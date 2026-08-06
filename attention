@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""attention -- prioritized multi-source triage dashboard.
+"""attention -- prioritized multi-source triage dashboard, core.
 
-Pulls near-term calendar events, open reminders, GitHub PRs/issues that
-need your attention, and open Linear issues into one fzf-driven list,
-sorted by urgency, with per-item hotkeys to act on a row immediately
-(open, approve, merge, comment, complete, dispatch a work session, ...).
+Slim orchestrator: loads config, loads each configured plugin module,
+merges/cross-links/sorts what they return, renders through fzf, and
+routes a pressed hotkey back to whichever plugin's action produced it.
+Contains no source-specific logic itself -- see PLUGINS.md for the
+interface a plugin implements; sources/*.py are the bundled ones.
 
 Config: reads $XDG_CONFIG_HOME/attention/config.json (default
-~/.config/attention/config.json). See README.md for the schema. Missing
-config is not an error -- GitHub/Linear default enabled (gated only by
-their own auth availability), calendar/reminders default enabled with
-no names configured (so they simply contribute nothing until you add
-some).
+~/.config/attention/config.json). With no config file at all, the four
+bundled plugins (calendar, reminders, github, linear) all load with
+their own empty defaults -- calendar/reminders then contribute nothing
+until you list some names; github/linear still work out of the box,
+gated only by their own auth availability.
 """
+import base64
+import importlib.util
 import json
 import os
 import re
-import sys
 import subprocess
-import tempfile
-import urllib.request
-import urllib.error
-from datetime import datetime, date, timedelta, timezone
+import sys
 from pathlib import Path
 
 USAGE = """Usage: attention [COMMAND]
@@ -32,11 +31,17 @@ Commands:
   expect-keys    Print the comma-joined set of hotkeys the dashboard binds
   act KEY LINE   Dispatch a single hotkey press against one dashboard row
   -h, --help     Show this message
+
+See PLUGINS.md for the source-plugin interface and config["plugins"].
 """
+
+DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear"]
+
 
 def get_config_path():
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(xdg_config_home) / "attention" / "config.json"
+
 
 _config_cache = None
 
@@ -50,598 +55,176 @@ def load_config():
             _config_cache = {}
     return _config_cache
 
-# Helper to find ical path
-def get_ical_path():
-    # Prefer a fixed known-good path over PATH resolution: a stray dev
-    # build shadowing `ical` on PATH (e.g. a mise shim) is ad-hoc-signed
-    # separately from wherever your managed release binary lives, so
-    # macOS TCC treats them as different app identities and Calendar
-    # access doesn't carry over.
-    local_path = Path.home() / ".local/bin/ical"
-    if local_path.exists():
-        return str(local_path)
-    try:
-        which = subprocess.run(["which", "ical"], capture_output=True, text=True)
-        if which.returncode == 0 and which.stdout.strip():
-            return which.stdout.strip()
-    except Exception:
-        pass
-    return "ical"
 
-# Linear token retrieval: config first (sources.linear.apiToken), then
-# environment variables -- no OS-specific credential store coupling.
-def get_linear_token():
-    lin_cfg = load_config().get("sources", {}).get("linear", {})
-    token = lin_cfg.get("apiToken")
-    if token:
-        return token
-    return os.environ.get("LINEAR_API_TOKEN") or os.environ.get("LINEAR_TOKEN")
+_plugin_cache = {}
 
-# Parallel/Sequential data fetching
-def fetch_calendar(cal_names):
-    if not cal_names:
-        return []
+def load_plugin(name):
+    """Resolve a plugin by name: a bare word (e.g. "github") loads the
+    bundled sources/<name>.py next to this script; anything containing
+    "/" or ending in ".py" is a direct path to a third-party module --
+    nothing to register, just point at the file. Cached per name so a
+    plugin is only ever imported once per process.
+    """
+    if name in _plugin_cache:
+        return _plugin_cache[name]
+    if "/" in name or name.endswith(".py"):
+        path = Path(name).expanduser().resolve()
+    else:
+        path = Path(__file__).resolve().parent / "sources" / f"{name}.py"
 
-    ical_bin = get_ical_path()
-    today_str = str(date.today())
-    tomorrow_str = str(date.today() + timedelta(days=1))
+    # Put the plugin's own directory on sys.path before loading it, so
+    # it can `import` sibling helper modules (the bundled plugins share
+    # sources/_util.py this way; a third-party plugin can do the same
+    # with its own helpers).
+    plugin_dir = str(path.parent)
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
 
-    events = []
-    for cal in cal_names:
+    spec = importlib.util.spec_from_file_location(f"attention_plugin_{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _plugin_cache[name] = mod
+    return mod
+
+
+def fetch_all(config):
+    """Call every configured plugin's fetch(), tagging each returned
+    action with which plugin produced it (core's own bookkeeping, not
+    part of the plugin's return value) so act() later knows who to
+    dispatch a pressed key to. One plugin failing (bad config, missing
+    dependency, network error) never takes down the others.
+    """
+    items = []
+    for name in config.get("plugins", DEFAULT_PLUGINS):
         try:
-            cmd = [ical_bin, "list", "-c", cal, "--from", today_str, "--to", tomorrow_str, "-o", "json"]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0 and res.stdout.strip():
-                cal_events = json.loads(res.stdout)
-                for e in cal_events:
-                    if (
-                        e.get("status") == "cancelled"
-                        or e.get("availability") == "free"
-                        or e.get("self_status") == "declined"
-                    ):
-                        continue
-                    e["_calendar_name"] = cal
-                    events.append(e)
+            mod = load_plugin(name)
+            fetched = mod.fetch(config) or []
         except Exception:
-            continue
-    return events
+            fetched = []
+        for item in fetched:
+            for action in item.get("actions", []):
+                action["_plugin"] = name
+            items.append(item)
+    return items
 
-def fetch_reminders(list_names):
-    if not list_names:
-        return []
 
-    try:
-        cmd = ["remindctl", "show", "all", "--json"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            return []
-        all_reminders = json.loads(res.stdout or "[]")
-        return [r for r in all_reminders if not r.get("isCompleted") and r.get("listName") in list_names]
-    except Exception:
-        return []
-
-def _gh_json(args):
-    """Run `gh <args...>` and parse its stdout as JSON, returning [] on
-    any failure (non-zero exit, timeout, malformed JSON). Centralizes the
-    try/except boilerplate every gh JSON query below repeats.
+def _absorb(host, guest):
+    """Merge `guest` into `host`: append guest's note to host's details,
+    boost host's weight, and splice guest's actions into host's action
+    list (renamed only on an actual key collision, tried in order: the
+    alt-stripped-and-uppercased variant, then the lowest unused bare
+    digit -- and always labeled "(linked)" so it's visually obvious
+    which actions reach a different, absorbed item).
     """
-    try:
-        res = subprocess.run(["gh"] + args, capture_output=True, text=True)
-        if res.returncode != 0:
-            return []
-        return json.loads(res.stdout or "[]")
-    except Exception:
-        return []
+    note = guest.get("absorb_note") or f"{guest.get('status', '')}: {guest.get('title', '')}"
+    host["details"] = f"{host['details']} | {note}" if host.get("details") else note
+    host["weight"] = max(host.get("weight", 0), guest.get("weight", 0)) + 5
 
-def get_gh_login():
-    try:
-        res = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
-        if res.returncode == 0:
-            return res.stdout.strip()
-    except Exception:
-        pass
-    return ""
+    host_actions = host.setdefault("actions", [])
+    host_keys = {a["key"] for a in host_actions}
+    for action in guest.get("actions", []):
+        key = action["key"]
+        new_key = key
+        if new_key in host_keys:
+            candidates = []
+            if key.startswith("alt-"):
+                candidates.append(key[len("alt-"):].upper())
+            candidates.extend(list("123456789"))
+            new_key = next((c for c in candidates if c not in host_keys), key)
+        merged_action = dict(action, key=new_key, label=f"{action['label']} (linked)", primary=False, _original_key=key)
+        host_actions.append(merged_action)
+        host_keys.add(new_key)
 
-def fetch_authored_pr_attention():
-    """Open PRs I authored that need MY attention right now: failing
-    checks, changes requested, a merge conflict, or a comment from
-    someone else. `gh search prs` (used to find the candidates) exposes
-    none of that state -- its --json fields are limited to search-index
-    metadata -- so this follows up with one `gh pr view` per candidate
-    (repo is already known from the search hit, so this is a targeted
-    lookup, not a repo-wide scan) to pull the actionable fields.
+
+def merge_cross_links(items):
+    """Two generic, source-agnostic passes over every fetched item --
+    see PLUGINS.md's "Cross-link merging" section for the exact rules.
+    Neither pass knows or cares which plugin produced which item.
     """
-    prs = _gh_json([
-        "search", "prs", "--author=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
-    ])
-    if not prs:
-        return []
-
-    me = get_gh_login()
-    flagged = []
-    for p in prs:
-        repo = p.get("repository", {}).get("nameWithOwner", "")
-        number = p.get("number")
-        if not repo or number is None:
+    # 1. ID-shaped title match (e.g. a PR title mentioning "ABC-123"
+    # absorbs whichever other item has id "ABC-123").
+    by_id = {it["id"].upper(): it for it in items if it.get("id")}
+    absorbed_ids = set()
+    for host in items:
+        if id(host) in absorbed_ids:
             continue
-        detail = _gh_json([
-            "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,comments",
-        ])
-        if not isinstance(detail, dict):
-            continue
-
-        reasons = []
-        if detail.get("reviewDecision") == "CHANGES_REQUESTED":
-            reasons.append("Changes Requested")
-        if detail.get("mergeable") == "CONFLICTING":
-            reasons.append("Merge Conflict")
-        checks = detail.get("statusCheckRollup") or []
-        if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
-            reasons.append("Checks Failing")
-        comments = detail.get("comments") or []
-        if me and any(c.get("author", {}).get("login") != me for c in comments):
-            reasons.append("New Comments")
-
-        if not reasons:
-            continue
-
-        p["attention_reasons"] = reasons
-        flagged.append(p)
-
-    return flagged
-
-def fetch_my_repo_issues():
-    # Open issues in repos I own, regardless of assignee -- distinct from
-    # the assignee=@me query below, which only catches issues explicitly
-    # assigned to me and misses everything else in my own repos.
-    return _gh_json([
-        "search", "issues", "--owner=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
-    ])
-
-def build_repo_dir_index(code_dir):
-    """Map "owner/repo" (lowercased) -> the actual local directory name
-    under code_dir, derived from each subdirectory's own `git remote
-    origin`. Intentionally not a maintained/committed mapping -- a repo
-    cloned under a shorthand directory name (e.g. "jef" for a repo
-    actually named "big-project-name") still resolves, with nothing to
-    keep in sync.
-    """
-    index = {}
-    try:
-        entries = list(os.scandir(code_dir))
-    except OSError:
-        return index
-    # Strip any inherited GIT_DIR/GIT_WORK_TREE/etc: if the caller's
-    # environment has one set (e.g. running inside another git hook),
-    # `-C entry.path` is silently overridden and every git call below
-    # would operate on that unrelated repo instead of entry.path.
-    git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    for entry in entries:
-        if not entry.is_dir():
-            continue
-        try:
-            res = subprocess.run(
-                ["git", "-C", entry.path, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=2, env=git_env
-            )
-            if res.returncode != 0:
+        for token in re.findall(r"[A-Z]+-\d+", host.get("title", "").upper()):
+            guest = by_id.get(token)
+            if guest is None or guest is host or id(guest) in absorbed_ids:
                 continue
-            m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", res.stdout.strip())
-            if m:
-                index[m.group(1).lower()] = entry.name
-        except Exception:
+            _absorb(host, guest)
+            absorbed_ids.add(id(guest))
+    items = [it for it in items if id(it) not in absorbed_ids]
+
+    # 2. Title-substring match (e.g. a reminder titled "Prep for Team
+    # Dinner" absorbs into a calendar event titled "Team Dinner").
+    by_title = [(it["title"].lower().strip(), it) for it in items]
+    absorbed_titles = set()
+    for guest_title, guest in by_title:
+        if id(guest) in absorbed_titles:
             continue
-    return index
-
-def fetch_github():
-    # `gh pr list`/`gh issue list` are repo-scoped: they resolve a single
-    # target repo from the cwd's git remote (or an explicit -R) and only
-    # filter *within* that repo, so --search never made them search across
-    # all of @me's repos. `gh search prs`/`gh search issues` are the actual
-    # global cross-repo search subcommands.
-    #
-    # No org/user scoping: GitHub's `org:` search qualifier only matches
-    # real Organizations, not personal user accounts, so scoping by a
-    # configured org silently drops results for any key that's actually
-    # someone's personal username. Simpler and correct: one unscoped @me
-    # search per query type.
-    review_prs = _gh_json([
-        "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
-    ])
-    for p in review_prs:
-        p["type"] = "review_request"
-
-    assigned_issues = _gh_json([
-        "search", "issues", "--assignee=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
-    ])
-    for i in assigned_issues:
-        i["type"] = "assigned_issue"
-
-    authored_prs = fetch_authored_pr_attention()
-    for p in authored_prs:
-        p["type"] = "authored_attention"
-
-    repo_issues = fetch_my_repo_issues()
-    for i in repo_issues:
-        i["type"] = "repo_issue"
-
-    # De-dupe: the same PR/issue can surface from more than one query (a PR
-    # I authored could also be review-requested; an issue assigned to me in
-    # my own repo matches both the assignee and owner queries). Issue and PR
-    # numbers share one counter per repo, so (repo, number) alone uniquely
-    # identifies the item. Concatenation order decides which variant wins:
-    # review-request/authored-attention carry more specific detail than a
-    # plain assigned/repo listing, so they're listed first.
-    seen = set()
-    combined = []
-    for item in review_prs + authored_prs + assigned_issues + repo_issues:
-        key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
-        if key in seen:
-            continue
-        seen.add(key)
-        combined.append(item)
-    return combined
-
-def fetch_linear():
-    token = get_linear_token()
-    if not token:
-        return []
-
-    query = """
-query {
-  viewer {
-    assignedIssues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }, first: 250) {
-      nodes {
-        id
-        identifier
-        title
-        url
-        state {
-          name
-        }
-        project {
-          name
-        }
-      }
-    }
-  }
-}
-"""
-
-    req = urllib.request.Request(
-        "https://api.linear.app/graphql",
-        data=json.dumps({"query": query}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": token
-        },
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res_data = json.loads(response.read().decode("utf-8"))
-            if "errors" in res_data:
-                return []
-
-            # Helper to recursively extract Linear issues
-            def extract(data):
-                if isinstance(data, list):
-                    for item in data:
-                        yield from extract(item)
-                elif isinstance(data, dict):
-                    if "identifier" in data and "title" in data:
-                        yield data
-                    else:
-                        for val in data.values():
-                            yield from extract(val)
-
-            return list(extract(res_data.get("data", {})))
-    except Exception:
-        return []
-
-def slugify(text, max_len=50):
-    """Filesystem/git-branch/tmux-safe slug derived from a title, e.g.
-    "Fix the login bug!" -> "fix-the-login-bug". Used for session names
-    and worktree branches so they read semantically instead of by
-    PR/issue number -- trimmed at a hyphen boundary so it never cuts
-    mid-word.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    if len(slug) > max_len:
-        slug = slug[:max_len].rsplit("-", 1)[0]
-    return slug or "session"
-
-# Prioritization and output generation
-def build_rows():
-    """Fetch every enabled source, prioritize, de-dupe/cross-link, and
-    return the fully formatted dashboard rows (one string per item).
-    """
-    config = load_config()
-    sources = config.get("sources", {})
-    cal_cfg = sources.get("calendar", {})
-    rem_cfg = sources.get("reminders", {})
-    gh_cfg = sources.get("github", {})
-    lin_cfg = sources.get("linear", {})
-    code_dir = config.get("codeDir", str(Path.home() / "code"))
-
-    cal_raw = fetch_calendar(cal_cfg.get("names", [])) if cal_cfg.get("enabled", True) else []
-    rem_raw = fetch_reminders(rem_cfg.get("lists", [])) if rem_cfg.get("enabled", True) else []
-    gh_raw = fetch_github() if gh_cfg.get("enabled", True) else []
-    lin_raw = fetch_linear() if lin_cfg.get("enabled", True) else []
-
-    cal_items = []
-    rem_items = []
-    gh_items = []
-    lin_items = []
-
-    # 1. Parse Calendar
-    for e in cal_raw:
-        # Sanitize raw external title to remove tab/pipe characters
-        title = e.get("title", "Untitled").strip().replace('\t', ' ').replace('|', '/')
-        all_day = e.get("all_day", False)
-        start_str = e.get("start_date", "")
-        calendar_name = e.get("_calendar_name", "").replace('\t', ' ').replace('|', '/')
-
-        weight = 50
-        status = "ALL DAY"
-        time_tag = ""
-        if not all_day and start_str:
-            try:
-                dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
-                diff_mins = (dt - now).total_seconds() / 60.0
-                # Local timezone, 12-hour clock (e.g. "2:00 PM") rather
-                # than the event's origin offset or a 24-hour clock.
-                time_tag = dt.astimezone().strftime("%I:%M %p").lstrip("0")
-                if 0 <= diff_mins <= 30:
-                    weight = 100
-                    status = "NOW"
-                elif 0 <= diff_mins <= 120:
-                    weight = 80
-                    status = "SOON"
-                elif diff_mins < 0:
-                    weight = 20 # past
-                    status = "PAST"
-                else:
-                    status = "UPCOMING"
-            except Exception:
-                time_tag = start_str[:16].replace("T", " ")
-                status = "UPCOMING"
-
-        cal_items.append({
-            "type": "CAL",
-            "weight": weight,
-            "status": status,
-            "context": calendar_name,
-            "title": title,
-            "details": time_tag,
-            "id": e.get("id", ""),
-            "database_id": "",
-            "url": "",
-            "repo_path": ""
-        })
-
-    # 2. Parse Reminders
-    for r in rem_raw:
-        # Sanitize raw external title and list name to remove tab/pipe characters
-        title = r.get("title", "Untitled").strip().replace('\t', ' ').replace('|', '/')
-        list_name = r.get('listName', '').replace('\t', ' ').replace('|', '/')
-        prio = r.get("priority", "none").lower()
-        due = r.get("dueDate", "")
-
-        weight = 50
-        status = "PENDING"
-        details = ""
-        if due:
-            details = f"Due: {due[:10]}"
-            status = "DUE"
-            try:
-                due_date = date.fromisoformat(due[:10])
-                if due_date < date.today():
-                    weight = 95 # overdue
-                    status = "OVERDUE"
-                elif due_date == date.today():
-                    weight = 85 # due today
-                    status = "DUE TODAY"
-            except Exception:
-                pass
-        else:
-            if prio == "high":
-                weight = 70
-            elif prio == "medium":
-                weight = 50
-            elif prio == "low":
-                weight = 30
-            else:
-                weight = 15
-
-        rem_items.append({
-            "type": "REM",
-            "weight": weight,
-            "status": status,
-            "context": list_name,
-            "title": title,
-            "details": details,
-            "id": r.get("id", ""),
-            "database_id": "",
-            "url": "",
-            "repo_path": ""
-        })
-
-    # 3. Parse GitHub
-    # Match each GH repo's actual `git remote origin` against local
-    # directories under code_dir, so a repo cloned under a shorthand name
-    # still resolves -- no mapping to maintain; the git remote is ground
-    # truth. One-time scan, only when there's a GH item to resolve.
-    repo_dir_index = build_repo_dir_index(code_dir) if gh_raw else {}
-    for g in gh_raw:
-        # Sanitize raw external title and repo name to remove tab/pipe characters
-        title = g.get("title", "Untitled").strip().replace('\t', ' ').replace('|', '/')
-        repo_name = g.get("repository", {}).get("nameWithOwner", "unknown").replace('\t', ' ').replace('|', '/')
-
-        gtype = g.get("type", "")
-        details = ""
-        if gtype == "review_request":
-            weight = 90
-            status = "REVIEW REQUESTED"
-        elif gtype == "authored_attention":
-            weight = 88
-            status = "NEEDS ATTENTION"
-            details = ", ".join(g.get("attention_reasons", []))
-        elif gtype == "assigned_issue":
-            weight = 75
-            status = "ASSIGNED"
-        else:
-            weight = 55
-            status = "OPEN"
-
-        # Resolve Repo Path via the git-remote-derived index above,
-        # falling back to the repo's own last path segment.
-        repo_path = ""
-        if repo_name:
-            dir_name = repo_dir_index.get(repo_name.lower(), repo_name.split("/")[-1])
-            repo_path = os.path.join(code_dir, dir_name)
-
-        gh_items.append({
-            "type": "GH",
-            "weight": weight,
-            "status": status,
-            "context": repo_name,
-            "title": title,
-            "details": details,
-            "id": str(g.get("number")),
-            "database_id": "",
-            "url": g.get("url", ""),
-            "repo_path": repo_path
-        })
-
-    # 4. Parse Linear
-    for l in lin_raw:
-        # Sanitize raw external title, identifier, state, and project to
-        # remove tab/pipe characters
-        title = l.get("title", "Untitled").strip().replace('\t', ' ').replace('|', '/')
-        identifier = l.get("identifier", "unknown").replace('\t', ' ').replace('|', '/')
-        state_raw = l.get("state", {}).get("name", "Unknown") if isinstance(l.get("state"), dict) else "Unknown"
-        state = state_raw.replace('\t', ' ').replace('|', '/')
-        project_raw = l.get("project", {}).get("name", "") if isinstance(l.get("project"), dict) else ""
-        project = project_raw.replace('\t', ' ').replace('|', '/')
-
-        weight = 65
-        if state.lower() == "in progress":
-            weight = 80
-
-        lin_items.append({
-            "type": "LIN",
-            "weight": weight,
-            "status": state.upper(),
-            "context": project,
-            "title": title,
-            "details": "",
-            "id": identifier,
-            "database_id": l.get("id", ""),
-            "url": l.get("url", ""),
-            "repo_path": ""
-        })
-
-    # ==========================================
-    # Cross-association and De-duplication Logic
-    # ==========================================
-
-    # Deduplicate 1: Linear Issues vs GitHub Issues/PRs
-    # Map from Linear issue key (e.g. LIN-123) to corresponding GH item
-    github_linear_map = {}
-    for g in gh_items:
-        # Scan for Linear identifiers matching pattern (e.g. LIN-123)
-        found_keys = re.findall(r"([A-Z]+-\d+)", g["title"].upper())
-        for k in found_keys:
-            github_linear_map[k] = g
-
-    final_lin_items = []
-    for l in lin_items:
-        key = l["id"].upper()
-        if key in github_linear_map:
-            # Match found! Merge Linear item into GitHub item
-            g = github_linear_map[key]
-            note = f"Linear {key}: {l['status']}"
-            g["details"] = f"{g['details']} | {note}" if g["details"] else note
-            # Boost the weight of the merged item
-            g["weight"] = max(g["weight"], l["weight"]) + 5
-            # Associate the Linear Database ID and URL to the GitHub item
-            g["linear_db_id"] = l["database_id"]
-            g["linear_url"] = l["url"]
-        else:
-            final_lin_items.append(l)
-
-    # Deduplicate 2: Calendar Events vs Reminders
-    # Map from lowercase calendar event titles to calendar items
-    cal_titles = {c["title"].lower().strip(): c for c in cal_items}
-
-    final_rem_items = []
-    for r in rem_items:
-        title_lower = r["title"].lower()
-        matched_cal = None
-        for cal_title in cal_titles:
-            # Skip short or default/placeholder calendar titles to avoid spurious matches
-            if len(cal_title) < 4 or cal_title == "untitled":
+        for host_title, host in by_title:
+            if host is guest or id(host) in absorbed_titles:
                 continue
-            # e.g., Reminder: "Book babysitter for Team Dinner" or "Prep for Team Dinner" matches "Team Dinner" event
-            if cal_title in title_lower:
-                matched_cal = cal_titles[cal_title]
+            if len(host_title) < 4 or host_title == "untitled":
+                continue
+            if host_title in guest_title:
+                _absorb(host, guest)
+                absorbed_titles.add(id(guest))
                 break
+    return [it for it in items if id(it) not in absorbed_titles]
 
-        if matched_cal:
-            # Match found! Merge Reminder into Calendar event
-            note = f"Reminder: {r['title']}"
-            matched_cal["details"] = f"{matched_cal['details']} | {note}" if matched_cal["details"] else note
-            # Boost weight
-            matched_cal["weight"] = max(matched_cal["weight"], r["weight"]) + 5
-            # Associate reminder IDs to complete them from Calendar actions (support multiple reminders per event)
-            matched_cal.setdefault("reminder_ids", []).append(r["id"])
-        else:
-            final_rem_items.append(r)
 
-    # Re-combine all surviving de-duplicated items
-    items = cal_items + final_rem_items + gh_items + final_lin_items
-
-    # Sort items by weight descending (weight drives priority only -- it's
-    # never displayed; STATUS/CONTEXT/TITLE/DETAILS are the visible columns)
-    items.sort(key=lambda x: x["weight"], reverse=True)
-
-    # Format for fzf: STATUS/CONTEXT/TITLE columns sized to this run's
-    # longest value (capped, so one outlier doesn't blow out the whole
-    # table) keep every row's fields lined up. TYPE moves into the hidden
-    # metadata tail -- act() dispatches on it, but it's redundant with
-    # STATUS/CONTEXT for a human scanning the table, so it isn't rendered.
-    # Row shape: STATUS  CONTEXT  TITLE  DETAILS \t| TYPE:<type> | ID:<id> | SLUG:<slug> | DATABASE_ID:<database_id> | URL:<url> | REPO_PATH:<path> | LINEAR_DB_ID:<linear_db_id> | LINEAR_URL:<linear_url> | REMINDER_ID:<reminder_id> \tHINT
-    # The third (hint) field is never rendered as a list row (the
-    # dashboard's --with-nth 1 hides fields 2+), only surfaced via a
-    # --bind transform-footer that reads {3} on cursor movement -- so
-    # moving the cursor to see an item's available hotkeys costs zero
-    # extra process spawns.
-    STATUS_MAX = 20
-    CONTEXT_MAX = 30
-    TITLE_MAX = 60
-
-    # Safety net: strip any remaining tab characters up front (pipes are
-    # intentional separators, don't touch them). Raw external data was
-    # already sanitized in the parsing loops above.
+def expect_keys_for(items):
+    """Union of every action key actually present across the current
+    item list -- computed fresh from what's really there, not a static
+    hypothetical table, since core no longer knows the space of possible
+    plugins/actions ahead of time.
+    """
+    keys = []
+    seen = set()
     for item in items:
-        item["status"] = item["status"].replace('\t', ' ')
-        item["context"] = item["context"].replace('\t', ' ')
-        item["title"] = item["title"].replace('\t', ' ')
-        item["details"] = item["details"].replace('\t', ' ')
+        for a in item.get("actions", []):
+            if a["key"] not in seen:
+                seen.add(a["key"])
+                keys.append(a["key"])
+    return keys
 
-    status_col = min(max((len(item["status"]) for item in items), default=0), STATUS_MAX)
-    context_col = min(max((len(item["context"]) for item in items), default=0), CONTEXT_MAX)
-    title_col = min(max((len(item["title"]) for item in items), default=0), TITLE_MAX)
+
+def hint_for_actions(actions):
+    """Human-readable footer hint, e.g. '⌥o open  ⌥s session'."""
+    parts = []
+    for a in actions:
+        key = a["key"]
+        symbol = f"⌥{key[len('alt-'):]}" if key.startswith("alt-") else key
+        parts.append(f"{symbol} {a['label']}")
+    return "  ".join(parts)
+
+
+def render_rows(items):
+    """Format the (already merged, already sorted) item list for fzf:
+    STATUS/CONTEXT/TITLE columns sized to this run's longest value
+    (capped, so one outlier doesn't blow out the whole table) keep every
+    row's fields lined up. Each row's hidden second field is its actions
+    list, base64(JSON)-encoded (opaque and delimiter-safe, since a
+    plugin's payload can be arbitrary JSON) -- act() decodes it, never
+    needing to know which plugin produced the row until dispatch time.
+    Row shape: STATUS  CONTEXT  TITLE  DETAILS \t<base64 actions>\tHINT
+    The third (hint) field is never rendered as a list row (the
+    dashboard's --with-nth 1 hides fields 2+), only surfaced via a
+    --bind transform-footer that reads {3} on cursor movement.
+    """
+    STATUS_MAX, CONTEXT_MAX, TITLE_MAX = 20, 30, 60
+
+    for item in items:
+        item["status"] = item.get("status", "").replace("\t", " ")
+        item["context"] = item.get("context", "").replace("\t", " ")
+        item["title"] = item.get("title", "").replace("\t", " ")
+        item["details"] = item.get("details", "").replace("\t", " ")
+
+    status_col = min(max((len(i["status"]) for i in items), default=0), STATUS_MAX)
+    context_col = min(max((len(i["context"]) for i in items), default=0), CONTEXT_MAX)
+    title_col = min(max((len(i["title"]) for i in items), default=0), TITLE_MAX)
 
     def _clip(text, width):
         return text if len(text) <= width else text[: width - 1] + "…"
@@ -651,433 +234,67 @@ def build_rows():
         status = _clip(item["status"], status_col)
         context = _clip(item["context"], context_col)
         title = _clip(item["title"], title_col)
-
-        # Join multiple reminder IDs with comma if present; slug is the
-        # full (unclipped) title, for session/branch names act() builds.
-        slug = slugify(item["title"])
-        reminder_ids_str = ','.join(item.get('reminder_ids', [])) if 'reminder_ids' in item else ''
-
-        hint = hint_for(
-            item["type"],
-            has_linear=bool(item.get("linear_db_id")),
-            rem_ids=item.get("reminder_ids", []),
-        )
-
+        actions = item.get("actions", [])
+        blob = base64.b64encode(json.dumps(actions).encode()).decode()
+        hint = hint_for_actions(actions)
         rows.append(
             f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {item['details']} \t"
-            f"| TYPE:{item['type']} "
-            f"| ID:{item['id']} "
-            f"| SLUG:{slug} "
-            f"| DATABASE_ID:{item['database_id']} "
-            f"| URL:{item['url']} "
-            f"| REPO_PATH:{item['repo_path']} "
-            f"| LINEAR_DB_ID:{item.get('linear_db_id', '')} "
-            f"| LINEAR_URL:{item.get('linear_url', '')} "
-            f"| REMINDER_ID:{reminder_ids_str}\t"
-            f"{hint}"
+            f"{blob}\t{hint}"
         )
     return rows
 
+
+def build_prioritized_items(config):
+    items = fetch_all(config)
+    items = merge_cross_links(items)
+    items.sort(key=lambda x: x.get("weight", 0), reverse=True)
+    return items
+
+
 def print_rows():
-    for row in build_rows():
+    for row in render_rows(build_prioritized_items(load_config())):
         print(row)
 
-def actions_for(item_type, *, has_linear=False, rem_ids=None):
-    """Single source of truth for which hotkeys are available on an item
-    and their human-readable descriptions.
 
-    Consumed by both build_rows() (to build the footer hint field) and
-    act() (to validate/dispatch a pressed key), so the two can never drift
-    out of sync.
-
-    Keys are alt-prefixed (fzf's `alt-X` --expect syntax) so plain letters
-    stay free for fzf's fuzzy-filter typing -- verified empirically that
-    Terminal.app's "Use Option as Meta Key" delivers these as a distinct
-    ESC-prefixed sequence fzf's --expect can bind directly, e.g. alt-o is
-    never confused with a literal `o` keystroke.
-
-    The Linear cross-link variants (O/C/T: same verb, but targets the
-    linked Linear issue instead of the GH item) stay plain uppercase
-    rather than alt-shift-prefixed: an empirical pty test showed `alt-O`
-    (ESC followed by a bare capital letter) collides with the terminal's
-    SS3 application-keypad escape prefix (`ESC O <letter>`, used for
-    function/arrow keys), so fzf's input parser waits indefinitely for a
-    third byte that never comes and the binding never fires. Plain
-    uppercase O/C/T has no such collision and costs only 3 of 26 letters
-    from query-filtering.
-
-    CAL's digit-overflow reminder keys (beyond the first, which gets
-    alt-x) stay plain bare digits: "type a number" is the overflow
-    mechanism for the rare multi-reminder case instead of inventing new
-    alt-digit bindings for it.
-    """
-    rem_ids = rem_ids or []
-    if item_type == "CAL":
-        actions = [("alt-y", "yank")]
-        # Multiple linked reminders share one verb (complete), so only the
-        # first gets the primary hotkey `alt-x` (matching REM's
-        # single-reminder case below); any additional ones fall back to
-        # digit keys 1, 2, 3... This keeps "type a number" as the overflow
-        # mechanism for the rare multi-reminder case instead of needing
-        # more letter keys that would have to be reserved everywhere just
-        # to cover this one edge case.
-        for idx, _ in enumerate(rem_ids):
-            key = "alt-x" if idx == 0 else str(idx)
-            label = "complete" if idx == 0 else "complete (extra)"
-            actions.append((key, label))
-        return actions
-    if item_type == "REM":
-        return [("alt-x", "complete")]
-    if item_type == "GH":
-        actions = [
-            ("alt-o", "open"),
-            ("alt-s", "session"),
-            ("alt-l", "lumen"),
-            ("alt-a", "approve"),
-            ("alt-m", "merge"),
-            ("alt-c", "comment"),
-            ("alt-g", "label"),
-        ]
-        # Linear cross-association actions, uppercased so the same verb
-        # letter (o/c/t) still applies to the linked Linear issue instead
-        # of the GH item itself.
-        if has_linear:
-            actions.extend([
-                ("O", "open linear"),
-                ("C", "comment linear"),
-                ("T", "transition linear"),
-            ])
-        return actions
-    if item_type == "LIN":
-        return [
-            ("alt-o", "open"),
-            ("alt-s", "session"),
-            ("alt-c", "comment"),
-            ("alt-t", "transition"),
-        ]
-    return []
-
-
-def expect_keys():
-    """Union of every hotkey actions_for() can ever produce, across all
-    item types and contexts.
-
-    There is no separate quit key: Esc is fzf's native "no selection" exit
-    (rc 130), which the dashboard loop already treats as "stop triaging" --
-    a second, redundant quit hotkey would just be one more way to do the
-    same thing.
-
-    CAL's digit-overflow reminder keys are enumerated up to 9 linked
-    reminders: overflow keys must be single characters (matching fzf's
-    --expect key syntax), so str(idx) for idx >= 10 was never a valid key
-    even in the original per-item menu -- this isn't a new cap, just the
-    same implicit one made explicit here.
-    """
-    contexts = [
-        actions_for("CAL", rem_ids=[f"r{i}" for i in range(1, 10)]),
-        actions_for("REM"),
-        actions_for("GH", has_linear=False),
-        actions_for("GH", has_linear=True),
-        actions_for("LIN"),
-    ]
-    keys = []
-    seen = set()
-    for actions in contexts:
-        for key, _ in actions:
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
-    return keys
-
-
-def hint_for(item_type, *, has_linear=False, rem_ids=None):
-    """Human-readable footer hint string for an item, e.g.
-    '⌥o open  ⌥s session  ⌥l lumen  ⌥a approve  ⌥m merge  ⌥c comment  ⌥g label'.
-
-    Built from the same actions_for() table act() dispatches against, so
-    the hint can never promise a hotkey act() doesn't actually honor.
-    """
-    parts = []
-    for key, desc in actions_for(item_type, has_linear=has_linear, rem_ids=rem_ids):
-        symbol = f"⌥{key[len('alt-'):]}" if key.startswith("alt-") else key
-        parts.append(f"{symbol} {desc}")
-    return "  ".join(parts)
-
-
-# Action execution
 def act(key, line):
     """Dispatch a single fzf --expect key press against the highlighted
-    dashboard row.
-
-    `key` is the literal --expect token fzf reported (e.g. "alt-o"), or ""
-    if the row was accepted with plain Enter. `line` is the full
-    tab-delimited dashboard row text (display portion + metadata tail),
-    exactly as fzf's --expect output's second line reports it.
-
-    One fzf process per dashboard render, not a nested submenu: this is
-    called once per keypress from run_dashboard()'s loop, which
-    re-invokes fzf afterward.
+    dashboard row. `key` is the literal --expect token fzf reported
+    (e.g. "alt-o"), or "" if the row was accepted with plain Enter.
+    `line` is the full tab-delimited row text, exactly as fzf's
+    --expect output's second line reports it.
     """
-    # Split line into display portion and metadata tail at the first tab
-    parts = line.split('\t', 1)
-    display_portion = parts[0] if parts else line
-    metadata_tail = parts[1] if len(parts) > 1 else ""
+    parts = line.split("\t", 1)
+    if len(parts) < 2:
+        print("No action bound to this row (malformed row).")
+        return
+    blob = parts[1].split("\t", 1)[0]
+    try:
+        actions = json.loads(base64.b64decode(blob).decode())
+    except Exception:
+        print("No action bound to this row (malformed row).")
+        return
 
-    # Parse metadata from the tail only (avoids false positives from display text)
-    match_type = re.search(r"\| TYPE:([^\s|]*)", metadata_tail)
-    match_id = re.search(r"\| ID:([^\s|]*)", metadata_tail)
-    match_slug = re.search(r"\| SLUG:([^\s|]*)", metadata_tail)
-    match_db_id = re.search(r"\| DATABASE_ID:([^\s|]*)", metadata_tail)
-    match_url = re.search(r"\| URL:([^\s|]*)", metadata_tail)
-    match_path = re.search(r"\| REPO_PATH:([^\s|]*)", metadata_tail)
-    match_lin_db_id = re.search(r"\| LINEAR_DB_ID:([^\s|]*)", metadata_tail)
-    match_lin_url = re.search(r"\| LINEAR_URL:([^\s|]*)", metadata_tail)
-    match_rem_id = re.search(r"\| REMINDER_ID:([^\s|]*)", metadata_tail)
-
-    item_id = match_id.group(1) if match_id else ""
-    slug = match_slug.group(1) if match_slug else "session"
-    db_id = match_db_id.group(1) if match_db_id else ""
-    item_url = match_url.group(1) if match_url else ""
-    repo_path = match_path.group(1) if match_path else ""
-    lin_db_id = match_lin_db_id.group(1) if match_lin_db_id else ""
-    lin_url = match_lin_url.group(1) if match_lin_url else ""
-    rem_ids_str = match_rem_id.group(1) if match_rem_id else ""
-    rem_ids = [rid.strip() for rid in rem_ids_str.split(',') if rid.strip()] if rem_ids_str else []
-    item_type = match_type.group(1) if match_type else ""
-
-    # Per-key dispatch callables. Keys here must exactly match whatever
-    # actions_for() returns for this item_type/context -- that pairing (key
-    # + description from actions_for(), executable from this dict) is
-    # validated against `valid_keys` below before a press is ever honored.
-    lambdas = {}
-    if item_type == "CAL":
-        lambdas["alt-y"] = lambda: copy_to_clipboard(display_portion)
-        for idx, rid in enumerate(rem_ids):
-            rem_key = "alt-x" if idx == 0 else str(idx)
-            lambdas[rem_key] = (lambda r=rid: run_cmd(["remindctl", "complete", r]))
-    elif item_type == "REM":
-        lambdas["alt-x"] = lambda: run_cmd(["remindctl", "complete", item_id])
-    elif item_type == "GH":
-        lambdas["alt-o"] = lambda: run_cmd(["open", item_url]) if item_url else print("No URL.")
-        lambdas["alt-s"] = lambda: dispatch_background(["aoe-cmd", "-d", repo_path, "-n", slug, "-b", "-w", slug, f"Work on issue {item_id} in this repo"]) if repo_path else print("No local repo path mapped.")
-        lambdas["alt-l"] = lambda: run_cmd(["lumen", "diff", "--pr", item_url]) if item_url else print("No URL.")
-        lambdas["alt-a"] = lambda: run_cmd(["gh", "pr", "review", "--approve", item_id, "--repo", get_repo_from_url(item_url)]) if item_url else print("No URL.")
-        lambdas["alt-m"] = lambda: confirm_and_merge(item_id, item_url)
-        lambdas["alt-c"] = lambda: run_cmd(["gh", "issue", "comment", item_id, "-R", get_repo_from_url(item_url), "-b", input("\nEnter comment body: ").strip()]) if item_url else print("No URL.")
-        lambdas["alt-g"] = lambda: run_cmd(["gh", "issue", "edit", item_id, "-R", get_repo_from_url(item_url), "--add-label", input("\nEnter label name: ").strip()]) if item_url else print("No URL.")
-        if lin_db_id:
-            # Plain (non-alt) uppercase, not alt-shift-prefixed: see
-            # actions_for()'s docstring for the empirical reason
-            # (Terminal's ESC-O SS3 prefix collision) alt-O isn't usable.
-            lambdas["O"] = lambda: run_cmd(["open", lin_url]) if lin_url else print("No Linear URL.")
-            lambdas["C"] = lambda: linear_comment(lin_db_id)
-            lambdas["T"] = lambda: linear_transition(lin_db_id)
-    elif item_type == "LIN":
-        lambdas["alt-o"] = lambda: run_cmd(["open", item_url]) if item_url else print("No URL.")
-        lambdas["alt-s"] = lambda: dispatch_background(["aoe-cmd", "-d", os.getcwd(), "-n", slug, f"Work on Linear issue {item_id}"])
-        lambdas["alt-c"] = lambda: linear_comment(db_id)
-        lambdas["alt-t"] = lambda: linear_transition(db_id)
-
-    valid_keys = {k for k, _ in actions_for(item_type, has_linear=bool(lin_db_id), rem_ids=rem_ids)}
-
+    valid_keys = {a["key"] for a in actions}
     resolved_key = key
     if resolved_key == "":
-        # Enter: the type's primary "read" action -- Open in Browser for
-        # GH/LIN, which have a natural target. CAL/REM have none, so Enter
-        # is a no-op that just returns to the dashboard.
-        if item_type in ("GH", "LIN"):
-            resolved_key = "alt-o"
-        else:
+        primary = next((a for a in actions if a.get("primary")), None)
+        if primary is None:
             return
+        resolved_key = primary["key"]
 
     if resolved_key not in valid_keys:
         print(f"No action bound to '{resolved_key}' for this item.")
         return
 
-    action = lambdas.get(resolved_key)
-    if action is None:
-        return
-
+    action = next(a for a in actions if a["key"] == resolved_key)
     try:
-        action()
+        mod = load_plugin(action["_plugin"])
+        mod.act(action.get("_original_key", resolved_key), action.get("payload"))
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
-
-def confirm_and_merge(item_id, item_url):
-    """Merge confirmation gate, run after fzf has already exited: a plain
-    input() y/n prompt on the bare terminal rather than a second fzf
-    process, matching the single-fzf-process design (see act()).
-    """
-    if not item_url:
-        print("No URL.")
-        return
-    repo = get_repo_from_url(item_url)
-    try:
-        choice = input(f"\nMerge {repo}#{item_id} (squash + delete branch)? [y/N]: ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print("\nCanceled.")
-        return
-    if choice == "y":
-        run_cmd(["gh", "pr", "merge", "--squash", "--delete-branch", item_id, "--repo", repo])
-    else:
-        print("Canceled.")
-
-def copy_to_clipboard(text):
-    try:
-        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        p.communicate(input=text.encode("utf-8"))
-        print("Copied to clipboard!")
     except Exception as e:
-        print(f"Failed to copy: {e}")
+        print(f"Action failed: {e}")
 
-def run_cmd(cmd):
-    try:
-        print(f"Running: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-    except Exception as e:
-        print(f"Command failed: {e}")
-
-def dispatch_background(cmd):
-    """Launch a fire-and-forget subprocess without blocking the dashboard
-    loop -- `aoe-cmd` (session dispatch) can take up to ~30s (worktree
-    creation plus a readiness poll) before it even sends anything, and
-    the dashboard has no reason to sit frozen for that: press alt-s,
-    it's queued, you're straight back at the list. Detached from this
-    process's stdio/session so it survives past this `act()` call
-    exiting; output goes to a per-dispatch log file since the terminal
-    may already be showing the next dashboard render by the time it
-    produces any.
-    """
-    log_fd, log_path = tempfile.mkstemp(prefix="attention-dispatch-", suffix=".log")
-    with os.fdopen(log_fd, "w") as log_file:
-        try:
-            subprocess.Popen(
-                cmd, stdout=log_file, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, start_new_session=True,
-            )
-            print(f"Dispatched in background (log: {log_path}): {' '.join(cmd)}")
-        except Exception as e:
-            print(f"Failed to dispatch: {e}")
-
-def get_repo_from_url(url):
-    # e.g., https://github.com/athal7/kb/pull/40 -> athal7/kb
-    m = re.search(r"github\.com/([^/]+/[^/]+)", url)
-    return m.group(1) if m else ""
-
-# Linear API Helper mutations
-def query_linear_graphql(query, variables=None):
-    token = get_linear_token()
-    if not token:
-        print("Linear token not available.")
-        return None
-    req = urllib.request.Request(
-        "https://api.linear.app/graphql",
-        data=json.dumps({"query": query, "variables": variables or {}}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": token
-        },
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        print(f"Linear query failed: {e}")
-        return None
-
-def linear_comment(issue_uuid):
-    if not issue_uuid:
-        print("No issue database ID available to comment.")
-        return
-    body = input("\nEnter comment body: ").strip()
-    if not body:
-        print("Empty comment. Canceled.")
-        return
-    query = """
-    mutation($issueId: String!, $body: String!) {
-      commentCreate(input: { issueId: $issueId, body: $body }) {
-        success
-      }
-    }
-    """
-    res = query_linear_graphql(query, {"issueId": issue_uuid, "body": body})
-    if res and not res.get("errors"):
-        print("Comment created successfully!")
-    else:
-        print("Failed to create comment.")
-
-def linear_transition(issue_uuid):
-    if not issue_uuid:
-        print("No issue database ID available to transition.")
-        return
-    # Workflow states are per-team, so listing every team's states mixed
-    # together (an earlier version's design) offers duplicate/foreign
-    # names (e.g. multiple "Backlog"s) and silently fails issueUpdate if
-    # one from the wrong team gets picked. Resolve the issue's own team
-    # first.
-    query_team = """
-    query($id: String!) {
-      issue(id: $id) {
-        team {
-          id
-        }
-      }
-    }
-    """
-    res_team = query_linear_graphql(query_team, {"id": issue_uuid})
-    team_id = None
-    if res_team and not res_team.get("errors"):
-        team_id = res_team.get("data", {}).get("issue", {}).get("team", {}).get("id")
-    if not team_id:
-        print("Could not resolve the issue's team.")
-        return
-
-    query_states = """
-    query($teamId: ID!) {
-      workflowStates(filter: { team: { id: { eq: $teamId } } }) {
-        nodes {
-          id
-          name
-        }
-      }
-    }
-    """
-    res_states = query_linear_graphql(query_states, {"teamId": team_id})
-    if not res_states or res_states.get("errors"):
-        print("Could not retrieve states.")
-        return
-    states = res_states.get("data", {}).get("workflowStates", {}).get("nodes", [])
-    if not states:
-        print("No workflow states found.")
-        return
-
-    print("\nAvailable States:")
-    for idx, s in enumerate(states, 1):
-        print(f"{idx}) {s['name']}")
-
-    try:
-        choice = input("\nSelect state to transition to [1-%d]: " % len(states)).strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(states):
-            target_state_id = states[int(choice) - 1]["id"]
-            target_state_name = states[int(choice) - 1]["name"]
-            # Perform transition
-            query_update = """
-            mutation($id: String!, $stateId: String!) {
-              issueUpdate(id: $id, input: { stateId: $stateId }) {
-                success
-              }
-            }
-            """
-            res_update = query_linear_graphql(query_update, {"id": issue_uuid, "stateId": target_state_id})
-            if res_update and not res_update.get("errors"):
-                print(f"Issue transitioned successfully to '{target_state_name}'!")
-            else:
-                print("Failed to transition issue.")
-        else:
-            print("Invalid choice.")
-    except (KeyboardInterrupt, EOFError):
-        print("\nCanceled.")
 
 def run_dashboard():
     """The interactive loop: render the prioritized list through fzf,
@@ -1090,8 +307,10 @@ def run_dashboard():
     next time round, so newly-completed/dispatched items drop off and
     newly-relevant ones appear without any extra bookkeeping.
     """
+    config = load_config()
     while True:
-        rows = build_rows()
+        items = build_prioritized_items(config)
+        rows = render_rows(items)
         if not rows:
             print("Nothing needs attention right now.")
             return
@@ -1101,7 +320,7 @@ def run_dashboard():
                     "fzf", "--ansi", "--height", "~60%", "--layout=reverse",
                     "--header", "Hotkeys act immediately on this row · Enter = primary action · Esc = quit",
                     "-d", "\t", "--with-nth", "1",
-                    "--expect", ",".join(expect_keys()),
+                    "--expect", ",".join(expect_keys_for(items)),
                     "--footer-border=line",
                     "--bind", 'start,focus:transform-footer:printf "%s\\n" {3}',
                 ],
@@ -1122,11 +341,12 @@ def run_dashboard():
             key, row = out[:first_nl], out[first_nl + 1:].rstrip("\n")
         act(key, row)
 
+
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "act":
         act(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 1 and sys.argv[1] == "expect-keys":
-        print(",".join(expect_keys()))
+        print(",".join(expect_keys_for(build_prioritized_items(load_config()))))
     elif len(sys.argv) > 1 and sys.argv[1] == "list":
         print_rows()
     elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):

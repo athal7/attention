@@ -5,6 +5,10 @@ open reminders, GitHub PRs/issues that need your attention, and open Linear
 issues into one [fzf](https://github.com/junegunn/fzf)-driven list, sorted by
 urgency, with per-item hotkeys to act on a row immediately.
 
+The core has no source-specific logic at all -- everything above is a
+plugin (see [PLUGINS.md](PLUGINS.md)). Enable, disable, or reorder them
+freely, or write your own and point `attention` at it.
+
 ## Install
 
 ```sh
@@ -12,7 +16,7 @@ brew install athal7/tap/attention
 ```
 
 Requires [`fzf`](https://github.com/junegunn/fzf) (installed automatically as
-a dependency). Everything else below is optional, per source.
+a dependency). Everything else below is optional, per plugin.
 
 ## Usage
 
@@ -23,7 +27,7 @@ attention expect-keys # print the comma-joined set of hotkeys the dashboard bind
 attention act K LINE  # dispatch a single hotkey press against one dashboard row
 ```
 
-In the dashboard: `Enter` runs the row's primary action (open in browser for
+In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
 row without leaving the list. `Esc` quits.
 
@@ -44,56 +48,63 @@ its number.
 ## Configuration
 
 Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
-`~/.config/attention/config.json`. Everything is optional — with no config
-file at all, GitHub and Linear are enabled by default (each gated only by
-their own auth availability below) and calendar/reminders are enabled but
-contribute nothing until you list some.
+`~/.config/attention/config.json`.
 
 ```json
 {
   "codeDir": "/Users/you/code",
-  "sources": {
-    "calendar":  { "enabled": true, "names": ["Work"] },
-    "reminders": { "enabled": true, "lists": ["Personal", "Work"] },
-    "github":    { "enabled": true },
-    "linear":    { "enabled": true, "apiToken": "lin_api_..." }
-  }
+  "plugins": ["calendar", "reminders", "github", "linear"],
+  "calendar":  { "names": ["Work"] },
+  "reminders": { "lists": ["Personal", "Work"] },
+  "github":    {},
+  "linear":    { "apiToken": "lin_api_..." }
 }
 ```
 
 | Key | Meaning |
 |---|---|
-| `codeDir` | Parent directory of your local repo clones (default `~/code`). GitHub items resolve their local checkout by matching each subdirectory's own `git remote origin` against the item's repo — not by name, so a repo cloned under a shorthand directory name still resolves. Used for the session-dispatch (`⌥s`) working directory. |
-| `sources.calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). |
-| `sources.reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). |
-| `sources.github` | Toggle GitHub fetching (via [`gh`](https://cli.github.com) on `PATH`, already authenticated). No further config — it's always your PRs/issues. |
-| `sources.linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted — put it there instead if you'd rather not keep a secret in a config file. |
+| `plugins` | Which plugins to run, in order. A bare name (`"github"`) loads a bundled plugin; anything containing `/` or ending in `.py` is a path to your own -- see [PLUGINS.md](PLUGINS.md). Missing entirely = the four bundled plugins. |
+| `codeDir` | Parent directory of your local repo clones (default `~/code`). Used by the `github` plugin, which resolves each item's local checkout by matching each subdirectory's own `git remote origin` against the item's repo -- not by name, so a repo cloned under a shorthand directory name still resolves. |
+| `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
+| `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
+| `github` | No config needed -- it's always your PRs/issues, via [`gh`](https://cli.github.com) on `PATH`, already authenticated. |
+| `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 
-## What each source surfaces
+## What each bundled plugin surfaces
 
-- **Calendar**: events today/tomorrow on the configured calendars, weighted by
+- **calendar**: events today/tomorrow on the configured calendars, weighted by
   how soon they start (declined/free/cancelled events excluded).
-- **Reminders**: open (incomplete) reminders on the configured lists, weighted
+- **reminders**: open (incomplete) reminders on the configured lists, weighted
   by due date (overdue/due-today) or priority.
-- **GitHub**: PRs where your review is requested; PRs you authored that need
+- **github**: PRs where your review is requested; PRs you authored that need
   attention (failing checks, changes requested, a merge conflict, or a new
   comment from someone else); issues assigned to you; open issues in repos you
   own regardless of assignee. De-duplicated by repo+number if an item matches
   more than one of these.
-- **Linear**: your assigned issues not in a completed/canceled/duplicate
+- **linear**: your assigned issues not in a completed/canceled/duplicate
   state.
 
-A GitHub item whose title contains a Linear issue identifier (e.g. `ABC-123`)
-absorbs the matching Linear item instead of listing it twice. A reminder whose
-title contains a calendar event's title absorbs into that event the same way.
+Two generic, source-agnostic passes then cross-link items regardless of
+which plugin produced them: an item whose title mentions another item's
+ticket-shaped id (e.g. a GitHub PR title mentioning `ABC-123` absorbs the
+Linear issue `ABC-123`), and an item whose title is a substring of
+another's (e.g. a reminder titled "Prep for Team Dinner" absorbs into a
+calendar event titled "Team Dinner"). See
+[PLUGINS.md](PLUGINS.md#cross-link-merging) for the exact rules.
+
+## Writing your own plugin
+
+See [PLUGINS.md](PLUGINS.md) -- a plugin is a single `.py` file exposing
+`fetch(config)` and `act(key, payload)`. No registration, no packaging;
+just point `config["plugins"]` at it.
 
 ## Dependencies
 
-- [`fzf`](https://github.com/junegunn/fzf) — required
-- [`gh`](https://cli.github.com) — GitHub source (authenticated)
-- [`ical`](https://github.com/BRO3886/ical) — calendar source
-- [`remindctl`](https://github.com/steipete/remindctl) — reminders source
-- [`lumen`](https://github.com/jnsahaj/lumen) — `⌥l` review-diff hotkey
-- `aoe-cmd` — `⌥s` session-dispatch hotkey (your own wrapper around
-  [`aoe`](https://github.com/agent-of-empires/agent-of-empires), not a
+- [`fzf`](https://github.com/junegunn/fzf) -- required
+- [`gh`](https://cli.github.com) -- `github` plugin (authenticated)
+- [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
+- [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
+- [`lumen`](https://github.com/jnsahaj/lumen) -- `⌥l` review-diff hotkey (github)
+- `aoe-cmd` -- `⌥s` session-dispatch hotkey (github, linear; your own wrapper
+  around [`aoe`](https://github.com/agent-of-empires/agent-of-empires), not a
   standalone published tool)
