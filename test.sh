@@ -1132,6 +1132,95 @@ test_run_dashboard_empty
 
 # ---------------------------------------------------------------------------
 echo
+echo "== core: runtime type validation and fail fast =="
+
+test_runtime_validation() {
+  local err
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err_missing_status:', e)
+" 2>/dev/null || true)"
+  check "detects missing required item key status" "$err" "err_missing_status: plugin 'badplugin' returned a malformed item: missing required key 'status'"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': '10'}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err_wrong_weight_type:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for weight (str instead of int)" "$err" "err_wrong_weight_type: plugin 'badplugin' returned a malformed item: 'weight' must be of type int, got str"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': True}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err_wrong_weight_type_bool:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for weight (bool instead of int)" "$err" "err_wrong_weight_type_bool: plugin 'badplugin' returned a malformed item: 'weight' must be of type int, got bool"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {
+    'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10,
+    'actions': [{'label': 'open'}]
+}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err_missing_action_key:', e)
+" 2>/dev/null || true)"
+  check "detects action missing required key 'key'" "$err" "err_missing_action_key: plugin 'badplugin' returned a malformed item: action missing required key 'key'"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {
+    'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10,
+    'actions': [{'key': 'alt-o', 'label': 123}]
+}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err_wrong_action_label_type:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for action label" "$err" "err_wrong_action_label_type: plugin 'badplugin' returned a malformed item: action 'label' must be of type str, got int"
+
+  # Test defaults are populated
+  local defaults
+  defaults="$(python3 -c "
+$LOAD_CORE
+import json
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'alt-o', 'label': 'o'}]}
+m.validate_and_normalize_item(item, 'goodplugin')
+print(json.dumps(item))
+")"
+  check "defaults optional fields on item" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['id'], item['absorb_note'])" "$defaults")" \
+    " "
+  check "defaults optional fields on action" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['actions'][0]['primary'], item['actions'][0]['payload'])" "$defaults")" \
+    "False {}"
+
+  # Test payload validation in act()
+  local act_err
+  act_err="$(python3 -c "
+$LOAD_CORE
+line = 'STATUS\t' + m.base64.b64encode(m.json.dumps([{'key': 'alt-o', 'label': 'o', 'payload': 'not-a-dict', '_plugin': 'github'}]).encode()).decode()
+m.act('alt-o', line)
+" 2>/dev/null || true)"
+  check "act() payload validation rejects non-dict payload" "$act_err" "Action failed: plugin 'github' act() received a malformed payload: expected a dictionary, got str"
+}
+test_runtime_validation
+
+# ---------------------------------------------------------------------------
+echo
 echo "== --help =="
 
 check "attention --help mentions Usage" \

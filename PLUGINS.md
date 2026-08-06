@@ -32,23 +32,43 @@ def act(key: str, payload) -> None:
     """
 ```
 
-### Item shape
+### Enforced Item and Action shape
+
+Runtime type validation is strictly enforced at the plugin boundary. If a plugin's `fetch()` returns a malformed item or an item with malformed actions, a detailed `ValueError` is raised naming the plugin and the specific problem.
+
+The following shows the expected types, which fields are required/optional, and the default values supplied if optional fields are omitted.
+
+#### Item fields
+- **`status`** (`str`, **required**): Short, normalized, all-caps status convention (e.g., `"REVIEW REQUESTED"`).
+- **`context`** (`str`, **required**): Where the item originated (e.g., repo, list, calendar, project).
+- **`title`** (`str`, **required**): The title/headline of the item.
+- **`details`** (`str`, **required**): Trailing free-form text or description (may be empty).
+- **`weight`** (`int`, **required**): Sort priority key, descending.
+- **`id`** (`str`, *optional*, defaults to `""`): Unique identifier; enables cross-link merging (see below).
+- **`absorb_note`** (`str`, *optional*, defaults to `""`): Note appended to host's details if this item is absorbed.
+- **`actions`** (`list` of action dicts, *optional*, defaults to `[]`): Actions available for this item.
+
+#### Action fields
+- **`key`** (`str`, **required**): The hotkey token (e.g., `"alt-o"`, a bare letter/digit, or `""`).
+- **`label`** (`str`, **required**): Short verb shown in the footer hint.
+- **`primary`** (`bool`, *optional*, defaults to `False`): At most one per item; indicates what plain Enter runs.
+- **`payload`** (`dict`, *optional*, defaults to `{}`): Arbitrary dictionary of data passed back to `act()`. The `payload` received by `act()` is validated to be a dictionary at runtime before dispatching.
 
 ```python
 {
-    "status":  "REVIEW REQUESTED",   # short, normalized, all-caps by convention
-    "context": "myorg/myrepo",       # where this came from -- repo, list, calendar, project...
-    "title":   "Fix the login bug",
-    "details": "",                   # trailing free-form text; may be empty
-    "weight":  90,                   # sort key, descending -- never displayed, priority only
-    "id":      "42",                 # optional; enables cross-link merging, see below
-    "absorb_note": "...",            # optional; text used if THIS item gets merged into another
-    "actions": [
+    "status":  "REVIEW REQUESTED",   # str, required
+    "context": "myorg/myrepo",       # str, required
+    "title":   "Fix the login bug",  # str, required
+    "details": "",                   # str, required -- may be empty
+    "weight":  90,                   # int, required -- sort key, descending
+    "id":      "42",                 # str, optional (defaults to "")
+    "absorb_note": "...",            # str, optional (defaults to "")
+    "actions": [                     # list, optional (defaults to [])
         {
-            "key": "alt-o",          # fzf --expect token: "alt-X", a bare letter/digit, or ""
-            "label": "open",         # short verb, shown in the footer hint
-            "primary": True,         # optional; at most one per item -- what plain Enter runs
-            "payload": {...},        # anything JSON-serializable; yours, passed back to act()
+            "key": "alt-o",          # str, required
+            "label": "open",         # str, required
+            "primary": True,         # bool, optional (defaults to False)
+            "payload": {...},        # dict, optional (defaults to {})
         },
         ...
     ],

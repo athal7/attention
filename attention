@@ -22,6 +22,27 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import TypedDict, List, Dict, Any
+
+class ActionRequired(TypedDict):
+    key: str
+    label: str
+
+class Action(ActionRequired, total=False):
+    primary: bool
+    payload: dict
+
+class ItemRequired(TypedDict):
+    status: str
+    context: str
+    title: str
+    details: str
+    weight: int
+
+class Item(ItemRequired, total=False):
+    id: str
+    absorb_note: str
+    actions: List[Action]
 
 USAGE = """Usage: attention [COMMAND]
 
@@ -87,6 +108,73 @@ def load_plugin(name):
     return mod
 
 
+def validate_and_normalize_item(item, name):
+    if not isinstance(item, dict):
+        raise ValueError(f"plugin '{name}' returned a malformed item: expected a dictionary, got {type(item).__name__}")
+
+    required_item_keys = {
+        "status": str,
+        "context": str,
+        "title": str,
+        "details": str,
+        "weight": int,
+    }
+
+    for key, expected_type in required_item_keys.items():
+        if key not in item:
+            raise ValueError(f"plugin '{name}' returned a malformed item: missing required key '{key}'")
+        val = item[key]
+        if expected_type is int and isinstance(val, bool):
+            raise ValueError(f"plugin '{name}' returned a malformed item: '{key}' must be of type int, got bool")
+        if not isinstance(val, expected_type):
+            raise ValueError(f"plugin '{name}' returned a malformed item: '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
+
+    if "id" not in item:
+        item["id"] = ""
+    elif not isinstance(item["id"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'id' must be of type str, got {type(item['id']).__name__}")
+
+    if "absorb_note" not in item:
+        item["absorb_note"] = ""
+    elif not isinstance(item["absorb_note"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'absorb_note' must be of type str, got {type(item['absorb_note']).__name__}")
+
+    if "actions" not in item:
+        item["actions"] = []
+    elif not isinstance(item["actions"], list):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'actions' must be of type list, got {type(item['actions']).__name__}")
+
+    validated_actions = []
+    for action in item["actions"]:
+        if not isinstance(action, dict):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action must be a dictionary, got {type(action).__name__}")
+
+        required_action_keys = {
+            "key": str,
+            "label": str,
+        }
+        for key, expected_type in required_action_keys.items():
+            if key not in action:
+                raise ValueError(f"plugin '{name}' returned a malformed item: action missing required key '{key}'")
+            val = action[key]
+            if not isinstance(val, expected_type):
+                raise ValueError(f"plugin '{name}' returned a malformed item: action '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
+
+        if "primary" not in action:
+            action["primary"] = False
+        elif not isinstance(action["primary"], bool):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'primary' must be of type bool, got {type(action['primary']).__name__}")
+
+        if "payload" not in action:
+            action["payload"] = {}
+        elif not isinstance(action["payload"], dict):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'payload' must be of type dict, got {type(action['payload']).__name__}")
+
+        validated_actions.append(action)
+
+    item["actions"] = validated_actions
+
+
 def fetch_all(config):
     """Call every configured plugin's fetch(), tagging each returned
     action with which plugin produced it (core's own bookkeeping, not
@@ -102,6 +190,7 @@ def fetch_all(config):
         except Exception:
             fetched = []
         for item in fetched:
+            validate_and_normalize_item(item, name)
             for action in item.get("actions", []):
                 action["_plugin"] = name
             items.append(item)
@@ -289,7 +378,10 @@ def act(key, line):
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
         mod = load_plugin(action["_plugin"])
-        mod.act(action.get("_original_key", resolved_key), action.get("payload"))
+        payload = action.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"plugin '{action['_plugin']}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
+        mod.act(action.get("_original_key", resolved_key), payload)
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
     except Exception as e:
