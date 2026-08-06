@@ -5,6 +5,7 @@ Config (config["linear"]):
 """
 import json
 import os
+import shlex
 import urllib.error
 import urllib.request
 
@@ -77,6 +78,11 @@ query {
 
     raw = list(extract(res_data.get("data", {})))
 
+    linear_cfg = config.get("linear", {})
+    session_cfg = linear_cfg.get("session", {})
+    session_enabled = session_cfg.get("enabled", True)
+    session_command = session_cfg.get("command", "aoe-cmd")
+
     items = []
     for l in raw:
         title = l.get("title", "Untitled").strip().replace("\t", " ").replace("|", "/")
@@ -90,6 +96,17 @@ query {
 
         weight = 80 if state.lower() == "in progress" else 65
 
+        actions = [
+            {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+        ]
+        if session_enabled:
+            actions.append({"key": "alt-s", "label": "session", "payload": {"kind": "session", "identifier": identifier, "command": session_command}})
+
+        actions.extend([
+            {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
+            {"key": "alt-t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
+        ])
+
         items.append({
             "status": state.upper(),
             "context": project,
@@ -98,12 +115,7 @@ query {
             "weight": weight,
             "id": identifier,
             "absorb_note": f"Linear {identifier}: {state.upper()}",
-            "actions": [
-                {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-                {"key": "alt-s", "label": "session", "payload": {"kind": "session", "identifier": identifier}},
-                {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
-                {"key": "alt-t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
-            ],
+            "actions": actions,
         })
 
     # Stash the token on every comment/transition payload -- act() is a
@@ -213,7 +225,9 @@ def act(key, payload):
         run_cmd(["open", payload["url"]]) if payload.get("url") else print("No URL.")
     elif kind == "session":
         identifier = payload["identifier"]
-        dispatch_background(["aoe-cmd", "-d", os.getcwd(), "-n", identifier.lower(), f"Work on Linear issue {identifier}"])
+        cmd_override = payload.get("command", "aoe-cmd")
+        cmd_prefix = shlex.split(cmd_override)
+        dispatch_background(cmd_prefix + ["-d", os.getcwd(), "-n", identifier.lower(), f"Work on Linear issue {identifier}"])
     elif kind == "comment":
         _linear_comment(payload.get("db_id"), payload.get("token"))
     elif kind == "transition":

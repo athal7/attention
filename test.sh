@@ -1132,6 +1132,250 @@ test_run_dashboard_empty
 
 # ---------------------------------------------------------------------------
 echo
+echo "== custom command overrides & disable/enable config per-action =="
+
+test_calendar_custom_command_override() {
+  local cal_stub_bin="$WORK/bin-cal-custom"
+  mkdir -p "$cal_stub_bin"
+  cat > "$cal_stub_bin/my-ical-wrapper" <<STUB
+#!/bin/sh
+# Prints a distinct event to verify it was executed
+echo '[{"id": "e_custom", "title": "CALTEST-custom-wrapper-event", "status": "confirmed", "availability": "busy", "all_day": true}]'
+STUB
+  chmod +x "$cal_stub_bin/my-ical-wrapper"
+
+  write_config <<'JSON'
+{"plugins": ["calendar"], "calendar": {"names": ["Work"], "command": "my-ical-wrapper --some-flag"}}
+JSON
+
+  local out
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$cal_stub_bin:$PATH" python3 "$ATTENTION" list)"
+  if grep -q 'CALTEST-custom-wrapper-event' <<<"$out"; then
+    ok "calendar.command successfully shells out to custom wrapper with flags"
+  else
+    bad "calendar.command did not shell out to custom wrapper (got: $out)"
+  fi
+}
+test_calendar_custom_command_override
+
+test_reminders_custom_command_override() {
+  local rem_stub_bin="$WORK/bin-rem-custom"
+  mkdir -p "$rem_stub_bin"
+  cat > "$rem_stub_bin/my-remindctl-wrapper" <<STUB
+#!/bin/sh
+case "\$*" in
+  *show*)
+    cat <<JSON
+[
+  {"id": "r_custom", "title": "REMTEST-custom-wrapper-reminder", "listName": "Personal", "isCompleted": false, "priority": "none"}
+]
+JSON
+    ;;
+  *complete*)
+    echo "completed_with_wrapper:\$*" >> "$WORK/rem-custom-act.log"
+    ;;
+esac
+STUB
+  chmod +x "$rem_stub_bin/my-remindctl-wrapper"
+
+  write_config <<'JSON'
+{"plugins": ["reminders"], "reminders": {"lists": ["Personal"], "command": "my-remindctl-wrapper --extra-args"}}
+JSON
+
+  local out line
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$rem_stub_bin:$PATH" python3 "$ATTENTION" list)"
+  if grep -q 'REMTEST-custom-wrapper-reminder' <<<"$out"; then
+    ok "reminders.command successfully fetches via custom wrapper"
+  else
+    bad "reminders.command did not fetch via custom wrapper (got: $out)"
+  fi
+
+  line="$(grep 'REMTEST-custom-wrapper-reminder' <<<"$out" || true)"
+  : > "$WORK/rem-custom-act.log"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$rem_stub_bin:$PATH" python3 "$ATTENTION" act "alt-x" "$line" >/dev/null 2>&1
+  if grep -q "completed_with_wrapper:.*complete r_custom" "$WORK/rem-custom-act.log"; then
+    ok "reminders.command successfully completes via custom wrapper"
+  else
+    bad "reminders.command did not complete via custom wrapper"
+  fi
+}
+test_reminders_custom_command_override
+
+test_github_disabled_lumen_and_custom_commands() {
+  # Write a GH stub that returns one review-requested item
+  local gh_stub_bin="$WORK/bin-gh-custom"
+  mkdir -p "$gh_stub_bin"
+  cat > "$gh_stub_bin/gh" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "search prs --review-requested=@me"*)
+    echo '[{"number": 101, "title": "GH_DISABLE_TEST", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/101"}]'
+    ;;
+  *) echo "[]" ;;
+esac
+exit 0
+STUB
+  chmod +x "$gh_stub_bin/gh"
+
+  # Custom wrapper binaries for session and lumen commands
+  cat > "$gh_stub_bin/my-session-cmd" <<STUB
+#!/bin/sh
+echo "session_custom_ran:\$*" >> "$WORK/gh-custom-session.log"
+STUB
+  chmod +x "$gh_stub_bin/my-session-cmd"
+
+  cat > "$gh_stub_bin/my-lumen-cmd" <<STUB
+#!/bin/sh
+echo "lumen_custom_ran:\$*" >> "$WORK/gh-custom-lumen.log"
+STUB
+  chmod +x "$gh_stub_bin/my-lumen-cmd"
+
+  # Test 1: Disable lumen
+  write_config <<'JSON'
+{
+  "plugins": ["github"],
+  "github": {
+    "lumen": {"enabled": false}
+  }
+}
+JSON
+
+  local out line
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$gh_stub_bin:$PATH" python3 "$ATTENTION" list)"
+  line="$(grep 'GH_DISABLE_TEST' <<<"$out" || true)"
+  if grep -q 'alt-l' <<<"$line"; then
+    bad "alt-l hotkey is present in actions list/hint but github.lumen.enabled was false"
+  else
+    ok "alt-l hotkey is absent when github.lumen.enabled is false"
+  fi
+
+  # Test 2: Custom commands with flags
+  write_config <<'JSON'
+{
+  "plugins": ["github"],
+  "github": {
+    "session": {"enabled": true, "command": "my-session-cmd --custom-flag"},
+    "lumen": {"enabled": true, "command": "my-lumen-cmd --lumen-flag"}
+  }
+}
+JSON
+
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$gh_stub_bin:$PATH" python3 "$ATTENTION" list)"
+  line="$(grep 'GH_DISABLE_TEST' <<<"$out" || true)"
+
+  # Verify action Alt-S executes my-session-cmd
+  : > "$WORK/gh-custom-session.log"
+  # Run the action. Since session uses dispatch_background, we wait briefly or let it execute.
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$gh_stub_bin:$PATH" python3 "$ATTENTION" act "alt-s" "$line" >/dev/null 2>&1
+  # Give background dispatch a brief moment to run
+  sleep 0.2
+  if grep -q "session_custom_ran:" "$WORK/gh-custom-session.log"; then
+    ok "github.session.command overrides standard aoe-cmd and accepts arguments"
+  else
+    bad "github.session.command override did not execute custom session command (got: \$(cat "$WORK/gh-custom-session.log" 2>/dev/null))"
+  fi
+
+  # Verify action Alt-L executes my-lumen-cmd
+  : > "$WORK/gh-custom-lumen.log"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$gh_stub_bin:$PATH" python3 "$ATTENTION" act "alt-l" "$line" >/dev/null 2>&1
+  if grep -q "lumen_custom_ran:" "$WORK/gh-custom-lumen.log"; then
+    ok "github.lumen.command overrides standard lumen and accepts arguments"
+  else
+    bad "github.lumen.command override did not execute custom lumen command (got: \$(cat "$WORK/gh-custom-lumen.log" 2>/dev/null))"
+  fi
+}
+test_github_disabled_lumen_and_custom_commands
+
+test_linear_disabled_session_and_custom_command() {
+  local lin_stub_bin="$WORK/bin-lin-custom"
+  mkdir -p "$lin_stub_bin"
+  cat > "$lin_stub_bin/my-session-cmd-linear" <<STUB
+#!/bin/sh
+echo "linear_session_custom_ran:\$*" >> "$WORK/lin-custom-session.log"
+STUB
+  chmod +x "$lin_stub_bin/my-session-cmd-linear"
+
+  # Test 1: Disable session
+  test_linear_disabled_and_custom_functional() {
+    python3 -c "
+$(load_plugin_py linear)
+import json
+
+payload = {
+    'data': {'viewer': {'assignedIssues': {'nodes': [
+        {'id': 'lin_101', 'identifier': 'LIN-101', 'title': 'Custom issue',
+         'url': 'https://linear.app/x/issue/LIN-101',
+         'state': {'name': 'Todo'}, 'project': {'name': 'Backend'}}
+    ]}}}
+}
+
+class FakeResp:
+    def read(self):
+        return json.dumps(payload).encode()
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+p.urllib.request.urlopen = lambda *a, **kw: FakeResp()
+
+# Fetch with session disabled
+disabled_res = p.fetch({
+    'linear': {
+        'apiToken': 'fake-token',
+        'session': {'enabled': False}
+    }
+})
+disabled_actions = [a['key'] for item in disabled_res for a in item['actions']]
+
+# Fetch with session custom command
+custom_res = p.fetch({
+    'linear': {
+        'apiToken': 'fake-token',
+        'session': {'enabled': True, 'command': 'my-session-cmd-linear --some-arg'}
+    }
+})
+session_action = next(a for item in custom_res for a in item['actions'] if a['key'] == 'alt-s')
+print(json.dumps({
+    'disabled_has_alt_s': 'alt-s' in disabled_actions,
+    'custom_cmd': session_action['payload'].get('command')
+}))
+"
+  }
+
+  local lin_res
+  lin_res="$(test_linear_disabled_and_custom_functional)"
+  if [ "$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['disabled_has_alt_s'])" "$lin_res")" = "False" ]; then
+    ok "linear.session.enabled: false removes alt-s action from the list"
+  else
+    bad "linear.session.enabled: false did not remove alt-s action (got: $lin_res)"
+  fi
+
+  local custom_cmd_str
+  custom_cmd_str="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['custom_cmd'])" "$lin_res")"
+  check "linear.session.command custom command parsed and stashed in payload" "$custom_cmd_str" "my-session-cmd-linear --some-arg"
+
+  # Verify actual act dispatching for linear session with custom command
+  local act_line
+  act_line="TODO  Backend  Custom issue   ${TAB}$(python3 -c "
+import json, base64
+actions = [
+    {'key': 'alt-s', 'label': 'session', 'payload': {'kind': 'session', 'identifier': 'LIN-101', 'command': 'my-session-cmd-linear --some-arg'}, '_plugin': 'linear'}
+]
+print(base64.b64encode(json.dumps(actions).encode()).decode())
+")${TAB}hint"
+
+  : > "$WORK/lin-custom-session.log"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$lin_stub_bin:$PATH" python3 "$ATTENTION" act "alt-s" "$act_line" >/dev/null 2>&1
+  sleep 0.2
+  if grep -q "linear_session_custom_ran:" "$WORK/lin-custom-session.log"; then
+    ok "linear.session.command override correctly executed on act() and accepted arguments"
+  else
+    bad "linear.session.command override did not execute on act() (got: $(cat "$WORK/lin-custom-session.log" 2>/dev/null))"
+  fi
+}
+test_linear_disabled_session_and_custom_command
+
+# ---------------------------------------------------------------------------
+echo
 echo "== --help =="
 
 check "attention --help mentions Usage" \

@@ -5,6 +5,7 @@ Config (config["reminders"]):
     {"lists": ["Personal", "Work"]}   # list names to pull open items from
 """
 import json
+import shlex
 import subprocess
 from datetime import date
 
@@ -16,8 +17,14 @@ def fetch(config):
     if not list_names:
         return []
 
+    custom_cmd = config.get("reminders", {}).get("command")
+    if custom_cmd:
+        cmd_prefix = shlex.split(custom_cmd)
+    else:
+        cmd_prefix = ["remindctl"]
+
     try:
-        res = subprocess.run(["remindctl", "show", "all", "--json"], capture_output=True, text=True)
+        res = subprocess.run(cmd_prefix + ["show", "all", "--json"], capture_output=True, text=True)
         if res.returncode != 0:
             return []
         raw = json.loads(res.stdout or "[]")
@@ -60,7 +67,7 @@ def fetch(config):
             "id": reminder_id,
             "absorb_note": f"Reminder: {title}",
             "actions": [
-                {"key": "alt-x", "label": "complete", "payload": {"id": reminder_id}},
+                {"key": "alt-x", "label": "complete", "payload": {"id": reminder_id, "command": cmd_prefix}},
             ],
         })
     return items
@@ -68,4 +75,5 @@ def fetch(config):
 
 def act(key, payload):
     if key == "alt-x":
-        run_cmd(["remindctl", "complete", payload["id"]])
+        cmd_prefix = payload.get("command") or ["remindctl"]
+        run_cmd(cmd_prefix + ["complete", payload["id"]])

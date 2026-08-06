@@ -9,6 +9,7 @@ checkout.
 import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -189,6 +190,16 @@ def fetch(config):
     if not raw:
         return []
 
+    gh_config = config.get("github", {})
+    session_cfg = gh_config.get("session", {})
+    lumen_cfg = gh_config.get("lumen", {})
+
+    session_enabled = session_cfg.get("enabled", True)
+    session_command = session_cfg.get("command", "aoe-cmd")
+
+    lumen_enabled = lumen_cfg.get("enabled", True)
+    lumen_command = lumen_cfg.get("command", "lumen")
+
     code_dir = config.get("codeDir", str(Path.home() / "code"))
     # Match each repo's actual `git remote origin` against local
     # directories under code_dir, so a repo cloned under a shorthand name
@@ -219,6 +230,23 @@ def fetch(config):
         repo_path = os.path.join(code_dir, dir_name)
         slug = slugify(title)
 
+        actions = [
+            {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+        ]
+        if session_enabled:
+            actions.append({"key": "alt-s", "label": "session", "payload": {
+                "kind": "session", "repo_path": repo_path, "slug": slug, "item_id": number, "command": session_command,
+            }})
+        if lumen_enabled:
+            actions.append({"key": "alt-l", "label": "lumen", "payload": {"kind": "lumen", "url": url, "command": lumen_command}})
+
+        actions.extend([
+            {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
+            {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
+            {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
+            {"key": "alt-g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
+        ])
+
         items.append({
             "status": status,
             "context": repo_name,
@@ -227,17 +255,7 @@ def fetch(config):
             "weight": weight,
             "id": number,
             "absorb_note": f"{status}: {title}",
-            "actions": [
-                {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-                {"key": "alt-s", "label": "session", "payload": {
-                    "kind": "session", "repo_path": repo_path, "slug": slug, "item_id": number,
-                }},
-                {"key": "alt-l", "label": "lumen", "payload": {"kind": "lumen", "url": url}},
-                {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
-                {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
-                {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
-                {"key": "alt-g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
-            ],
+            "actions": actions,
         })
     return items
 
@@ -272,9 +290,17 @@ def act(key, payload):
             print("No local repo path mapped.")
             return
         slug, item_id = payload["slug"], payload["item_id"]
-        dispatch_background(["aoe-cmd", "-d", repo_path, "-n", slug, "-b", "-w", slug, f"Work on issue {item_id} in this repo"])
+        cmd_override = payload.get("command", "aoe-cmd")
+        cmd_prefix = shlex.split(cmd_override)
+        dispatch_background(cmd_prefix + ["-d", repo_path, "-n", slug, "-b", "-w", slug, f"Work on issue {item_id} in this repo"])
     elif kind == "lumen":
-        run_cmd(["lumen", "diff", "--pr", payload["url"]]) if payload.get("url") else print("No URL.")
+        url = payload.get("url")
+        if not url:
+            print("No URL.")
+            return
+        cmd_override = payload.get("command", "lumen")
+        cmd_prefix = shlex.split(cmd_override)
+        run_cmd(cmd_prefix + ["diff", "--pr", url])
     elif kind == "approve":
         url = payload.get("url")
         if not url:

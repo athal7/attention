@@ -5,6 +5,7 @@ Config (config["calendar"]):
     {"names": ["Work"]}   # calendar names to pull events from; [] = none
 """
 import json
+import shlex
 import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,14 +36,19 @@ def fetch(config):
     if not cal_names:
         return []
 
-    ical_bin = _get_ical_path()
+    custom_cmd = config.get("calendar", {}).get("command")
+    if custom_cmd:
+        ical_cmd = shlex.split(custom_cmd)
+    else:
+        ical_cmd = [_get_ical_path()]
+
     today_str = str(date.today())
     tomorrow_str = str(date.today() + timedelta(days=1))
 
     events = []
     for cal in cal_names:
         try:
-            cmd = [ical_bin, "list", "-c", cal, "--from", today_str, "--to", tomorrow_str, "-o", "json"]
+            cmd = ical_cmd + ["list", "-c", cal, "--from", today_str, "--to", tomorrow_str, "-o", "json"]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and res.stdout.strip():
                 for e in json.loads(res.stdout):
