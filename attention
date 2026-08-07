@@ -111,6 +111,7 @@ class ItemRequired(TypedDict):
 class Item(ItemRequired, total=False):
     id: str
     absorb_note: str
+    created_at: str
     actions: list
 
 
@@ -149,6 +150,11 @@ def validate_and_normalize_item(item, name):
         item["absorb_note"] = ""
     elif not isinstance(item["absorb_note"], str):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'absorb_note' must be of type str, got {type(item['absorb_note']).__name__}")
+
+    if "created_at" not in item:
+        item["created_at"] = ""
+    elif not isinstance(item["created_at"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'created_at' must be of type str, got {type(item['created_at']).__name__}")
 
     if "actions" not in item:
         item["actions"] = []
@@ -219,8 +225,8 @@ def fetch_all(config):
 
     items = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(plugin_names)) as pool:
-        futures = {pool.submit(_fetch_one, name): name for name in plugin_names}
-        for fut in concurrent.futures.as_completed(futures):
+        futures = [pool.submit(_fetch_one, name) for name in plugin_names]
+        for fut in futures:
             items.extend(fut.result())
     return items
 
@@ -369,11 +375,11 @@ def build_prioritized_items(config, recently_acted=None):
     items = fetch_all(config)
     items = merge_cross_links(items)
 
-    # Age-based weight boost: items created more than a day ago get +1,
-    # more than a week get +2, etc.  Plugins that can supply a real
-    # creation timestamp set "created_at" (ISO 8601); items without one
-    # (reminders, calendar events -- there's no meaningful "created"
-    # concept for those) get no boost.
+    # Age-based weight boost: items at least a day old get +1, at least
+    # three days old get +2, at least a week old get +3.  Plugins that
+    # can supply a real creation timestamp set "created_at" (ISO 8601);
+    # items without one (reminders, calendar events -- there's no
+    # meaningful "created" concept for those) get no boost.
     now = datetime.now(timezone.utc)
     for it in items:
         age_boost = 0
@@ -452,7 +458,7 @@ def act(key, line):
         print(f"Action failed: {e}")
 
 
-def run_dashboard():
+def run_dashboard(refresh_interval=60):
     """The interactive loop: render the prioritized list through fzf,
     dispatch whatever hotkey was pressed against the highlighted row,
     and loop back until Esc (no selection) or an empty list.
@@ -463,30 +469,25 @@ def run_dashboard():
     next time round, so newly-completed/dispatched items drop off and
     newly-relevant ones appear without any extra bookkeeping.
 
-    Periodically re-fetches data (every 60s) so the list stays fresh
-    without the user needing to quit and restart.
+    fzf itself is bounded by refresh_interval: if the user hasn't
+    pressed anything within that window, the still-running fzf is
+    interrupted (SIGTERM, so it restores the terminal the same way Esc
+    does -- a hard kill would leave the raw-mode/alt-screen state
+    behind) and the loop re-fetches and re-renders a fresh one, so the
+    list stays current even while the user is just looking at it, not
+    only between actions.
     """
-    import time
-
     config = load_config()
-    recently_acted = set()
-    last_refresh = 0.0
-    refresh_interval = 60  # seconds between background refreshes
+    recently_acted = {}  # ordered set of item ids (dict; oldest first)
 
     while True:
-        now = time.time()
-        # Re-fetch if enough time has passed since last refresh.
-        if now - last_refresh >= refresh_interval:
-            last_refresh = now
-            print("Refreshing data...")
-
         items = build_prioritized_items(config, recently_acted)
         rows = render_rows(items)
         if not rows:
             print("Nothing needs attention right now.")
             return
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "fzf", "--ansi", "--height", "10", "--layout=reverse",
                     "--header", "Hotkeys act immediately on this row · Enter = primary action · Esc = quit",
@@ -495,14 +496,23 @@ def run_dashboard():
                     "--footer-border=line",
                     "--bind", 'start,focus:transform-footer:printf "%s\\n" {3}',
                 ],
-                input="\n".join(rows) + "\n",
-                capture_output=True, text=True,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             )
         except FileNotFoundError:
             print("attention: `fzf` is required but was not found on PATH.", file=sys.stderr)
             sys.exit(1)
 
-        out = proc.stdout
+        try:
+            out, _ = proc.communicate(input="\n".join(rows) + "\n", timeout=refresh_interval)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            continue  # stale render interrupted; loop re-fetches fresh data
+
         if not out.strip():
             break
         first_nl = out.find("\n")
@@ -527,12 +537,15 @@ def run_dashboard():
 
         act(key, row)
 
-        # Track the acted item for deprioritization on the next render.
+        # Track the acted item for deprioritization on the next render,
+        # re-inserted last so it counts as newest -- a plain set has no
+        # order, so evicting "the oldest" from one can evict the item
+        # just added instead.
         if item_id:
-            recently_acted.add(item_id)
-            # Keep the set bounded — drop entries older than 10 items.
+            recently_acted.pop(item_id, None)
+            recently_acted[item_id] = True
             if len(recently_acted) > 10:
-                recently_acted.pop()
+                del recently_acted[next(iter(recently_acted))]
 
 
 if __name__ == "__main__":

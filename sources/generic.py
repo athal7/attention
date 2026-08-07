@@ -55,10 +55,15 @@ def _lookup(record, path):
 def _resolve(template, record):
     if not isinstance(template, str):
         return template
-    return _PLACEHOLDER.sub(lambda m: str(_lookup(record, m.group(1)) or ""), template)
+    def _sub(m):
+        val = _lookup(record, m.group(1))
+        return "" if val is None else str(val)
+    return _PLACEHOLDER.sub(_sub, template)
 
 
 def _resolve_weight(spec, record, default=50):
+    if isinstance(spec, bool):
+        return default
     if isinstance(spec, int):
         return spec
     if spec is None:
@@ -74,7 +79,10 @@ def _fetch_provider(name, spec):
     if not command:
         return []
     try:
-        res = subprocess.run(command, capture_output=True, text=True)
+        res = subprocess.run(
+            command, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=30,
+        )
         if res.returncode != 0:
             return []
         records = json.loads(res.stdout or "[]")

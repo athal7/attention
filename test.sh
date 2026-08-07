@@ -774,6 +774,16 @@ except ValueError as e:
 " 2>/dev/null || true)"
   check "detects wrong type for action label" "$err" "err: plugin 'badplugin' returned a malformed item: action 'label' must be of type str, got int"
 
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'created_at': 1700000000}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for created_at (int instead of str)" "$err" "err: plugin 'badplugin' returned a malformed item: 'created_at' must be of type str, got int"
+
   local defaults
   defaults="$(python3 -c "
 $LOAD_CORE
@@ -782,9 +792,9 @@ item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight':
 m.validate_and_normalize_item(item, 'goodplugin')
 print(json.dumps(item))
 ")"
-  check "defaults optional item fields (id, absorb_note) to empty string" \
-    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['id'], item['absorb_note'])" "$defaults")" \
-    " "
+  check "defaults optional item fields (id, absorb_note, created_at) to empty string" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(repr(item['id']), repr(item['absorb_note']), repr(item['created_at']))" "$defaults")" \
+    "'' '' ''"
   check "defaults optional action fields (primary=False, payload={})" \
     "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['actions'][0]['primary'], item['actions'][0]['payload'])" "$defaults")" \
     "False {}"
@@ -829,6 +839,55 @@ test_malformed_item_isolated_to_its_own_plugin() {
   esac
 }
 test_malformed_item_isolated_to_its_own_plugin
+
+# ---------------------------------------------------------------------------
+echo
+echo "== core: fetch_all() preserves config plugin order regardless of completion timing =="
+
+ORDER_SLOW_PLUGIN="$WORK/order_slow_plugin.py"
+cat > "$ORDER_SLOW_PLUGIN" <<'PY'
+import time
+def fetch(config):
+    time.sleep(0.3)
+    return [{"status": "S", "context": "c", "title": "OrderA-slowest", "details": "", "weight": 50}]
+def act(key, payload):
+    pass
+PY
+
+ORDER_FAST_PLUGIN="$WORK/order_fast_plugin.py"
+cat > "$ORDER_FAST_PLUGIN" <<'PY'
+def fetch(config):
+    return [{"status": "S", "context": "c", "title": "OrderB-fastest", "details": "", "weight": 50}]
+def act(key, payload):
+    pass
+PY
+
+ORDER_MID_PLUGIN="$WORK/order_mid_plugin.py"
+cat > "$ORDER_MID_PLUGIN" <<'PY'
+import time
+def fetch(config):
+    time.sleep(0.1)
+    return [{"status": "S", "context": "c", "title": "OrderC-mid", "details": "", "weight": 50}]
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$ORDER_SLOW_PLUGIN", "$ORDER_FAST_PLUGIN", "$ORDER_MID_PLUGIN"]}
+JSON
+
+test_fetch_all_deterministic_order() {
+  local titles
+  titles="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+$LOAD_CORE
+items = m.fetch_all(m.load_config())
+for it in items:
+    print(it['title'])
+")"
+  check "items come back in config (submission) order, not completion order, even though the slowest plugin is listed first" \
+    "$(tr '\n' ',' <<<"$titles")" "OrderA-slowest,OrderB-fastest,OrderC-mid,"
+}
+test_fetch_all_deterministic_order
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
@@ -1519,6 +1578,60 @@ test_run_dashboard_empty() {
   esac
 }
 test_run_dashboard_empty
+
+echo
+echo "-- periodic refresh: a stuck fzf is interrupted and re-rendered, not waited out --"
+
+REFRESH_BIN="$WORK/bin-refresh"
+mkdir -p "$REFRESH_BIN"
+REFRESH_FZF_LOG="$WORK/refresh-fzf-calls.log"
+: > "$REFRESH_FZF_LOG"
+
+cat > "$REFRESH_BIN/gh" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "search prs --review-requested=@me"*)
+    echo '[{"number": 1, "title": "REFRESHTEST-pr", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/1"}]'
+    ;;
+  *) echo "[]" ;;
+esac
+STUB
+chmod +x "$REFRESH_BIN/gh"
+
+# First call: sleeps far longer than the 1s refresh_interval under test,
+# to prove the loop interrupts it rather than waiting it out. Second
+# call: responds immediately with no selection (Esc), ending the loop.
+cat > "$REFRESH_BIN/fzf" <<STUB
+#!/bin/sh
+echo call >> "$REFRESH_FZF_LOG"
+calls=\$(wc -l < "$REFRESH_FZF_LOG")
+if [ "\$calls" -eq 1 ]; then
+  sleep 5
+fi
+STUB
+chmod +x "$REFRESH_BIN/fzf"
+
+write_config <<'JSON'
+{"plugins": ["github"], "codeDir": "/tmp/nonexistent-fakecode", "github": {}}
+JSON
+
+test_periodic_refresh_interrupts_stuck_fzf() {
+  local start_ts elapsed
+  start_ts=$(date +%s)
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$REFRESH_BIN:$PATH" python3 -c "
+$LOAD_CORE
+m.run_dashboard(refresh_interval=1)
+" >/dev/null 2>&1
+  elapsed=$(( $(date +%s) - start_ts ))
+  check "fzf invoked exactly twice (stuck render interrupted, then a fresh one)" \
+    "$(wc -l < "$REFRESH_FZF_LOG" | tr -d ' ')" "2"
+  if [ "$elapsed" -le 3 ]; then
+    ok "the loop moved on after refresh_interval (1s) instead of waiting out the stuck fzf's 5s sleep (${elapsed}s)"
+  else
+    bad "the loop moved on after refresh_interval (1s) instead of waiting out the stuck fzf's 5s sleep (took ${elapsed}s)"
+  fi
+}
+test_periodic_refresh_interrupts_stuck_fzf
 
 # ---------------------------------------------------------------------------
 echo

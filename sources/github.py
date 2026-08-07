@@ -20,7 +20,7 @@ def _gh_json(args):
     any failure (non-zero exit, timeout, malformed JSON).
     """
     try:
-        res = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        res = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=30)
         if res.returncode != 0:
             return []
         return json.loads(res.stdout or "[]")
@@ -58,6 +58,7 @@ def _fetch_pr_attention(author):
         return []
 
     me = _get_gh_login()
+    expected_author = me if author == "@me" else author
     flagged = []
     for p in prs:
         repo = p.get("repository", {}).get("nameWithOwner", "")
@@ -80,7 +81,10 @@ def _fetch_pr_attention(author):
         if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
             reasons.append("Checks Failing")
         comments = detail.get("comments") or []
-        if me and any(c.get("author", {}).get("login") != me for c in comments):
+        if expected_author and any(
+            (c.get("author", {}).get("login") or "").casefold() != expected_author.casefold()
+            for c in comments
+        ):
             reasons.append("New Comments")
 
         if not reasons:

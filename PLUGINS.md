@@ -37,14 +37,18 @@ def act(key: str, payload) -> None:
 
 ### Item shape
 
-Enforced at the plugin boundary: `fetch_all()` validates every item (and
-its actions) immediately after a plugin's `fetch()` returns, raising
+Enforced at the plugin boundary: right after a plugin's `fetch()`
+returns, each item (and its actions) is validated, raising
 `ValueError(f"plugin '<name>' returned a malformed item: <detail>")`
-naming the plugin and the exact problem, rather than letting a bad shape
-propagate into `merge_cross_links()`/`render_rows()` and fail opaquely
-several frames later. `act()`'s payload is validated the same way before
-dispatch. Required fields default to nothing (must be present); optional
-fields are filled in with the defaults shown below if omitted.
+naming the plugin and the exact problem. That error is caught by core,
+not propagated -- one malformed item discards that whole plugin's
+contribution for this render (not just the bad item) and prints the
+error to stderr; every other plugin still renders normally. `act()`'s
+payload is validated the same way before dispatch (uncaught there, so
+a malformed payload surfaces as this row's "Action failed: ..."
+instead). Required fields default to nothing (must be present);
+optional fields are filled in with the defaults shown below if
+omitted.
 
 ```python
 {
