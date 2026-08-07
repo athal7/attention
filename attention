@@ -8,11 +8,11 @@ Contains no source-specific logic itself -- see PLUGINS.md for the
 interface a plugin implements; sources/*.py are the bundled ones.
 
 Config: reads $XDG_CONFIG_HOME/attention/config.json (default
-~/.config/attention/config.json). With no config file at all, the four
-bundled plugins (calendar, reminders, github, linear) all load with
-their own empty defaults -- calendar/reminders then contribute nothing
-until you list some names; github/linear still work out of the box,
-gated only by their own auth availability.
+~/.config/attention/config.json). With no config file at all, the five
+bundled plugins (calendar, reminders, github, linear, generic) all load
+with their own empty defaults -- calendar/reminders/generic then
+contribute nothing until configured; github/linear still work out of
+the box, gated only by their own auth availability.
 """
 import base64
 import importlib.util
@@ -22,6 +22,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
+import concurrent.futures
+from typing import TypedDict
 
 USAGE = """Usage: attention [COMMAND]
 
@@ -35,7 +38,7 @@ Commands:
 See PLUGINS.md for the source-plugin interface and config["plugins"].
 """
 
-DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear"]
+DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear", "generic"]
 
 
 def get_config_path():
@@ -87,24 +90,138 @@ def load_plugin(name):
     return mod
 
 
+class ActionRequired(TypedDict):
+    key: str
+    label: str
+
+
+class Action(ActionRequired, total=False):
+    primary: bool
+    payload: dict
+
+
+class ItemRequired(TypedDict):
+    status: str
+    context: str
+    title: str
+    details: str
+    weight: int
+
+
+class Item(ItemRequired, total=False):
+    id: str
+    absorb_note: str
+    actions: list
+
+
+def validate_and_normalize_item(item, name):
+    """Enforce the Item/Action shape documented in PLUGINS.md on one
+    item a plugin's fetch() returned: raises ValueError naming the
+    plugin and the exact problem for a missing/mistyped field, and
+    fills in defaults for the optional ones so callers never need
+    `.get(..., default)` again.
+    """
+    if not isinstance(item, dict):
+        raise ValueError(f"plugin '{name}' returned a malformed item: expected a dictionary, got {type(item).__name__}")
+
+    required_item_keys = {
+        "status": str,
+        "context": str,
+        "title": str,
+        "details": str,
+        "weight": int,
+    }
+    for key, expected_type in required_item_keys.items():
+        if key not in item:
+            raise ValueError(f"plugin '{name}' returned a malformed item: missing required key '{key}'")
+        val = item[key]
+        if expected_type is int and isinstance(val, bool):
+            raise ValueError(f"plugin '{name}' returned a malformed item: '{key}' must be of type int, got bool")
+        if not isinstance(val, expected_type):
+            raise ValueError(f"plugin '{name}' returned a malformed item: '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
+
+    if "id" not in item:
+        item["id"] = ""
+    elif not isinstance(item["id"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'id' must be of type str, got {type(item['id']).__name__}")
+
+    if "absorb_note" not in item:
+        item["absorb_note"] = ""
+    elif not isinstance(item["absorb_note"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'absorb_note' must be of type str, got {type(item['absorb_note']).__name__}")
+
+    if "actions" not in item:
+        item["actions"] = []
+    elif not isinstance(item["actions"], list):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'actions' must be of type list, got {type(item['actions']).__name__}")
+
+    for action in item["actions"]:
+        if not isinstance(action, dict):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action must be a dictionary, got {type(action).__name__}")
+
+        required_action_keys = {"key": str, "label": str}
+        for key, expected_type in required_action_keys.items():
+            if key not in action:
+                raise ValueError(f"plugin '{name}' returned a malformed item: action missing required key '{key}'")
+            val = action[key]
+            if not isinstance(val, expected_type):
+                raise ValueError(f"plugin '{name}' returned a malformed item: action '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
+
+        if "primary" not in action:
+            action["primary"] = False
+        elif not isinstance(action["primary"], bool):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'primary' must be of type bool, got {type(action['primary']).__name__}")
+
+        if "payload" not in action:
+            action["payload"] = {}
+        elif not isinstance(action["payload"], dict):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'payload' must be of type dict, got {type(action['payload']).__name__}")
+
+
 def fetch_all(config):
-    """Call every configured plugin's fetch(), tagging each returned
-    action with which plugin produced it (core's own bookkeeping, not
-    part of the plugin's return value) so act() later knows who to
+    """Call every configured plugin's fetch() concurrently, tagging each
+    returned action with which plugin produced it (core's own bookkeeping,
+    not part of the plugin's return value) so act() later knows who to
     dispatch a pressed key to. One plugin failing (bad config, missing
     dependency, network error) never takes down the others.
+
+    Plugins are loaded in the main thread first (load_plugin mutates
+    sys.path which isn't thread-safe), then only fetch() runs in parallel.
     """
-    items = []
-    for name in config.get("plugins", DEFAULT_PLUGINS):
+    plugin_names = config.get("plugins", DEFAULT_PLUGINS)
+    if not plugin_names:
+        return []
+
+    # Pre-load all plugins in the main thread.
+    for name in plugin_names:
+        try:
+            load_plugin(name)
+        except Exception:
+            pass
+
+    def _fetch_one(name):
         try:
             mod = load_plugin(name)
             fetched = mod.fetch(config) or []
         except Exception:
-            fetched = []
+            return []
+        try:
+            for item in fetched:
+                validate_and_normalize_item(item, name)
+        except Exception as e:
+            print(e, file=sys.stderr)
+            return []
         for item in fetched:
             for action in item.get("actions", []):
                 action["_plugin"] = name
-            items.append(item)
+                action["_item_id"] = item.get("id")
+        return fetched
+
+    items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(plugin_names)) as pool:
+        futures = {pool.submit(_fetch_one, name): name for name in plugin_names}
+        for fut in concurrent.futures.as_completed(futures):
+            items.extend(fut.result())
     return items
 
 
@@ -244,9 +361,45 @@ def render_rows(items):
     return rows
 
 
-def build_prioritized_items(config):
+def build_prioritized_items(config, recently_acted=None):
+    """Fetch, merge, and sort items.  `recently_acted` is a set of item
+    ids that should be deprioritized (e.g. the user just acted on them).
+    Older items get a small age boost so they don't get buried.
+    """
     items = fetch_all(config)
     items = merge_cross_links(items)
+
+    # Age-based weight boost: items created more than a day ago get +1,
+    # more than a week get +2, etc.  Plugins that can supply a real
+    # creation timestamp set "created_at" (ISO 8601); items without one
+    # (reminders, calendar events -- there's no meaningful "created"
+    # concept for those) get no boost.
+    now = datetime.now(timezone.utc)
+    for it in items:
+        age_boost = 0
+        created_at = it.get("created_at", "")
+        if created_at:
+            try:
+                created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_days = (now - created).total_seconds() / 86400
+                if age_days >= 7:
+                    age_boost = 3
+                elif age_days >= 3:
+                    age_boost = 2
+                elif age_days >= 1:
+                    age_boost = 1
+            except (ValueError, TypeError):
+                pass
+        it["weight"] = it.get("weight", 0) + age_boost
+
+    # Deprioritize recently-acted items.
+    if recently_acted:
+        for it in items:
+            if it.get("id") in recently_acted:
+                it["weight"] = max(0, it.get("weight", 0) - 20)
+
     items.sort(key=lambda x: x.get("weight", 0), reverse=True)
     return items
 
@@ -289,7 +442,10 @@ def act(key, line):
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
         mod = load_plugin(action["_plugin"])
-        mod.act(action.get("_original_key", resolved_key), action.get("payload"))
+        payload = action.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"plugin '{action['_plugin']}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
+        mod.act(action.get("_original_key", resolved_key), payload)
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
     except Exception as e:
@@ -306,10 +462,25 @@ def run_dashboard():
     plain print()/input() prompts) and this loop re-renders fzf fresh
     next time round, so newly-completed/dispatched items drop off and
     newly-relevant ones appear without any extra bookkeeping.
+
+    Periodically re-fetches data (every 60s) so the list stays fresh
+    without the user needing to quit and restart.
     """
+    import time
+
     config = load_config()
+    recently_acted = set()
+    last_refresh = 0.0
+    refresh_interval = 60  # seconds between background refreshes
+
     while True:
-        items = build_prioritized_items(config)
+        now = time.time()
+        # Re-fetch if enough time has passed since last refresh.
+        if now - last_refresh >= refresh_interval:
+            last_refresh = now
+            print("Refreshing data...")
+
+        items = build_prioritized_items(config, recently_acted)
         rows = render_rows(items)
         if not rows:
             print("Nothing needs attention right now.")
@@ -317,7 +488,7 @@ def run_dashboard():
         try:
             proc = subprocess.run(
                 [
-                    "fzf", "--ansi", "--height", "~60%", "--layout=reverse",
+                    "fzf", "--ansi", "--height", "10", "--layout=reverse",
                     "--header", "Hotkeys act immediately on this row · Enter = primary action · Esc = quit",
                     "-d", "\t", "--with-nth", "1",
                     "--expect", ",".join(expect_keys_for(items)),
@@ -339,7 +510,29 @@ def run_dashboard():
             key, row = out.rstrip("\n"), ""
         else:
             key, row = out[:first_nl], out[first_nl + 1:].rstrip("\n")
+
+        # Extract the item id before acting so we can deprioritize it.
+        item_id = None
+        if row:
+            parts = row.split("\t", 1)
+            if len(parts) >= 2:
+                try:
+                    actions = json.loads(base64.b64decode(parts[1].split("\t", 1)[0]).decode())
+                    for a in actions:
+                        if a.get("key") == key or (key == "" and a.get("primary")):
+                            item_id = a.get("_item_id")
+                            break
+                except Exception:
+                    pass
+
         act(key, row)
+
+        # Track the acted item for deprioritization on the next render.
+        if item_id:
+            recently_acted.add(item_id)
+            # Keep the set bounded — drop entries older than 10 items.
+            if len(recently_acted) > 10:
+                recently_acted.pop()
 
 
 if __name__ == "__main__":

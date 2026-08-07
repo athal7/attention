@@ -38,18 +38,21 @@ def _get_gh_login():
     return ""
 
 
-def _fetch_authored_pr_attention():
-    """Open PRs I authored that need MY attention right now: failing
+def _fetch_pr_attention(author):
+    """Open PRs `author` authored that need attention right now: failing
     checks, changes requested, a merge conflict, or a comment from
-    someone else. `gh search prs` (used to find the candidates) exposes
-    none of that state -- its --json fields are limited to search-index
-    metadata -- so this follows up with one `gh pr view` per candidate
-    (repo is already known from the search hit, so this is a targeted
-    lookup, not a repo-wide scan) to pull the actionable fields.
+    someone else. `author` is a `gh search prs --author=` value ("@me"
+    for yourself, or any other GitHub username to also track a
+    teammate's PRs, see config["github"]["trackAuthors"]). `gh search
+    prs` (used to find the candidates) exposes none of that state --
+    its `--json` fields are limited to search-index metadata -- so
+    this follows up with one `gh pr view` per candidate (repo is
+    already known from the search hit, so this is a targeted lookup,
+    not a repo-wide scan) to pull the actionable fields.
     """
     prs = _gh_json([
-        "search", "prs", "--author=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
+        "search", "prs", f"--author={author}", "--state=open", "--limit", "50",
+        "--json", "number,title,repository,url,isDraft,createdAt",
     ])
     if not prs:
         return []
@@ -63,7 +66,7 @@ def _fetch_authored_pr_attention():
             continue
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,comments",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,comments,isDraft",
         ])
         if not isinstance(detail, dict):
             continue
@@ -93,7 +96,7 @@ def _fetch_my_repo_issues():
     # assigned to me and misses everything else in my own repos.
     return _gh_json([
         "search", "issues", "--owner=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
+        "--json", "number,title,repository,url,createdAt",
     ])
 
 
@@ -132,7 +135,7 @@ def _build_repo_dir_index(code_dir):
     return index
 
 
-def _fetch_raw():
+def _fetch_raw(config):
     # `gh pr list`/`gh issue list` are repo-scoped: they resolve a single
     # target repo from the cwd's git remote (or an explicit -R) and only
     # filter *within* that repo, so --search never made them search across
@@ -140,21 +143,29 @@ def _fetch_raw():
     # global cross-repo search subcommands.
     review_prs = _gh_json([
         "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
+        "--json", "number,title,repository,url,isDraft,createdAt",
     ])
     for p in review_prs:
         p["type"] = "review_request"
 
     assigned_issues = _gh_json([
         "search", "issues", "--assignee=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url",
+        "--json", "number,title,repository,url,createdAt",
     ])
     for i in assigned_issues:
         i["type"] = "assigned_issue"
 
-    authored_prs = _fetch_authored_pr_attention()
+    authored_prs = _fetch_pr_attention("@me")
     for p in authored_prs:
         p["type"] = "authored_attention"
+
+    tracked_prs = []
+    for author in config.get("github", {}).get("trackAuthors", []):
+        prs = _fetch_pr_attention(author)
+        for p in prs:
+            p["type"] = "tracked_attention"
+            p["tracked_author"] = author
+        tracked_prs.extend(prs)
 
     repo_issues = _fetch_my_repo_issues()
     for i in repo_issues:
@@ -169,7 +180,7 @@ def _fetch_raw():
     # plain assigned/repo listing, so they're listed first.
     seen = set()
     combined = []
-    for item in review_prs + authored_prs + assigned_issues + repo_issues:
+    for item in review_prs + authored_prs + tracked_prs + assigned_issues + repo_issues:
         key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
         if key in seen:
             continue
@@ -185,7 +196,7 @@ def get_repo_from_url(url):
 
 
 def fetch(config):
-    raw = _fetch_raw()
+    raw = _fetch_raw(config)
     if not raw:
         return []
 
@@ -202,6 +213,7 @@ def fetch(config):
         repo_name = g.get("repository", {}).get("nameWithOwner", "unknown").replace("\t", " ").replace("|", "/")
         number = str(g.get("number"))
         url = g.get("url", "")
+        is_draft = g.get("isDraft", False)
 
         gtype = g.get("type", "")
         details = ""
@@ -210,10 +222,17 @@ def fetch(config):
         elif gtype == "authored_attention":
             weight, status = 88, "NEEDS ATTENTION"
             details = ", ".join(g.get("attention_reasons", []))
+        elif gtype == "tracked_attention":
+            weight, status = 85, f"{g.get('tracked_author', '').upper()}: NEEDS ATTENTION"
+            details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
         else:
-            weight, status = 55, "OPEN"
+            # repo_issue: boost so they rank higher
+            weight, status = 70, "OPEN"
+
+        if is_draft:
+            status = f"DRAFT: {status}"
 
         dir_name = repo_dir_index.get(repo_name.lower(), repo_name.split("/")[-1])
         repo_path = os.path.join(code_dir, dir_name)
@@ -226,6 +245,7 @@ def fetch(config):
             "details": details,
             "weight": weight,
             "id": number,
+            "created_at": g.get("createdAt", ""),
             "absorb_note": f"{status}: {title}",
             "actions": [
                 {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},

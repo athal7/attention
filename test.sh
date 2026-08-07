@@ -220,7 +220,7 @@ echo "\$*" >> "$GH_LOG"
 case "\$*" in
   "search prs --review-requested=@me"*)
     cat <<'JSON'
-[{"number": 1, "title": "GHTEST-review-me", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/1"}]
+[{"number": 1, "title": "GHTEST-review-me", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/1"}, {"number": 5, "title": "GHTEST-draft-review", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/5", "isDraft": true}]
 JSON
     ;;
   "search prs --author=@me"*)
@@ -286,6 +286,8 @@ test_github_source() {
   pr_line="$(grep 'GHTEST-review-me' <<<"$out" || true)"
   issue_line="$(grep 'GHTEST-assigned-me' <<<"$out" || true)"
   authored_line="$(grep 'GHTEST-authored-me' <<<"$out" || true)"
+  local draft_line
+  draft_line="$(grep 'GHTEST-draft-review' <<<"$out" || true)"
   repo_issue_line="$(grep 'GHTEST-repo-issue' <<<"$out" || true)"
 
   case "$pr_line" in
@@ -304,6 +306,10 @@ test_github_source() {
   case "$repo_issue_line" in
     "OPEN"*"myorg/kb"*) ok "owned-repo issue (not assigned to me) appears with OPEN status" ;;
     *) bad "owned-repo issue (not assigned to me) appears with OPEN status (got: $repo_issue_line)" ;;
+  esac
+  case "$draft_line" in
+    "DRAFT:"*"myorg/kb"*) ok "draft PR shown with DRAFT status, distinguishable from ready-to-review" ;;
+    *) bad "draft PR shown with DRAFT status, distinguishable from ready-to-review (got: $draft_line)" ;;
   esac
 
   check "issue matching both assignee and owner queries appears exactly once" \
@@ -361,6 +367,64 @@ print(session['payload']['repo_path'])
   check "repo_path matches the shorthand-named local clone via its git remote" "$decoded" "$FAKE_CODE_DIR/bigproj"
 }
 test_repo_path_git_remote_autodetect
+
+# ---------------------------------------------------------------------------
+echo
+echo "== github plugin: tracked-author PRs needing attention, config[\"github\"][\"trackAuthors\"] =="
+
+JULES_BIN="$WORK/bin-jules"
+mkdir -p "$JULES_BIN"
+cat > "$JULES_BIN/gh" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "search prs --author=jules-bot"*)
+    cat <<'JSON'
+[{"number": 11, "title": "JULESTEST-needs-attention", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/11"}]
+JSON
+    ;;
+  "pr view 11 -R myorg/kb"*)
+    cat <<'JSON'
+{"mergeable": "MERGEABLE", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [], "comments": []}
+JSON
+    ;;
+  "api user --jq .login")
+    echo "ghtestuser"
+    ;;
+  *) echo "[]" ;;
+esac
+exit 0
+STUB
+chmod +x "$JULES_BIN/gh"
+
+write_config <<'JSON'
+{"plugins": ["github"], "codeDir": "/tmp/nonexistent-fakecode", "github": {"trackAuthors": ["jules-bot"]}}
+JSON
+
+test_tracked_author_pr_with_configured_list() {
+  local out jules_line
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$JULES_BIN:$PATH" python3 "$ATTENTION" list)"
+  jules_line="$(grep 'JULESTEST-needs-attention' <<<"$out" || true)"
+  case "$jules_line" in
+    "JULES-BOT:"*"myorg/kb"*) ok "a tracked author's flagged PR appears with their username in the status" ;;
+    *) bad "a tracked author's flagged PR appears with their username in the status (got: $jules_line)" ;;
+  esac
+}
+test_tracked_author_pr_with_configured_list
+
+write_config <<'JSON'
+{"plugins": ["github"], "codeDir": "/tmp/nonexistent-fakecode", "github": {}}
+JSON
+
+test_tracked_author_skipped_without_configured_list() {
+  local out
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$JULES_BIN:$PATH" python3 "$ATTENTION" list)"
+  if grep -q 'JULESTEST-needs-attention' <<<"$out"; then
+    bad "no tracked-author query is run when github.trackAuthors is unconfigured (got: $out)"
+  else
+    ok "no tracked-author query is run when github.trackAuthors is unconfigured"
+  fi
+}
+test_tracked_author_skipped_without_configured_list
 
 # ---------------------------------------------------------------------------
 echo
@@ -447,6 +511,324 @@ test_custom_plugin_resolution_and_dispatch() {
 }
 test_custom_plugin_resolution_and_dispatch
 
+
+# ---------------------------------------------------------------------------
+echo
+echo "== generic plugin: config-only provider (command + field templates, no .py file) =="
+
+GENERIC_BIN="$WORK/bin-generic"
+mkdir -p "$GENERIC_BIN"
+GENERIC_OPEN_LOG="$WORK/generic-open.log"; : > "$GENERIC_OPEN_LOG"
+GENERIC_SESSION_LOG="$WORK/generic-session.log"; : > "$GENERIC_SESSION_LOG"
+
+cat > "$GENERIC_BIN/my-source-cli" <<'STUB'
+#!/bin/sh
+cat <<'JSON'
+[
+  {"num": 7, "name": "GENERICTEST-first", "proj": {"slug": "backend"}, "link": "https://example.com/7", "prio": "12"},
+  {"num": 8, "name": "GENERICTEST-second", "proj": {"slug": "frontend"}, "link": "https://example.com/8"}
+]
+JSON
+STUB
+chmod +x "$GENERIC_BIN/my-source-cli"
+
+cat > "$GENERIC_BIN/open" <<STUB
+#!/bin/sh
+echo "\$*" >> "$GENERIC_OPEN_LOG"
+STUB
+chmod +x "$GENERIC_BIN/open"
+
+cat > "$GENERIC_BIN/my-session-cli" <<STUB
+#!/bin/sh
+echo "\$*" >> "$GENERIC_SESSION_LOG"
+STUB
+chmod +x "$GENERIC_BIN/my-session-cli"
+
+cat > "$GENERIC_BIN/failing-cli" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+chmod +x "$GENERIC_BIN/failing-cli"
+
+write_config <<JSON
+{
+  "plugins": ["generic"],
+  "generic": {
+    "my-source": {
+      "command": ["my-source-cli"],
+      "status": "NEEDS REVIEW",
+      "context": "{proj.slug}",
+      "title": "{name}",
+      "details": "prio {prio}",
+      "id": "{num}",
+      "weight": "{prio}",
+      "actions": [
+        {"key": "alt-o", "label": "open", "primary": true, "command": ["open", "{link}"]},
+        {"key": "alt-s", "label": "session", "background": true, "command": ["my-session-cli", "-n", "{num}"]}
+      ]
+    },
+    "broken-source": {
+      "command": ["failing-cli"]
+    }
+  }
+}
+JSON
+
+test_generic_provider() {
+  local out first_line second_line
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" list)"
+  first_line="$(grep 'GENERICTEST-first' <<<"$out" || true)"
+  second_line="$(grep 'GENERICTEST-second' <<<"$out" || true)"
+
+  case "$first_line" in
+    "NEEDS REVIEW"*"backend"*"GENERICTEST-first"*"prio 12"*)
+      ok "status/context/title/details resolve {dotted.path} templates against the record" ;;
+    *) bad "status/context/title/details resolve {dotted.path} templates against the record (got: $first_line)" ;;
+  esac
+
+  case "$second_line" in
+    *"{prio}"*) bad "a missing {path} substitutes empty string rather than leaving the brace unresolved (got: $second_line)" ;;
+    *) ok "a missing {path} substitutes empty string rather than leaving the brace unresolved" ;;
+  esac
+
+  local weights
+  weights="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 -c "
+$LOAD_CORE
+items = m.build_prioritized_items(m.load_config())
+for it in items:
+    print(it['title'], it['weight'])
+")"
+  check "weight template {prio} resolves and parses as int" \
+    "$(grep 'GENERICTEST-first' <<<"$weights" | awk '{print $NF}')" "12"
+  check "weight template with no matching field falls back to the default" \
+    "$(grep 'GENERICTEST-second' <<<"$weights" | awk '{print $NF}')" "50"
+
+  : > "$GENERIC_OPEN_LOG"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "alt-o" "$first_line" >/dev/null 2>&1
+  check "action command template substitutes the record's field before dispatch" \
+    "$(cat "$GENERIC_OPEN_LOG")" "https://example.com/7"
+
+  : > "$GENERIC_SESSION_LOG"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "alt-s" "$first_line" >/dev/null 2>&1
+  sleep 0.3
+  check "an action marked background dispatches via dispatch_background, not run_cmd" \
+    "$(cat "$GENERIC_SESSION_LOG")" "-n 7"
+
+  if grep -q 'GENERICTEST' <<<"$out" && [ "$(grep -c 'GENERICTEST' <<<"$out")" = "2" ]; then
+    ok "one provider's failing command does not prevent another provider in the same config from contributing"
+  else
+    bad "one provider's failing command does not prevent another provider in the same config from contributing (got: $out)"
+  fi
+}
+test_generic_provider
+
+# ---------------------------------------------------------------------------
+echo
+echo "== core: build_prioritized_items() deprioritizes recently-acted items =="
+
+DEPRIO_PLUGIN="$WORK/deprio_plugin.py"
+cat > "$DEPRIO_PLUGIN" <<'PY'
+def fetch(config):
+    return [{
+        "status": "PENDING", "context": "test-source", "title": "Deprio item", "details": "",
+        "weight": 70, "id": "dp1",
+        "actions": [{"key": "alt-z", "label": "zap", "payload": {}}],
+    }]
+
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$DEPRIO_PLUGIN"]}
+JSON
+
+test_recently_acted_deprioritized() {
+  local before after blob item_id
+  before="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+$LOAD_CORE
+items = m.build_prioritized_items(m.load_config())
+print(items[0]['weight'])
+")"
+  check "weight before any action" "$before" "70"
+
+  after="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+$LOAD_CORE
+items = m.build_prioritized_items(m.load_config(), recently_acted={'dp1'})
+print(items[0]['weight'])
+")"
+  check "weight after its id is marked recently-acted (70 - 20 penalty)" "$after" "50"
+
+  item_id="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+$LOAD_CORE
+items = m.fetch_all(m.load_config())
+print(items[0]['actions'][0]['_item_id'])
+")"
+  check "fetch_all() tags each action with its item's id (so the dashboard loop can track it)" "$item_id" "dp1"
+}
+test_recently_acted_deprioritized
+
+# ---------------------------------------------------------------------------
+echo
+echo "== core: build_prioritized_items() ages items by real created_at, not by id =="
+
+AGE_PLUGIN="$WORK/age_plugin.py"
+cat > "$AGE_PLUGIN" <<'PY'
+from datetime import datetime, timedelta, timezone
+
+def fetch(config):
+    now = datetime.now(timezone.utc)
+    old_ts = (now - timedelta(days=10)).isoformat().replace("+00:00", "Z")
+    new_ts = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    return [
+        {"status": "OPEN", "context": "org/new-repo", "title": "New repo PR3", "details": "",
+         "weight": 70, "id": "3", "created_at": new_ts, "actions": []},
+        {"status": "OPEN", "context": "org/old-repo", "title": "Old repo PR3", "details": "",
+         "weight": 70, "id": "3", "created_at": old_ts, "actions": []},
+        {"status": "OPEN", "context": "no-ts", "title": "No timestamp item", "details": "",
+         "weight": 70, "id": "3", "actions": []},
+    ]
+
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$AGE_PLUGIN"]}
+JSON
+
+test_age_boost_uses_created_at_not_id() {
+  local weights
+  weights="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+$LOAD_CORE
+items = m.build_prioritized_items(m.load_config())
+for it in items:
+    print(it['title'], it['weight'])
+")"
+  check "10-day-old item (id=3) gets the full +3 age boost" \
+    "$(grep 'Old repo PR3' <<<"$weights" | awk '{print $NF}')" "73"
+  check "1-hour-old item sharing the same id=3 gets no age boost (age is by timestamp, not id)" \
+    "$(grep 'New repo PR3' <<<"$weights" | awk '{print $NF}')" "70"
+  check "item with no created_at at all (id=3) gets no age boost" \
+    "$(grep 'No timestamp item' <<<"$weights" | awk '{print $NF}')" "70"
+  local first_title
+  first_title="$(head -1 <<<"$weights" | cut -d' ' -f1-3)"
+  check "the actually-older item sorts first despite sharing an id with a newer one" \
+    "$first_title" "Old repo PR3"
+}
+test_age_boost_uses_created_at_not_id
+
+# ---------------------------------------------------------------------------
+echo
+echo "== core: validate_and_normalize_item() enforces the plugin boundary shape =="
+
+test_runtime_validation() {
+  local err
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects missing required item key status" "$err" "err: plugin 'badplugin' returned a malformed item: missing required key 'status'"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': '10'}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for weight (str instead of int)" "$err" "err: plugin 'badplugin' returned a malformed item: 'weight' must be of type int, got str"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': True}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for weight (bool instead of int, bool is an int subclass)" "$err" "err: plugin 'badplugin' returned a malformed item: 'weight' must be of type int, got bool"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'label': 'open'}]}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects action missing required key 'key'" "$err" "err: plugin 'badplugin' returned a malformed item: action missing required key 'key'"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'alt-o', 'label': 123}]}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "detects wrong type for action label" "$err" "err: plugin 'badplugin' returned a malformed item: action 'label' must be of type str, got int"
+
+  local defaults
+  defaults="$(python3 -c "
+$LOAD_CORE
+import json
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'alt-o', 'label': 'o'}]}
+m.validate_and_normalize_item(item, 'goodplugin')
+print(json.dumps(item))
+")"
+  check "defaults optional item fields (id, absorb_note) to empty string" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['id'], item['absorb_note'])" "$defaults")" \
+    " "
+  check "defaults optional action fields (primary=False, payload={})" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['actions'][0]['primary'], item['actions'][0]['payload'])" "$defaults")" \
+    "False {}"
+
+  local act_err
+  act_err="$(python3 -c "
+$LOAD_CORE
+line = 'STATUS\t' + m.base64.b64encode(m.json.dumps([{'key': 'alt-o', 'label': 'o', 'payload': 'not-a-dict', '_plugin': 'github'}]).encode()).decode()
+m.act('alt-o', line)
+" 2>/dev/null || true)"
+  check "act() rejects a non-dict payload before dispatching to the plugin" "$act_err" "Action failed: plugin 'github' act() received a malformed payload: expected a dictionary, got str"
+}
+test_runtime_validation
+
+VALIDATION_ISOLATION_PLUGIN="$WORK/validation_isolation_plugin.py"
+cat > "$VALIDATION_ISOLATION_PLUGIN" <<'PY'
+def fetch(config):
+    return [{"status": "OK", "context": "ctx", "title": "t", "details": "", "weight": "not-an-int"}]
+
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["github", "$VALIDATION_ISOLATION_PLUGIN"], "codeDir": "/tmp/nonexistent-fakecode", "github": {}}
+JSON
+
+test_malformed_item_isolated_to_its_own_plugin() {
+  local out err rc
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GH_BIN:$PATH" python3 "$ATTENTION" list 2>"$WORK/validation-stderr.log")" && rc=0 || rc=$?
+  check "a plugin returning a malformed item does not crash the whole run" "$rc" "0"
+  if grep -q 'GHTEST-review-me' <<<"$out"; then
+    ok "other plugins still contribute when one plugin's item fails validation"
+  else
+    bad "other plugins still contribute when one plugin's item fails validation (got: $out)"
+  fi
+  err="$(cat "$WORK/validation-stderr.log")"
+  case "$err" in
+    *"plugin '$VALIDATION_ISOLATION_PLUGIN' returned a malformed item: 'weight' must be of type int, got str"*)
+      ok "the validation failure is printed to stderr, naming the plugin and the exact problem" ;;
+    *) bad "the validation failure is printed to stderr, naming the plugin and the exact problem (got: $err)" ;;
+  esac
+}
+test_malformed_item_isolated_to_its_own_plugin
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
@@ -1061,6 +1443,8 @@ mkdir -p "$DASH_BIN"
 DASH_FZF_LOG="$WORK/dashboard-fzf-calls.log"
 DASH_OPEN_LOG="$WORK/dashboard-open.log"
 : > "$DASH_FZF_LOG"; : > "$DASH_OPEN_LOG"
+DASH_FZF_ARGS_LOG="$WORK/dashboard-fzf-args.log"
+: > "$DASH_FZF_ARGS_LOG"
 
 cat > "$DASH_BIN/gh" <<'STUB'
 #!/bin/sh
@@ -1084,6 +1468,7 @@ chmod +x "$DASH_BIN/open"
 cat > "$DASH_BIN/fzf" <<STUB
 #!/bin/sh
 echo call >> "$DASH_FZF_LOG"
+echo "\$*" >> "$DASH_FZF_ARGS_LOG"
 calls=\$(wc -l < "$DASH_FZF_LOG")
 if [ "\$calls" -eq 1 ]; then
   first_line=\$(head -1)
@@ -1106,6 +1491,11 @@ test_run_dashboard_loop() {
     ok "the hotkey pressed on the fzf-selected row actually dispatched (alt-o -> open)"
   else
     bad "the hotkey pressed on the fzf-selected row actually dispatched (got: $(cat "$DASH_OPEN_LOG"))"
+  fi
+  if grep -q -- '--height 10' "$DASH_FZF_ARGS_LOG"; then
+    ok "fzf invoked with a fixed --height (shows ~5 items regardless of terminal size, not a % of it)"
+  else
+    bad "fzf invoked with a fixed --height (shows ~5 items regardless of terminal size, not a % of it) (got: $(cat "$DASH_FZF_ARGS_LOG"))"
   fi
 }
 test_run_dashboard_loop
