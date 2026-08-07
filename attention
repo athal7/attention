@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import TypedDict, List, Dict, Any
+from typing import TypedDict
 
 class ActionRequired(TypedDict):
     key: str
@@ -42,7 +42,7 @@ class ItemRequired(TypedDict):
 class Item(ItemRequired, total=False):
     id: str
     absorb_note: str
-    actions: List[Action]
+    actions: list[Action]
 
 USAGE = """Usage: attention [COMMAND]
 
