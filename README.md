@@ -63,11 +63,11 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 
 | Key | Meaning |
 |---|---|
-| `plugins` | Which plugins to run, in order. A bare name (`"github"`) loads a bundled plugin; anything containing `/` or ending in `.py` is a path to your own -- see [PLUGINS.md](PLUGINS.md). Missing entirely = the four bundled plugins. |
+| `plugins` | Which plugins to run, in order. A bare name (`"github"`) loads a bundled plugin; anything containing `/` or ending in `.py` is a path to your own -- see [PLUGINS.md](PLUGINS.md). Missing entirely = the five bundled plugins. |
 | `codeDir` | Parent directory of your local repo clones (default `~/code`). Used by the `github` plugin, which resolves each item's local checkout by matching each subdirectory's own `git remote origin` against the item's repo -- not by name, so a repo cloned under a shorthand directory name still resolves. |
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
-| `github` | No config needed -- it's always your PRs/issues, via [`gh`](https://cli.github.com) on `PATH`, already authenticated. |
+| `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 
 ## What each bundled plugin surfaces
@@ -76,13 +76,20 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   how soon they start (declined/free/cancelled events excluded).
 - **reminders**: open (incomplete) reminders on the configured lists, weighted
   by due date (overdue/due-today) or priority.
-- **github**: PRs where your review is requested; PRs you authored that need
-  attention (failing checks, changes requested, a merge conflict, or a new
-  comment from someone else); issues assigned to you; open issues in repos you
-  own regardless of assignee. De-duplicated by repo+number if an item matches
-  more than one of these.
+- **github**: PRs where your review is requested; PRs you (or anyone listed
+  in `github.trackAuthors`) authored that need attention (failing checks,
+  changes requested, a merge conflict, or a new comment from someone else);
+  issues assigned to you; open issues in repos you own regardless of
+  assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
+  hidden. De-duplicated by repo+number if an item matches more than one of
+  these.
 - **linear**: your assigned issues not in a completed/canceled/duplicate
   state.
+- **generic**: config-only providers -- run a command, map its JSON output
+  onto the item shape via `{dotted.path}` templates. See
+  [PLUGINS.md](PLUGINS.md#config-only-providers-no-python-required) for
+  the config shape; contributes nothing until you define a provider under
+  `config["generic"]`.
 
 Two generic, source-agnostic passes then cross-link items regardless of
 which plugin produced them: an item whose title mentions another item's

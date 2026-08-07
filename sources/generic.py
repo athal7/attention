@@ -1,0 +1,138 @@
+"""generic plugin -- define an arbitrary data source purely from config:
+a command that prints a JSON array, plus templates mapping each record's
+fields onto the standard item shape and each action's argv. No Python
+file needed for a source that's just "run a command, map its JSON
+output" -- write a provider config instead of a plugin.
+
+Config (config["generic"]): a dict of named providers, e.g.
+
+    {
+      "plugins": ["github", "generic"],
+      "generic": {
+        "jules-prs": {
+          "command": ["gh", "search", "prs", "--author=google-labs-jules[bot]",
+                       "--state=open", "--json", "number,title,repository,url"],
+          "status": "NEEDS REVIEW",
+          "context": "{repository.nameWithOwner}",
+          "title": "{title}",
+          "id": "{number}",
+          "weight": 85,
+          "actions": [
+            {"key": "alt-o", "label": "open", "primary": true, "command": ["open", "{url}"]}
+          ]
+        }
+      }
+    }
+
+Every text field (status/context/title/details/id, and each action's
+command tokens) is a template: plain text is used as-is; `{dotted.path}`
+substitutes that field from the matching JSON record (missing paths
+become ""). `weight` is a plain int, or a `{path}` template resolved
+then parsed as one (falling back to 50 if that fails).
+
+Each provider is fetched and mapped independently -- one bad provider
+(missing/failing command, non-JSON-array output) contributes nothing,
+without affecting the others.
+"""
+import json
+import re
+import subprocess
+
+from _util import dispatch_background, run_cmd
+
+_PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
+
+
+def _lookup(record, path):
+    val = record
+    for part in path.split("."):
+        if not isinstance(val, dict):
+            return None
+        val = val.get(part)
+    return val
+
+
+def _resolve(template, record):
+    if not isinstance(template, str):
+        return template
+    def _sub(m):
+        val = _lookup(record, m.group(1))
+        return "" if val is None else str(val)
+    return _PLACEHOLDER.sub(_sub, template)
+
+
+def _resolve_weight(spec, record, default=50):
+    if isinstance(spec, bool):
+        return default
+    if isinstance(spec, int):
+        return spec
+    if spec is None:
+        return default
+    try:
+        return int(_resolve(spec, record))
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_provider(name, spec):
+    command = spec.get("command")
+    if not command:
+        return []
+    try:
+        res = subprocess.run(
+            command, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=30,
+        )
+        if res.returncode != 0:
+            return []
+        records = json.loads(res.stdout or "[]")
+    except Exception:
+        return []
+    if not isinstance(records, list):
+        return []
+
+    items = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        actions = []
+        for a in spec.get("actions", []):
+            actions.append({
+                "key": a.get("key", ""),
+                "label": a.get("label", ""),
+                "primary": a.get("primary", False),
+                "payload": {
+                    "command": [_resolve(tok, record) for tok in a.get("command", [])],
+                    "background": a.get("background", False),
+                },
+            })
+        items.append({
+            "status": _resolve(spec.get("status", name), record),
+            "context": _resolve(spec.get("context", name), record),
+            "title": _resolve(spec.get("title", ""), record),
+            "details": _resolve(spec.get("details", ""), record),
+            "weight": _resolve_weight(spec.get("weight"), record),
+            "id": _resolve(spec.get("id", ""), record),
+            "actions": actions,
+        })
+    return items
+
+
+def fetch(config):
+    providers = config.get("generic", {})
+    items = []
+    for name, spec in providers.items():
+        if isinstance(spec, dict):
+            items.extend(_fetch_provider(name, spec))
+    return items
+
+
+def act(key, payload):
+    command = payload.get("command")
+    if not command:
+        print("No command configured.")
+        return
+    if payload.get("background"):
+        dispatch_background(command)
+    else:
+        run_cmd(command)
