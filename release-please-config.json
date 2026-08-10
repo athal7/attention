@@ -3,7 +3,8 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "package-name": "attention"
+      "package-name": "attention",
+      "include-component-in-tag": false
     }
   }
 }
