@@ -1,0 +1,86 @@
+name: release
+
+# No release-please: that flow proposes a version-bump pull request and
+# commits a manifest/CHANGELOG into the repo before a human merges it.
+# Deliberately not wanted here — there is no committed version file for
+# this repo to begin with, and releases should never require a human to
+# review and merge a bot's own version-bump PR just to make a release
+# happen.
+#
+# This workflow instead computes the next semver directly from
+# Conventional Commits since the last tag, pushes that tag, and creates
+# the GitHub release from it directly — no PR, no committed version
+# file, ever.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version from Conventional Commits
+        id: bump
+        run: |
+          set -euo pipefail
+
+          last_tag=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          if [ -z "$last_tag" ]; then
+            range="HEAD"
+            last_tag="v0.0.0"
+          else
+            range="${last_tag}..HEAD"
+          fi
+
+          subjects=$(git log "$range" --no-merges --pretty=format:'%s')
+
+          bump=none
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            case "$subject" in
+              *!:*) bump=major ;;
+              feat:*|feat\(*\):*) [ "$bump" != major ] && bump=minor ;;
+              fix:*|fix\(*\):*) [ "$bump" = none ] && bump=patch ;;
+            esac
+          done <<< "$subjects"
+
+          body=$(git log "$range" --no-merges --pretty=format:'%b')
+          if echo "$body" | grep -q '^BREAKING CHANGE:'; then
+            bump=major
+          fi
+
+          if [ "$bump" = none ]; then
+            echo "No feat/fix/breaking commits since ${last_tag} — skipping release."
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="${last_tag#v}"
+          IFS='.' read -r major minor patch <<< "$version"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_tag="v${major}.${minor}.${patch}"
+
+          echo "Bumping ${last_tag} -> ${new_tag} (${bump})"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$new_tag" -m "$new_tag"
+          git push origin "$new_tag"
+          echo "new_tag=${new_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: ${{ steps.bump.outputs.new_tag != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ steps.bump.outputs.new_tag }}" --generate-notes
