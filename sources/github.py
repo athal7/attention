@@ -6,6 +6,7 @@ Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
 checkout.
 """
+import concurrent.futures
 import json
 import os
 import re
@@ -13,6 +14,13 @@ import subprocess
 from pathlib import Path
 
 from _util import dispatch_background, run_cmd, slugify
+
+# Fixed ceiling on any thread pool below, independent of how many
+# candidates/authors/directories a given call has to fan out over --
+# a large `trackAuthors` list or a code_dir with hundreds of checkouts
+# must not translate into hundreds of concurrent `gh`/`git` subprocess
+# spawns.
+_MAX_WORKERS = 8
 
 
 def _gh_json(args):
@@ -48,7 +56,12 @@ def _fetch_pr_attention(author):
     its `--json` fields are limited to search-index metadata -- so
     this follows up with one `gh pr view` per candidate (repo is
     already known from the search hit, so this is a targeted lookup,
-    not a repo-wide scan) to pull the actionable fields.
+    not a repo-wide scan) to pull the actionable fields. Each `pr view`
+    is an independent network round trip, so they run concurrently
+    (thread pool, not processes -- these are I/O-bound subprocess
+    calls) rather than one-at-a-time; sequentially, 50 candidates at
+    even a few hundred ms each turns a dashboard refresh into a
+    multi-second stall.
     """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--limit", "50",
@@ -59,18 +72,18 @@ def _fetch_pr_attention(author):
 
     me = _get_gh_login()
     expected_author = me if author == "@me" else author
-    flagged = []
-    for p in prs:
+
+    def _flag_if_attention(p):
         repo = p.get("repository", {}).get("nameWithOwner", "")
         number = p.get("number")
         if not repo or number is None:
-            continue
+            return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
             "--json", "mergeable,reviewDecision,statusCheckRollup,comments,isDraft",
         ])
         if not isinstance(detail, dict):
-            continue
+            return None
 
         reasons = []
         if detail.get("reviewDecision") == "CHANGES_REQUESTED":
@@ -88,10 +101,12 @@ def _fetch_pr_attention(author):
             reasons.append("New Comments")
 
         if not reasons:
-            continue
+            return None
         p["attention_reasons"] = reasons
-        flagged.append(p)
-    return flagged
+        return p
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), _MAX_WORKERS)) as pool:
+        return [p for p in pool.map(_flag_if_attention, prs) if p is not None]
 
 
 def _fetch_my_repo_issues():
@@ -109,33 +124,42 @@ def _build_repo_dir_index(code_dir):
     under code_dir, derived from each subdirectory's own `git remote
     origin`. Intentionally not a maintained/committed mapping -- a repo
     cloned under a shorthand directory name still resolves, with nothing
-    to keep in sync.
+    to keep in sync. Each subdirectory's `git remote` invocation is its
+    own subprocess spawn, independent of every other one, so they run
+    concurrently -- a code_dir with a hundred checkouts would otherwise
+    mean a hundred sequential process spawns before the dashboard can
+    even render.
     """
     index = {}
     try:
-        entries = list(os.scandir(code_dir))
+        entries = [e for e in os.scandir(code_dir) if e.is_dir()]
     except OSError:
+        return index
+    if not entries:
         return index
     # Strip any inherited GIT_DIR/GIT_WORK_TREE/etc: if the caller's
     # environment has one set (e.g. running inside another git hook),
     # `-C entry.path` is silently overridden and every git call below
     # would operate on that unrelated repo instead of entry.path.
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    for entry in entries:
-        if not entry.is_dir():
-            continue
+
+    def _origin_for(entry):
         try:
             res = subprocess.run(
                 ["git", "-C", entry.path, "remote", "get-url", "origin"],
                 capture_output=True, text=True, timeout=2, env=git_env,
             )
             if res.returncode != 0:
-                continue
+                return None
             m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", res.stdout.strip())
-            if m:
-                index[m.group(1).lower()] = entry.name
+            return (m.group(1).lower(), entry.name) if m else None
         except Exception:
-            continue
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(entries), _MAX_WORKERS)) as pool:
+        for result in pool.map(_origin_for, entries):
+            if result:
+                index[result[0]] = result[1]
     return index
 
 
@@ -145,35 +169,62 @@ def _fetch_raw(config):
     # filter *within* that repo, so --search never made them search across
     # all of @me's repos. `gh search prs`/`gh search issues` are the actual
     # global cross-repo search subcommands.
-    review_prs = _gh_json([
-        "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url,isDraft,createdAt",
-    ])
-    for p in review_prs:
-        p["type"] = "review_request"
+    def _review_prs():
+        prs = _gh_json([
+            "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
+            "--json", "number,title,repository,url,isDraft,createdAt",
+        ])
+        for p in prs:
+            p["type"] = "review_request"
+        return prs
 
-    assigned_issues = _gh_json([
-        "search", "issues", "--assignee=@me", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url,createdAt",
-    ])
-    for i in assigned_issues:
-        i["type"] = "assigned_issue"
+    def _assigned_issues():
+        issues = _gh_json([
+            "search", "issues", "--assignee=@me", "--state=open", "--limit", "50",
+            "--json", "number,title,repository,url,createdAt",
+        ])
+        for i in issues:
+            i["type"] = "assigned_issue"
+        return issues
 
-    authored_prs = _fetch_pr_attention("@me")
-    for p in authored_prs:
-        p["type"] = "authored_attention"
+    def _authored_prs():
+        prs = _fetch_pr_attention("@me")
+        for p in prs:
+            p["type"] = "authored_attention"
+        return prs
 
-    tracked_prs = []
-    for author in config.get("github", {}).get("trackAuthors", []):
+    def _tracked_prs(author):
         prs = _fetch_pr_attention(author)
         for p in prs:
             p["type"] = "tracked_attention"
             p["tracked_author"] = author
-        tracked_prs.extend(prs)
+        return prs
 
-    repo_issues = _fetch_my_repo_issues()
-    for i in repo_issues:
-        i["type"] = "repo_issue"
+    def _repo_issues():
+        issues = _fetch_my_repo_issues()
+        for i in issues:
+            i["type"] = "repo_issue"
+        return issues
+
+    track_authors = config.get("github", {}).get("trackAuthors", [])
+
+    # These five queries (plus one per tracked author) share no state
+    # and each costs at least one gh round trip -- some (authored/tracked
+    # attention) already fan out further internally. Running them
+    # one-after-another would stack all of that latency; a thread pool
+    # collapses it to the slowest single query.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4 + len(track_authors), _MAX_WORKERS)) as pool:
+        review_fut = pool.submit(_review_prs)
+        assigned_fut = pool.submit(_assigned_issues)
+        authored_fut = pool.submit(_authored_prs)
+        tracked_futs = [pool.submit(_tracked_prs, author) for author in track_authors]
+        repo_fut = pool.submit(_repo_issues)
+
+        review_prs = review_fut.result()
+        assigned_issues = assigned_fut.result()
+        authored_prs = authored_fut.result()
+        tracked_prs = [p for fut in tracked_futs for p in fut.result()]
+        repo_issues = repo_fut.result()
 
     # De-dupe: the same PR/issue can surface from more than one query (a PR
     # I authored could also be review-requested; an issue assigned to me in

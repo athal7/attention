@@ -34,6 +34,7 @@ Each provider is fetched and mapped independently -- one bad provider
 (missing/failing command, non-JSON-array output) contributes nothing,
 without affecting the others.
 """
+import concurrent.futures
 import json
 import re
 import subprocess
@@ -119,11 +120,23 @@ def _fetch_provider(name, spec):
 
 
 def fetch(config):
-    providers = config.get("generic", {})
+    providers = {
+        name: spec for name, spec in config.get("generic", {}).items()
+        if isinstance(spec, dict)
+    }
+    if not providers:
+        return []
+    # Each provider's command is an independent subprocess (often a
+    # network-bound CLI call, per the module docstring's `gh search prs`
+    # example) -- fetched concurrently so N slow providers cost as long
+    # as the slowest one, not their sum. Capped at a fixed ceiling,
+    # independent of how many providers are configured, so a large
+    # `generic` config can't spawn one process per provider at once.
     items = []
-    for name, spec in providers.items():
-        if isinstance(spec, dict):
-            items.extend(_fetch_provider(name, spec))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 8)) as pool:
+        futures = [pool.submit(_fetch_provider, name, spec) for name, spec in providers.items()]
+        for fut in futures:
+            items.extend(fut.result())
     return items
 
 
