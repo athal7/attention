@@ -15,6 +15,13 @@ from pathlib import Path
 
 from _util import dispatch_background, run_cmd, slugify
 
+# Fixed ceiling on any thread pool below, independent of how many
+# candidates/authors/directories a given call has to fan out over --
+# a large `trackAuthors` list or a code_dir with hundreds of checkouts
+# must not translate into hundreds of concurrent `gh`/`git` subprocess
+# spawns.
+_MAX_WORKERS = 8
+
 
 def _gh_json(args):
     """Run `gh <args...>` and parse its stdout as JSON, returning [] on
@@ -98,7 +105,7 @@ def _fetch_pr_attention(author):
         p["attention_reasons"] = reasons
         return p
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), 16)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), _MAX_WORKERS)) as pool:
         return [p for p in pool.map(_flag_if_attention, prs) if p is not None]
 
 
@@ -149,7 +156,7 @@ def _build_repo_dir_index(code_dir):
         except Exception:
             return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(entries), 16)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(entries), _MAX_WORKERS)) as pool:
         for result in pool.map(_origin_for, entries):
             if result:
                 index[result[0]] = result[1]
@@ -206,7 +213,7 @@ def _fetch_raw(config):
     # attention) already fan out further internally. Running them
     # one-after-another would stack all of that latency; a thread pool
     # collapses it to the slowest single query.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4 + len(track_authors)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4 + len(track_authors), _MAX_WORKERS)) as pool:
         review_fut = pool.submit(_review_prs)
         assigned_fut = pool.submit(_assigned_issues)
         authored_fut = pool.submit(_authored_prs)

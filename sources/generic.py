@@ -129,9 +129,11 @@ def fetch(config):
     # Each provider's command is an independent subprocess (often a
     # network-bound CLI call, per the module docstring's `gh search prs`
     # example) -- fetched concurrently so N slow providers cost as long
-    # as the slowest one, not their sum.
+    # as the slowest one, not their sum. Capped at a fixed ceiling,
+    # independent of how many providers are configured, so a large
+    # `generic` config can't spawn one process per provider at once.
     items = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 8)) as pool:
         futures = [pool.submit(_fetch_provider, name, spec) for name, spec in providers.items()]
         for fut in futures:
             items.extend(fut.result())
