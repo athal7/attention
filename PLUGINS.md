@@ -64,6 +64,14 @@ interactive dashboard's fixed launch-time keybindings; `attention
 list`/`expect-keys`/`act` compute their own key set fresh from
 whatever `fetch()` actually returned and need neither hook.
 
+Every declared key must be a plain fzf key token -- `alt-<letter>` or a
+bare letter/digit, matching the same shape `fetch()`'s own action
+`"key"` fields use (see "Item shape" below). Core embeds each declared
+key verbatim in the dashboard's launch-time binds
+(`KEY:print(KEY)+accept`) and in the focus transform's comma-joined
+`unbind(...)`/`rebind(...)` lists; nothing validates it, so a key
+containing `,`, `:`, `+`, `(`, or `)` breaks those binds.
+
 ### Item shape
 
 Enforced at the plugin boundary: right after a plugin's `fetch()`

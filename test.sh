@@ -825,6 +825,34 @@ print([(it['title'], it['weight']) for it in via_build_prioritized_items] == [(i
 }
 test_build_snapshot_matches_build_prioritized_items_flattened_equivalent
 
+test_build_snapshot_pure_over_stored_items_across_repeated_calls() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+import copy
+
+items_by_plugin = {
+    'p1': [{'status': 'S1', 'context': 'c1', 'title': 'Fix ABC-123 today', 'details': '', 'weight': 5, 'id': '', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 'alt-o', 'label': 'open', 'primary': False, 'payload': {}}], '_plugin': 'p1'}],
+    'p2': [{'status': 'S2', 'context': 'c2', 'title': 'Ticket', 'details': '', 'weight': 10, 'id': 'ABC-123', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 'alt-s', 'label': 'session', 'primary': False, 'payload': {}}], '_plugin': 'p2'}],
+}
+baseline = copy.deepcopy(items_by_plugin)
+
+def rendered(items):
+    return [(it['title'], it['weight'], it['details'], [(a['key'], a['label']) for a in it['actions']]) for it in items]
+
+first = rendered(m.build_snapshot(items_by_plugin))
+second = rendered(m.build_snapshot(items_by_plugin))
+
+print(first == second)
+print(items_by_plugin == baseline)
+")"
+  check "build_snapshot() called twice on the same items_by_plugin mapping returns identical rendered/action results both times" \
+    "$(sed -n 1p <<<"$out")" "True"
+  check "build_snapshot() never mutates the stored provider item objects it was given (source objects unchanged after two calls)" \
+    "$(sed -n 2p <<<"$out")" "True"
+}
+test_build_snapshot_pure_over_stored_items_across_repeated_calls
+
 test_build_prioritized_items_has_no_unreachable_dead_code() {
   local body
   body="$(python3 -c "
@@ -1575,6 +1603,95 @@ print('$NO_HOOK_PLUGIN' in warnings[0] if warnings else '')
 }
 test_declared_action_keys_missing_hook_warns_once_per_run
 
+BROKEN_HOOK_PLUGIN="$WORK/broken_hook_plugin.py"
+cat > "$BROKEN_HOOK_PLUGIN" <<'PY'
+def declared_action_keys(config):
+    return config["generic"]["boom"]
+def fetch(config):
+    return []
+def act(key, payload):
+    pass
+PY
+
+MALFORMED_KEYS_PLUGIN="$WORK/malformed_keys_plugin.py"
+cat > "$MALFORMED_KEYS_PLUGIN" <<'PY'
+ACTION_KEYS = "alt-o"
+def fetch(config):
+    return []
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$BROKEN_HOOK_PLUGIN", "$MALFORMED_KEYS_PLUGIN", "$DECL_KEYS_A_PLUGIN"]}
+JSON
+
+test_declared_action_keys_isolates_broken_plugin_hooks() {
+  local out keys warnings
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+import contextlib, io
+$LOAD_CORE
+config = m.load_config()
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    keys = m.declared_action_keys(config)
+print(','.join(keys))
+warnings = buf.getvalue().strip().splitlines()
+print(len(warnings))
+print('$BROKEN_HOOK_PLUGIN' in warnings[0] if len(warnings) > 0 else '')
+print('$MALFORMED_KEYS_PLUGIN' in warnings[1] if len(warnings) > 1 else '')
+" 2>&1)"
+  keys="$(sed -n 1p <<<"$out")"
+  warnings="$(sed -n 2p <<<"$out")"
+  check "a plugin whose declared_action_keys() raises contributes no keys, and a plugin whose ACTION_KEYS is a bare string ('alt-o') also contributes no keys -- neither aborts the dashboard, the good plugin's keys still land" \
+    "$keys" "alt-o,alt-b,O,B,1,2,3,4,5,6,7,8,9"
+  check "declared_action_keys() warns exactly once for the raising hook and once for the malformed-string ACTION_KEYS (two isolated plugins, two warnings)" \
+    "$warnings" "2"
+  check "the first warning names the plugin whose hook raised" "$(sed -n 3p <<<"$out")" "True"
+  check "the second warning names the plugin whose ACTION_KEYS was a bare string" "$(sed -n 4p <<<"$out")" "True"
+}
+test_declared_action_keys_isolates_broken_plugin_hooks
+
+MIXED_KEYS_PLUGIN="$WORK/mixed_keys_plugin.py"
+cat > "$MIXED_KEYS_PLUGIN" <<'PY'
+ACTION_KEYS = ["alt-z", 5]
+def fetch(config):
+    return []
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$MIXED_KEYS_PLUGIN", "$DECL_KEYS_A_PLUGIN"]}
+JSON
+
+test_declared_action_keys_rejects_mixed_type_list_and_warns_once() {
+  local out keys1 keys2 warnings
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+import contextlib, io
+$LOAD_CORE
+config = m.load_config()
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    keys1 = m.declared_action_keys(config)
+    keys2 = m.declared_action_keys(config)
+print(','.join(keys1))
+print(','.join(keys2))
+warnings = buf.getvalue().strip().splitlines()
+print(len(warnings))
+print('$MIXED_KEYS_PLUGIN' in warnings[0] if len(warnings) > 0 else '')
+" 2>&1)"
+  keys1="$(sed -n 1p <<<"$out")"
+  keys2="$(sed -n 2p <<<"$out")"
+  warnings="$(sed -n 3p <<<"$out")"
+  check "a plugin whose ACTION_KEYS mixes strings with non-strings (['alt-z', 5]) contributes zero keys, not just the non-string entries stripped" \
+    "$keys1" "alt-o,alt-b,O,B,1,2,3,4,5,6,7,8,9"
+  check "declared_action_keys() is stable across repeated calls for a mixed-type-list plugin" "$keys2" "$keys1"
+  check "a mixed-type ACTION_KEYS list warns exactly once even though declared_action_keys() ran twice" "$warnings" "1"
+  check "the warning names the plugin whose ACTION_KEYS was a mixed-type list" "$(sed -n 4p <<<"$out")" "True"
+}
+test_declared_action_keys_rejects_mixed_type_list_and_warns_once
+
 test_action_keys_constants_match_literal_keys_in_fetch() {
   local plugin expected actual
   for plugin in calendar reminders linear github; do
@@ -1610,6 +1727,46 @@ print(','.join(p.declared_action_keys(config)))
     "$out" "alt-o,alt-s"
 }
 test_generic_declared_action_keys_reads_config_only
+
+test_generic_declared_action_keys_guards_malformed_config() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py generic)
+configs = [
+    {'generic': ['not', 'a', 'dict']},
+    {'generic': 'not-even-a-list'},
+    {'generic': {'bad-actions-type': {'command': ['x'], 'actions': 'alt-o'}}},
+    {'generic': {'bad-action-entry': {'command': ['x'], 'actions': ['not-a-dict', {'key': 'alt-s', 'label': 'session'}]}}},
+]
+for config in configs:
+    print(','.join(p.declared_action_keys(config)))
+")"
+  check "declared_action_keys() ignores a non-dict config['generic'] value (list) instead of raising" "$(sed -n 1p <<<"$out")" ""
+  check "declared_action_keys() ignores a non-dict config['generic'] value (string) instead of raising" "$(sed -n 2p <<<"$out")" ""
+  check "declared_action_keys() ignores a provider whose actions value is a string instead of raising" "$(sed -n 3p <<<"$out")" ""
+  check "declared_action_keys() skips a non-dict entry in actions[] but still reads the valid sibling entry" "$(sed -n 4p <<<"$out")" "alt-s"
+}
+test_generic_declared_action_keys_guards_malformed_config
+
+test_plugins_md_documents_declared_key_character_constraints() {
+  local body
+  body="$(python3 -c "
+src = open('$REPO_ROOT/PLUGINS.md').read()
+start = src.index('### Declaring hotkeys for the interactive dashboard')
+end = src.index('### Item shape', start)
+print(src[start:end])
+")"
+  case "$body" in
+    *"alt-<letter>"*"bare letter/digit"*)
+      case "$body" in
+        *","*":"*"+"*"("*")"*) ok "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint and the exact breaking characters (',', ':', '+', '(', ')')" ;;
+        *) bad "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint and the exact breaking characters (',', ':', '+', '(', ')')" ;;
+      esac
+      ;;
+    *) bad "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint (alt-<letter> or a bare letter/digit)" ;;
+  esac
+}
+test_plugins_md_documents_declared_key_character_constraints
 
 
 
@@ -2423,10 +2580,32 @@ test_build_focus_transform_unbind_then_rebind_from_field4() {
 $LOAD_DASHBOARD
 print(repr(d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])))
 ")"
-  check "build_focus_transform() emits a printf unbinding the whole universe then rebinding only {4}'s keys" \
-    "$out" "'printf \"unbind(alt-o,alt-s,O,S,1)+rebind(%s)\" {4}'"
+  check "build_focus_transform() emits a shell snippet unbinding the whole universe then rebinding only {4}'s keys when {4} is non-empty" \
+    "$out" "'k={4}; if [ -z \"\$k\" ]; then printf \"unbind(alt-o,alt-s,O,S,1)\"; else printf \"unbind(alt-o,alt-s,O,S,1)+rebind(%s)\" \"\$k\"; fi'"
 }
 test_build_focus_transform_unbind_then_rebind_from_field4
+
+test_build_focus_transform_emits_unbind_only_when_row_has_no_keys() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import shlex, subprocess
+
+cmd = d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])
+
+def run_for_field4(value):
+    substituted = cmd.replace('{4}', shlex.quote(value))
+    return subprocess.run(['sh', '-c', substituted], capture_output=True, text=True, check=True).stdout
+
+print(repr(run_for_field4('alt-o,O')))
+print(repr(run_for_field4('')))
+")"
+  check "a row with keys in field 4 gets unbind(universe)+rebind(that row's keys)" \
+    "$(sed -n 1p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)+rebind(alt-o,O)'"
+  check "a row with no keys in field 4 gets unbind(universe) only -- never an empty rebind() fzf would reject, so the previous row's binding cannot persist" \
+    "$(sed -n 2p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)'"
+}
+test_build_focus_transform_emits_unbind_only_when_row_has_no_keys
 
 test_build_focus_transform_no_shell_breaking_chars_for_any_declarable_key() {
   local out
@@ -2435,13 +2614,17 @@ $LOAD_DASHBOARD
 universe = ['alt-o', 'alt-b', 'alt-q', 'O', 'B', 'Q'] + list('123456789')
 cmd = d.build_focus_transform(universe)
 binds = d.build_launch_binds(universe)
-print(all(c not in cmd for c in ['\`', '\$', ';', '|', '&', chr(39)]))
+universe_csv = ','.join(universe)
+print(all(c not in universe_csv for c in ['\`', '\$', ';', '|', '&', chr(39)]))
+print(universe_csv in cmd)
 print(all(':' in b and '(' not in b.split(':', 1)[0] for b in binds[:-1]))
 ")"
-  check "build_focus_transform()'s command contains no shell-breaking characters for any key declared_action_keys() can produce" \
+  check "the key-derived universe CSV embedded in build_focus_transform()'s command contains no shell-breaking characters for any key declared_action_keys() can produce" \
     "$(sed -n 1p <<<"$out")" "True"
-  check "build_launch_binds() keys are plain KEY:action tokens (no stray characters before the colon)" \
+  check "that clean universe CSV is embedded verbatim in the command (no extra escaping mangles it)" \
     "$(sed -n 2p <<<"$out")" "True"
+  check "build_launch_binds() keys are plain KEY:action tokens (no stray characters before the colon)" \
+    "$(sed -n 3p <<<"$out")" "True"
 }
 test_build_focus_transform_no_shell_breaking_chars_for_any_declarable_key
 
@@ -2843,6 +3026,10 @@ def child_wait_for_exit_timeout_escalates():
         'elapsed_bounded_by_the_requested_timeout': elapsed < 5,
         'proc_terminated_after_timeout_escalation': proc.poll() is not None,
         'tmpdir_removed_after_timeout': not os.path.exists(tmpdir),
+        'presenter_state_cleared_after_timeout': (
+            presenter._proc is None and presenter._tmpdir is None and
+            presenter._sock_path is None and presenter._snapshot_path is None
+        ),
     }
 
 
@@ -2867,9 +3054,64 @@ def child_stop_after_process_already_exited():
     }
 
 
+def child_push_snapshot_survives_teardown_race():
+    presenter = d.FzfPresenter()
+    presenter.launch(['alt-o'], 'header')
+
+    reached = threading.Event()
+    release = threading.Event()
+    original_mkstemp = d.tempfile.mkstemp
+
+    def gated_mkstemp(*args, **kwargs):
+        reached.set()
+        release.wait(timeout=5)
+        return original_mkstemp(*args, **kwargs)
+
+    d.tempfile.mkstemp = gated_mkstemp
+    push_raised = []
+
+    def call_push():
+        try:
+            presenter.push_snapshot(
+                ['rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [],
+            )
+        except Exception as e:
+            push_raised.append(repr(e))
+
+    # Deterministic barrier/event race, no wall-clock sleeps: push_snapshot
+    # reads the (still-live) tmpdir/sock_path under its own lock, then blocks
+    # right before its real mkstemp call via the gate below. Only once it's
+    # gated do we run wait_for_exit()'s timeout path on a second thread --
+    # the exact concurrent teardown FzfPresenter must survive -- and only
+    # after that full teardown completes do we release the gate, so the
+    # real mkstemp() runs against a directory wait_for_exit has already
+    # removed.
+    push_thread = threading.Thread(target=call_push)
+    push_thread.start()
+    reached.wait(timeout=5)
+
+    timeout_thread = threading.Thread(target=presenter.wait_for_exit, args=(0.1,))
+    timeout_thread.start()
+    timeout_thread.join(timeout=5)
+
+    release.set()
+    push_thread.join(timeout=5)
+    d.tempfile.mkstemp = original_mkstemp
+
+    return {
+        'push_snapshot_did_not_raise_into_removed_tmpdir': push_raised == [],
+        'push_thread_finished': not push_thread.is_alive(),
+        'presenter_state_cleared_after_race': (
+            presenter._proc is None and presenter._tmpdir is None and
+            presenter._sock_path is None and presenter._snapshot_path is None
+        ),
+    }
+
+
 r1 = run_in_pty_session(child_launch_push_stop)
 r2 = run_in_pty_session(child_wait_for_exit_timeout_escalates)
 r3 = run_in_pty_session(child_stop_after_process_already_exited)
+r4 = run_in_pty_session(child_push_snapshot_survives_teardown_race)
 for key in (
     'sock_exists_after_launch', 'proc_running_after_launch', 'launch_has_no_expect_flag',
     'launch_has_track_and_id_nth_3', 'first_push_reflected', 'second_push_replaces_not_appends',
@@ -2879,12 +3121,18 @@ for key in (
 for key in (
     'timeout_returns_none_key', 'elapsed_bounded_by_the_requested_timeout',
     'proc_terminated_after_timeout_escalation', 'tmpdir_removed_after_timeout',
+    'presenter_state_cleared_after_timeout',
 ):
     print(r2.get(key))
 for key in (
     'process_already_exited_before_stop', 'stop_after_already_exited_does_not_raise', 'tmpdir_still_removed',
 ):
     print(r3.get(key))
+for key in (
+    'push_snapshot_did_not_raise_into_removed_tmpdir', 'push_thread_finished',
+    'presenter_state_cleared_after_race',
+):
+    print(r4.get(key))
 "
 
 test_fzf_presenter_real_lifecycle() {
@@ -2902,9 +3150,13 @@ test_fzf_presenter_real_lifecycle() {
   check "wait_for_exit()'s timeout escalation returns within the requested bound, not the full session" "$(sed -n 10p <<<"$out")" "True"
   check "wait_for_exit()'s timeout escalation (SIGTERM-then-kill) actually terminates the process" "$(sed -n 11p <<<"$out")" "True"
   check "wait_for_exit()'s timeout escalation removes the per-session temp directory" "$(sed -n 12p <<<"$out")" "True"
-  check "the process has already exited (via abort) before stop() is called" "$(sed -n 13p <<<"$out")" "True"
-  check "stop() called after the process already exited is a safe no-op" "$(sed -n 14p <<<"$out")" "True"
-  check "stop() still removes the temp directory when the process had already exited" "$(sed -n 15p <<<"$out")" "True"
+  check "wait_for_exit()'s timeout escalation clears _proc/_tmpdir/_sock_path/_snapshot_path (no stale presenter state)" "$(sed -n 13p <<<"$out")" "True"
+  check "the process has already exited (via abort) before stop() is called" "$(sed -n 14p <<<"$out")" "True"
+  check "stop() called after the process already exited is a safe no-op" "$(sed -n 15p <<<"$out")" "True"
+  check "stop() still removes the temp directory when the process had already exited" "$(sed -n 16p <<<"$out")" "True"
+  check "push_snapshot() racing wait_for_exit()'s timeout teardown never raises into a removed tmpdir (no plugin-thread traceback)" "$(sed -n 17p <<<"$out")" "True"
+  check "the racing push_snapshot() thread returns cleanly (never hangs)" "$(sed -n 18p <<<"$out")" "True"
+  check "presenter state stays fully cleared after the race, not left stale for a later push" "$(sed -n 19p <<<"$out")" "True"
 }
 
 if command -v fzf >/dev/null 2>&1; then
@@ -3043,6 +3295,65 @@ print(tmpdir_removed)
     "$(sed -n 4p <<<"$out")" "True"
 }
 test_fzf_presenter_push_snapshot_bounds_temp_files_to_one
+
+SIMPLE_DASH_PLUGIN="$WORK/simple_dash_plugin.py"
+cat > "$SIMPLE_DASH_PLUGIN" <<'PY'
+def fetch(config):
+    return []
+def act(key, payload):
+    pass
+PY
+
+write_config <<JSON
+{"plugins": ["$SIMPLE_DASH_PLUGIN"]}
+JSON
+
+test_run_dashboard_handles_presenter_launch_timeout_and_oserror() {
+  local out
+  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
+import contextlib, io
+$LOAD_CORE
+
+class RaisingController:
+    def __init__(self, *args, **kwargs):
+        pass
+    def run(self, refresh_interval=60):
+        raise RaisingController.exc
+
+for exc, label in (
+    (m.dashboard.PresenterLaunchTimeout('fzf never created its --listen socket at /tmp/x within 5s'), 'timeout'),
+    (PermissionError('Permission denied'), 'oserror'),
+):
+    RaisingController.exc = exc
+    m.dashboard.DashboardController = RaisingController
+    buf = io.StringIO()
+    exit_code = None
+    crashed = None
+    with contextlib.redirect_stderr(buf):
+        try:
+            m.run_dashboard()
+        except SystemExit as e:
+            exit_code = e.code
+        except Exception as e:
+            crashed = repr(e)
+    stderr_lines = buf.getvalue().strip().splitlines()
+    named = any('attention:' in line and str(exc) in line for line in stderr_lines)
+    print(label, exit_code, crashed, named)
+")"
+  check "PresenterLaunchTimeout from controller.run(): run_dashboard() exits 1 instead of crashing" \
+    "$(sed -n 1p <<<"$out" | awk '{print $2}')" "1"
+  check "PresenterLaunchTimeout: run_dashboard() never lets the exception propagate uncaught" \
+    "$(sed -n 1p <<<"$out" | awk '{print $3}')" "None"
+  check "PresenterLaunchTimeout: stderr carries one line naming the failure with the attention: prefix and the underlying message" \
+    "$(sed -n 1p <<<"$out" | awk '{print $4}')" "True"
+  check "a general OSError (e.g. PermissionError) from launch(): run_dashboard() also exits 1 instead of crashing" \
+    "$(sed -n 2p <<<"$out" | awk '{print $2}')" "1"
+  check "OSError: run_dashboard() never lets the exception propagate uncaught" \
+    "$(sed -n 2p <<<"$out" | awk '{print $3}')" "None"
+  check "OSError: stderr carries one line naming the failure with the attention: prefix and the underlying message" \
+    "$(sed -n 2p <<<"$out" | awk '{print $4}')" "True"
+}
+test_run_dashboard_handles_presenter_launch_timeout_and_oserror
 
 
 

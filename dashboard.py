@@ -72,16 +72,27 @@ def build_launch_binds(universe_keys):
 
 
 def build_focus_transform(universe_keys):
-    """The `printf` command run by the `start,focus` `transform` bind:
-    unconditionally unbinds every key in the declared universe, then
-    rebinds only the keys present in the newly-focused row's field-4 CSV
-    (`{4}`) -- restoring exactly the launch-time `print(KEY)+accept`
-    binding for those keys only. A key that isn't rebound falls back to
+    """The shell snippet run by the `start,focus` `transform` bind:
+    unconditionally unbinds every key in the declared universe, then --
+    only when the newly-focused row's field-4 CSV (`{4}`) is non-empty --
+    rebinds exactly those keys, restoring their launch-time
+    `print(KEY)+accept` binding. A key that isn't rebound falls back to
     fzf's own default per-character behavior (ordinary query typing for
     a letter/digit), never an unconditional accept.
+
+    A row with no actions at all (empty field 4) must never produce
+    `rebind()`: fzf requires a non-empty target for `rebind(...)` and
+    parses the whole transform result before running any of it, so an
+    empty `rebind()` makes fzf discard the entire result -- leaving
+    whichever binding the previously-focused row's transform left
+    active still active. Emitting `unbind(...)` alone for an action-less
+    row is therefore both correct and necessary, not just tidier.
     """
     universe_csv = ",".join(universe_keys)
-    return f'printf "unbind({universe_csv})+rebind(%s)" {{4}}'
+    return (
+        f'k={{4}}; if [ -z "$k" ]; then printf "unbind({universe_csv})"; '
+        f'else printf "unbind({universe_csv})+rebind(%s)" "$k"; fi'
+    )
 
 
 class _Round:
@@ -391,9 +402,16 @@ class FzfPresenter:
             tmpdir, sock_path = self._tmpdir, self._sock_path
         if not sock_path:
             return
-        fd, path = tempfile.mkstemp(dir=tmpdir, prefix="snapshot-", suffix=".tsv")
-        with os.fdopen(fd, "w") as f:
-            f.write("\n".join(rows))
+        try:
+            fd, path = tempfile.mkstemp(dir=tmpdir, prefix="snapshot-", suffix=".tsv")
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(rows))
+        except OSError:
+            # tmpdir was torn down (wait_for_exit's timeout/exit path raced
+            # ahead of us -- see _clear_state_if_current()) between our read
+            # of it above and this mkstemp; the presenter is gone, so there's
+            # nothing left to publish to.
+            return
         body = f'reload[cat "{path}"]+change-header:{_pending_header(pending)}'
         try:
             unix_request(sock_path, "POST", "/", body=body.encode())
@@ -421,8 +439,10 @@ class FzfPresenter:
             out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _terminate_and_reap(proc)
+            self._clear_state_if_current(proc)
             shutil.rmtree(tmpdir, ignore_errors=True)
             return PresenterResult(None, "")
+        self._clear_state_if_current(proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
         if not out.strip():
             return PresenterResult("", "")
@@ -430,6 +450,21 @@ class FzfPresenter:
         if first_nl == -1:
             return PresenterResult(out.rstrip("\n"), "")
         return PresenterResult(out[:first_nl], out[first_nl + 1:].rstrip("\n"))
+
+    def _clear_state_if_current(self, proc):
+        """Clears the live-presenter fields as soon as `proc` is known to
+        have exited (or been reaped after a timeout), so a `push_snapshot()`
+        call racing against this teardown sees a cleared `sock_path` and
+        returns immediately instead of reading a `tmpdir` this method is
+        about to (or has just) removed. Guarded by identity, not just
+        presence, so this can never clobber a newer launch()'s state.
+        """
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+                self._tmpdir = None
+                self._sock_path = None
+                self._snapshot_path = None
 
     def stop(self):
         self._teardown_current(kill_only=False)

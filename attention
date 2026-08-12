@@ -432,6 +432,18 @@ def render_dashboard_rows(items):
 
 
 _warned_missing_action_keys = set()
+_warned_broken_action_keys = set()
+
+
+def _warn_broken_action_keys(name, reason):
+    if name in _warned_broken_action_keys:
+        return
+    _warned_broken_action_keys.add(name)
+    print(
+        f"attention: plugin '{name}' declared_action_keys()/ACTION_KEYS is broken ({reason}) -- "
+        "ignoring its declared keys for this run. See PLUGINS.md.",
+        file=sys.stderr,
+    )
 
 
 def declared_action_keys(config):
@@ -444,6 +456,13 @@ def declared_action_keys(config):
     fallbacks "1"-"9". A plugin with neither hook contributes no keys
     and gets exactly one stderr warning naming it, the first time this
     runs into it in this process.
+
+    Both the hook call and the ACTION_KEYS read are isolated per plugin:
+    a plugin whose hook raises, or whose config makes it raise, or whose
+    result is a bare string (which would otherwise expand into one key
+    per character) or anything else that isn't a list of key strings,
+    contributes zero keys and gets exactly one stderr warning naming it
+    -- it never aborts the rest of the dashboard.
     """
     plugin_names = config.get("plugins", DEFAULT_PLUGINS)
     declared = []
@@ -454,9 +473,17 @@ def declared_action_keys(config):
         except Exception:
             continue
         if hasattr(mod, "declared_action_keys"):
-            plugin_keys = mod.declared_action_keys(config) or []
+            try:
+                plugin_keys = mod.declared_action_keys(config)
+            except Exception as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
         elif hasattr(mod, "ACTION_KEYS"):
-            plugin_keys = mod.ACTION_KEYS or []
+            try:
+                plugin_keys = mod.ACTION_KEYS
+            except Exception as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
         else:
             if name not in _warned_missing_action_keys:
                 _warned_missing_action_keys.add(name)
@@ -467,6 +494,28 @@ def declared_action_keys(config):
                     file=sys.stderr,
                 )
             plugin_keys = []
+
+        if plugin_keys is None:
+            plugin_keys = []
+        elif isinstance(plugin_keys, str):
+            if plugin_keys:
+                _warn_broken_action_keys(
+                    name, "declared keys must be a list of key strings, not a bare string"
+                )
+            plugin_keys = []
+        else:
+            try:
+                plugin_keys = list(plugin_keys)
+            except TypeError as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
+            else:
+                if not all(isinstance(key, str) for key in plugin_keys):
+                    _warn_broken_action_keys(
+                        name, "declared keys must be a list of key strings, not a mixed-type list"
+                    )
+                    plugin_keys = []
+
         for key in plugin_keys:
             if key not in seen:
                 seen.add(key)
@@ -494,10 +543,21 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     weight. Extracted from build_prioritized_items() so the interactive
     dashboard's DashboardController can run the same merge/sort
     pipeline once per completed provider, not just once per full fetch.
+
+    Pure over `items_by_plugin`: every item is shallow-copied (with its
+    own copy of "actions") before any transformation, so the caller's
+    stored provider item objects are never mutated -- the dashboard
+    calls this repeatedly over the same stored items every time a round
+    relaunches or a new provider completes, and merge_cross_links()'s
+    _absorb() writes through host["details"]/host["weight"]/
+    host["actions"] would otherwise re-absorb the same guest on every
+    later call, compounding the note/weight/actions each time.
     """
-    items = []
-    for plugin_items in items_by_plugin.values():
-        items.extend(plugin_items)
+    items = [
+        dict(it, actions=list(it.get("actions", [])))
+        for plugin_items in items_by_plugin.values()
+        for it in plugin_items
+    ]
     items = merge_cross_links(items)
 
     now = datetime.now(timezone.utc)
@@ -645,6 +705,9 @@ def run_dashboard(refresh_interval=60):
         found_something = controller.run(refresh_interval)
     except FileNotFoundError:
         print("attention: `fzf` is required but was not found on PATH.", file=sys.stderr)
+        sys.exit(1)
+    except (dashboard.PresenterLaunchTimeout, OSError) as e:
+        print(f"attention: could not start the interactive dashboard: {e}", file=sys.stderr)
         sys.exit(1)
     if not found_something:
         print("Nothing needs attention right now.")
