@@ -15,12 +15,9 @@ from pathlib import Path
 
 from _util import dispatch_background, run_cmd, slugify
 
-# Fixed ceiling on any thread pool below, independent of how many
-# candidates/authors/directories a given call has to fan out over --
-# a large `trackAuthors` list or a code_dir with hundreds of checkouts
-# must not translate into hundreds of concurrent `gh`/`git` subprocess
-# spawns.
 _MAX_WORKERS = 8
+
+_MAX_PR_DETAIL_WORKERS = 32
 
 
 def _gh_json(args):
@@ -105,7 +102,7 @@ def _fetch_pr_attention(author):
         p["attention_reasons"] = reasons
         return p
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), _MAX_WORKERS)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), _MAX_PR_DETAIL_WORKERS)) as pool:
         return [p for p in pool.map(_flag_if_attention, prs) if p is not None]
 
 

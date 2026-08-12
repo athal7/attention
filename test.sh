@@ -888,6 +888,52 @@ for it in items:
     "$(tr '\n' ',' <<<"$titles")" "OrderA-slowest,OrderB-fastest,OrderC-mid,"
 }
 test_fetch_all_deterministic_order
+
+echo
+echo "== github plugin: PR details use enough parallelism for one page =="
+
+test_pr_detail_fetches_fill_one_page_concurrently() {
+  local max_active
+  max_active="$(python3 -c "
+$(load_plugin_py github)
+import threading
+import time
+
+prs = [
+    {'number': n, 'repository': {'nameWithOwner': 'owner/repo'}}
+    for n in range(16)
+]
+lock = threading.Lock()
+active = 0
+max_active = 0
+
+def fake_gh_json(args):
+    global active, max_active
+    if args[:2] == ['search', 'prs']:
+        return prs
+    if args[:2] == ['pr', 'view']:
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return {
+            'mergeable': 'MERGEABLE',
+            'reviewDecision': None,
+            'statusCheckRollup': [],
+            'comments': [],
+        }
+    raise AssertionError(args)
+
+p._gh_json = fake_gh_json
+p._get_gh_login = lambda: 'me'
+p._fetch_pr_attention('@me')
+print(max_active)
+")"
+  check "all PR details from one search page fetch concurrently" "$max_active" "16"
+}
+test_pr_detail_fetches_fill_one_page_concurrently
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
