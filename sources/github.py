@@ -15,12 +15,11 @@ from pathlib import Path
 
 from _util import dispatch_background, run_cmd, slugify
 
-# Fixed ceiling on any thread pool below, independent of how many
-# candidates/authors/directories a given call has to fan out over --
-# a large `trackAuthors` list or a code_dir with hundreds of checkouts
-# must not translate into hundreds of concurrent `gh`/`git` subprocess
-# spawns.
 _MAX_WORKERS = 8
+
+_MAX_PR_DETAIL_WORKERS = 32
+
+ACTION_KEYS = ["alt-o", "alt-s", "alt-l", "alt-a", "alt-m", "alt-c", "alt-g"]
 
 
 def _gh_json(args):
@@ -46,7 +45,7 @@ def _get_gh_login():
     return ""
 
 
-def _fetch_pr_attention(author):
+def _fetch_pr_attention(author, detail_pool):
     """Open PRs `author` authored that need attention right now: failing
     checks, changes requested, a merge conflict, or a comment from
     someone else. `author` is a `gh search prs --author=` value ("@me"
@@ -58,10 +57,10 @@ def _fetch_pr_attention(author):
     already known from the search hit, so this is a targeted lookup,
     not a repo-wide scan) to pull the actionable fields. Each `pr view`
     is an independent network round trip, so they run concurrently
-    (thread pool, not processes -- these are I/O-bound subprocess
-    calls) rather than one-at-a-time; sequentially, 50 candidates at
-    even a few hundred ms each turns a dashboard refresh into a
-    multi-second stall.
+    against `detail_pool` -- the one aggregate budget `_fetch_raw`
+    shares across `_authored_prs` and every `_tracked_prs` call, so N
+    tracked authors never multiply the concurrency past that single
+    fixed cap.
     """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--limit", "50",
@@ -105,8 +104,8 @@ def _fetch_pr_attention(author):
         p["attention_reasons"] = reasons
         return p
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prs), _MAX_WORKERS)) as pool:
-        return [p for p in pool.map(_flag_if_attention, prs) if p is not None]
+    futures = [detail_pool.submit(_flag_if_attention, p) for p in prs]
+    return [r for f in futures for r in [f.result()] if r is not None]
 
 
 def _fetch_my_repo_issues():
@@ -188,13 +187,13 @@ def _fetch_raw(config):
         return issues
 
     def _authored_prs():
-        prs = _fetch_pr_attention("@me")
+        prs = _fetch_pr_attention("@me", detail_pool)
         for p in prs:
             p["type"] = "authored_attention"
         return prs
 
     def _tracked_prs(author):
-        prs = _fetch_pr_attention(author)
+        prs = _fetch_pr_attention(author, detail_pool)
         for p in prs:
             p["type"] = "tracked_attention"
             p["tracked_author"] = author
@@ -213,7 +212,8 @@ def _fetch_raw(config):
     # attention) already fan out further internally. Running them
     # one-after-another would stack all of that latency; a thread pool
     # collapses it to the slowest single query.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4 + len(track_authors), _MAX_WORKERS)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as detail_pool, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=min(4 + len(track_authors), _MAX_WORKERS)) as pool:
         review_fut = pool.submit(_review_prs)
         assigned_fut = pool.submit(_assigned_issues)
         authored_fut = pool.submit(_authored_prs)

@@ -12,6 +12,8 @@ from _util import dispatch_background, run_cmd
 
 GRAPHQL_URL = "https://api.linear.app/graphql"
 
+ACTION_KEYS = ["alt-o", "alt-s", "alt-c", "alt-t"]
+
 
 def _get_token(config):
     token = config.get("linear", {}).get("apiToken")

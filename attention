@@ -19,7 +19,6 @@ import importlib.util
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -58,6 +57,12 @@ def load_config():
             _config_cache = {}
     return _config_cache
 
+
+_dashboard_spec = importlib.util.spec_from_file_location(
+    "dashboard", Path(__file__).resolve().parent / "dashboard.py"
+)
+dashboard = importlib.util.module_from_spec(_dashboard_spec)
+_dashboard_spec.loader.exec_module(dashboard)
 
 _plugin_cache = {}
 
@@ -218,6 +223,7 @@ def fetch_all(config):
             print(e, file=sys.stderr)
             return []
         for item in fetched:
+            item["_plugin"] = name
             for action in item.get("actions", []):
                 action["_plugin"] = name
                 action["_item_id"] = item.get("id")
@@ -298,6 +304,20 @@ def merge_cross_links(items):
     return [it for it in items if id(it) not in absorbed_titles]
 
 
+def row_identity(item):
+    """Stable, source-qualified identity for one item: (originating
+    plugin, context, id-or-title), joined on a control character no
+    plugin field legitimately contains. Used only by the interactive
+    dashboard's fzf `--track --id-nth` selection tracking (Decision 3
+    in design.md) -- qualifying by context matters because
+    sources/github.py's bare PR/issue numbers repeat across repos.
+    Survives cross-link absorption for free: the surviving host's own
+    _plugin/context/id never change when a guest is merged into it.
+    """
+    ident = item.get("id") or item.get("title", "")
+    return f"{item.get('_plugin', '')}\x1f{item.get('context', '')}\x1f{ident}"
+
+
 def expect_keys_for(items):
     """Union of every action key actually present across the current
     item list -- computed fresh from what's really there, not a static
@@ -324,6 +344,35 @@ def hint_for_actions(actions):
     return "  ".join(parts)
 
 
+_STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX = 20, 30, 60
+
+
+def _clip(text, width):
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _normalize_row_text(items):
+    for item in items:
+        item["status"] = item.get("status", "").replace("\t", " ")
+        item["context"] = item.get("context", "").replace("\t", " ")
+        item["title"] = item.get("title", "").replace("\t", " ")
+        item["details"] = item.get("details", "").replace("\t", " ")
+
+
+def _row_columns(items):
+    status_col = min(max((len(i["status"]) for i in items), default=0), _STATUS_MAX)
+    context_col = min(max((len(i["context"]) for i in items), default=0), _CONTEXT_MAX)
+    title_col = min(max((len(i["title"]) for i in items), default=0), _TITLE_MAX)
+    return status_col, context_col, title_col
+
+
+def _visible_row_text(item, status_col, context_col, title_col):
+    status = _clip(item["status"], status_col)
+    context = _clip(item["context"], context_col)
+    title = _clip(item["title"], title_col)
+    return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {item['details']} "
+
+
 def render_rows(items):
     """Format the (already merged, already sorted) item list for fzf:
     STATUS/CONTEXT/TITLE columns sized to this run's longest value
@@ -336,50 +385,181 @@ def render_rows(items):
     The third (hint) field is never rendered as a list row (the
     dashboard's --with-nth 1 hides fields 2+), only surfaced via a
     --bind transform-footer that reads {3} on cursor movement.
+
+    Used only by the blocking `attention list`/`expect-keys` commands --
+    byte-for-byte unchanged by the interactive dashboard's progressive
+    rendering. See render_dashboard_rows() for the dashboard's own,
+    additive 5-field format.
     """
-    STATUS_MAX, CONTEXT_MAX, TITLE_MAX = 20, 30, 60
-
-    for item in items:
-        item["status"] = item.get("status", "").replace("\t", " ")
-        item["context"] = item.get("context", "").replace("\t", " ")
-        item["title"] = item.get("title", "").replace("\t", " ")
-        item["details"] = item.get("details", "").replace("\t", " ")
-
-    status_col = min(max((len(i["status"]) for i in items), default=0), STATUS_MAX)
-    context_col = min(max((len(i["context"]) for i in items), default=0), CONTEXT_MAX)
-    title_col = min(max((len(i["title"]) for i in items), default=0), TITLE_MAX)
-
-    def _clip(text, width):
-        return text if len(text) <= width else text[: width - 1] + "…"
+    _normalize_row_text(items)
+    status_col, context_col, title_col = _row_columns(items)
 
     rows = []
     for item in items:
-        status = _clip(item["status"], status_col)
-        context = _clip(item["context"], context_col)
-        title = _clip(item["title"], title_col)
+        visible = _visible_row_text(item, status_col, context_col, title_col)
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
         hint = hint_for_actions(actions)
-        rows.append(
-            f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {item['details']} \t"
-            f"{blob}\t{hint}"
-        )
+        rows.append(f"{visible}\t{blob}\t{hint}")
     return rows
 
 
-def build_prioritized_items(config, recently_acted=None):
-    """Fetch, merge, and sort items.  `recently_acted` is a set of item
-    ids that should be deprioritized (e.g. the user just acted on them).
-    Older items get a small age boost so they don't get buried.
+def render_dashboard_rows(items):
+    """Interactive-dashboard-only row renderer: same visible columns as
+    render_rows(), plus two additional hidden fields render_rows() never
+    emits -- a stable row identity (field 3, row_identity()) for fzf's
+    `--track --id-nth` selection tracking, and a comma-joined CSV of
+    this item's own action keys (field 4), read by the focus-scoped
+    `transform` bind to decide which keys to rebind live. The hint
+    (field 5) is the same content render_rows() puts in field 3, just
+    shifted one position over.
+    Row shape: STATUS  CONTEXT  TITLE  DETAILS \t<base64 actions>\t
+               <row identity>\t<row keys csv>\tHINT
     """
-    items = fetch_all(config)
+    _normalize_row_text(items)
+    status_col, context_col, title_col = _row_columns(items)
+
+    rows = []
+    for item in items:
+        visible = _visible_row_text(item, status_col, context_col, title_col)
+        actions = item.get("actions", [])
+        blob = base64.b64encode(json.dumps(actions).encode()).decode()
+        identity = row_identity(item)
+        keys_csv = ",".join(a["key"] for a in actions)
+        hint = hint_for_actions(actions)
+        rows.append(f"{visible}\t{blob}\t{identity}\t{keys_csv}\t{hint}")
+    return rows
+
+
+_warned_missing_action_keys = set()
+_warned_broken_action_keys = set()
+
+
+def _warn_broken_action_keys(name, reason):
+    if name in _warned_broken_action_keys:
+        return
+    _warned_broken_action_keys.add(name)
+    print(
+        f"attention: plugin '{name}' declared_action_keys()/ACTION_KEYS is broken ({reason}) -- "
+        "ignoring its declared keys for this run. See PLUGINS.md.",
+        file=sys.stderr,
+    )
+
+
+def declared_action_keys(config):
+    """The complete, finite dashboard hotkey universe, computable
+    without calling any plugin's fetch(): the de-duped union of every
+    configured plugin's declared_action_keys(config) (or its ACTION_KEYS
+    constant, if it has no such function) plus the deterministic
+    collision-fallback keys _absorb() can introduce -- each declared
+    alt-X key's stripped-and-uppercased form, and the fixed bare-digit
+    fallbacks "1"-"9". A plugin with neither hook contributes no keys
+    and gets exactly one stderr warning naming it, the first time this
+    runs into it in this process.
+
+    Both the hook call and the ACTION_KEYS read are isolated per plugin:
+    a plugin whose hook raises, or whose config makes it raise, or whose
+    result is a bare string (which would otherwise expand into one key
+    per character) or anything else that isn't a list of key strings,
+    contributes zero keys and gets exactly one stderr warning naming it
+    -- it never aborts the rest of the dashboard.
+    """
+    plugin_names = config.get("plugins", DEFAULT_PLUGINS)
+    declared = []
+    seen = set()
+    for name in plugin_names:
+        try:
+            mod = load_plugin(name)
+        except Exception:
+            continue
+        if hasattr(mod, "declared_action_keys"):
+            try:
+                plugin_keys = mod.declared_action_keys(config)
+            except Exception as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
+        elif hasattr(mod, "ACTION_KEYS"):
+            try:
+                plugin_keys = mod.ACTION_KEYS
+            except Exception as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
+        else:
+            if name not in _warned_missing_action_keys:
+                _warned_missing_action_keys.add(name)
+                print(
+                    f"attention: plugin '{name}' has no declared_action_keys()/ACTION_KEYS -- "
+                    "its non-primary actions won't be bindable in the interactive dashboard "
+                    "(list/expect-keys/act are unaffected). See PLUGINS.md.",
+                    file=sys.stderr,
+                )
+            plugin_keys = []
+
+        if plugin_keys is None:
+            plugin_keys = []
+        elif isinstance(plugin_keys, str):
+            if plugin_keys:
+                _warn_broken_action_keys(
+                    name, "declared keys must be a list of key strings, not a bare string"
+                )
+            plugin_keys = []
+        else:
+            try:
+                plugin_keys = list(plugin_keys)
+            except TypeError as e:
+                _warn_broken_action_keys(name, e)
+                plugin_keys = []
+            else:
+                if not all(isinstance(key, str) for key in plugin_keys):
+                    _warn_broken_action_keys(
+                        name, "declared keys must be a list of key strings, not a mixed-type list"
+                    )
+                    plugin_keys = []
+
+        for key in plugin_keys:
+            if key not in seen:
+                seen.add(key)
+                declared.append(key)
+
+    universe = list(declared)
+    for key in declared:
+        if key.startswith("alt-"):
+            fallback = key[len("alt-"):].upper()
+            if fallback not in seen:
+                seen.add(fallback)
+                universe.append(fallback)
+    for digit in "123456789":
+        if digit not in seen:
+            seen.add(digit)
+            universe.append(digit)
+    return universe
+
+
+def build_snapshot(items_by_plugin, recently_acted=None):
+    """Flatten items_by_plugin's values, merge cross-links, apply the
+    age-based weight boost (created_at at least a day/three days/a week
+    old gets +1/+2/+3; items with no real creation timestamp get none)
+    and the recently_acted deprioritization penalty, then sort by
+    weight. Extracted from build_prioritized_items() so the interactive
+    dashboard's DashboardController can run the same merge/sort
+    pipeline once per completed provider, not just once per full fetch.
+
+    Pure over `items_by_plugin`: every item is shallow-copied (with its
+    own copy of "actions") before any transformation, so the caller's
+    stored provider item objects are never mutated -- the dashboard
+    calls this repeatedly over the same stored items every time a round
+    relaunches or a new provider completes, and merge_cross_links()'s
+    _absorb() writes through host["details"]/host["weight"]/
+    host["actions"] would otherwise re-absorb the same guest on every
+    later call, compounding the note/weight/actions each time.
+    """
+    items = [
+        dict(it, actions=list(it.get("actions", [])))
+        for plugin_items in items_by_plugin.values()
+        for it in plugin_items
+    ]
     items = merge_cross_links(items)
 
-    # Age-based weight boost: items at least a day old get +1, at least
-    # three days old get +2, at least a week old get +3.  Plugins that
-    # can supply a real creation timestamp set "created_at" (ISO 8601);
-    # items without one (reminders, calendar events -- there's no
-    # meaningful "created" concept for those) get no boost.
     now = datetime.now(timezone.utc)
     for it in items:
         age_boost = 0
@@ -400,7 +580,6 @@ def build_prioritized_items(config, recently_acted=None):
                 pass
         it["weight"] = it.get("weight", 0) + age_boost
 
-    # Deprioritize recently-acted items.
     if recently_acted:
         for it in items:
             if it.get("id") in recently_acted:
@@ -408,6 +587,18 @@ def build_prioritized_items(config, recently_acted=None):
 
     items.sort(key=lambda x: x.get("weight", 0), reverse=True)
     return items
+
+
+def build_prioritized_items(config, recently_acted=None):
+    """Fetch every configured plugin, group the results by which plugin
+    produced each item, and delegate to build_snapshot() for the merge/
+    age-boost/recently-acted/sort pipeline shared with the interactive
+    dashboard's per-round snapshots.
+    """
+    items_by_plugin = {}
+    for item in fetch_all(config):
+        items_by_plugin.setdefault(item.get("_plugin"), []).append(item)
+    return build_snapshot(items_by_plugin, recently_acted)
 
 
 def print_rows():
@@ -459,93 +650,67 @@ def act(key, line):
 
 
 def run_dashboard(refresh_interval=60):
-    """The interactive loop: render the prioritized list through fzf,
-    dispatch whatever hotkey was pressed against the highlighted row,
-    and loop back until Esc (no selection) or an empty list.
+    """The interactive loop: fetch every configured plugin concurrently,
+    republish a fresh recomputed snapshot through a single long-lived
+    fzf process as each plugin's fetch() completes, and dispatch
+    whatever hotkey was pressed against the highlighted row -- looping
+    until Esc or the merged snapshot goes permanently empty.
 
-    One fzf process per render, not a nested submenu -- act() runs
-    in-process afterward (fzf has already exited, terminal is free for
-    plain print()/input() prompts) and this loop re-renders fzf fresh
-    next time round, so newly-completed/dispatched items drop off and
-    newly-relevant ones appear without any extra bookkeeping.
-
-    fzf itself is bounded by refresh_interval: if the user hasn't
-    pressed anything within that window, the still-running fzf is
-    interrupted (SIGTERM, so it restores the terminal the same way Esc
-    does -- a hard kill would leave the raw-mode/alt-screen state
-    behind) and the loop re-fetches and re-renders a fresh one, so the
-    list stays current even while the user is just looking at it, not
-    only between actions.
+    All of the progressive-fetch/single-in-flight-round/pending-
+    visibility/selection-tracking behavior lives in
+    dashboard.DashboardController and dashboard.FzfPresenter; this
+    function's job is only to supply the real, config-bound callables
+    (fetch_plugin/build_snapshot/render_rows/act) those two classes
+    were designed to receive as plain injected arguments.
     """
     config = load_config()
-    recently_acted = {}  # ordered set of item ids (dict; oldest first)
+    plugin_names = config.get("plugins", DEFAULT_PLUGINS)
+    if not plugin_names:
+        print("Nothing needs attention right now.")
+        return
 
-    while True:
-        items = build_prioritized_items(config, recently_acted)
-        rows = render_rows(items)
-        if not rows:
-            print("Nothing needs attention right now.")
-            return
+    for name in plugin_names:
         try:
-            proc = subprocess.Popen(
-                [
-                    "fzf", "--ansi", "--height", "10", "--layout=reverse",
-                    "--header", "Hotkeys act immediately on this row · Enter = primary action · Esc = quit",
-                    "-d", "\t", "--with-nth", "1",
-                    "--expect", ",".join(expect_keys_for(items)),
-                    "--footer-border=line",
-                    "--bind", 'start,focus:transform-footer:printf "%s\\n" {3}',
-                ],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            )
-        except FileNotFoundError:
-            print("attention: `fzf` is required but was not found on PATH.", file=sys.stderr)
-            sys.exit(1)
+            load_plugin(name)
+        except Exception:
+            pass
 
+    def fetch_plugin(name):
         try:
-            out, _ = proc.communicate(input="\n".join(rows) + "\n", timeout=refresh_interval)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            continue  # stale render interrupted; loop re-fetches fresh data
+            mod = load_plugin(name)
+            fetched = mod.fetch(config) or []
+        except Exception:
+            return []
+        try:
+            for item in fetched:
+                validate_and_normalize_item(item, name)
+        except Exception as e:
+            print(e, file=sys.stderr)
+            return []
+        for item in fetched:
+            item["_plugin"] = name
+            for action in item.get("actions", []):
+                action["_plugin"] = name
+                action["_item_id"] = item.get("id")
+        return fetched
 
-        if not out.strip():
-            break
-        first_nl = out.find("\n")
-        if first_nl == -1:
-            key, row = out.rstrip("\n"), ""
-        else:
-            key, row = out[:first_nl], out[first_nl + 1:].rstrip("\n")
-
-        # Extract the item id before acting so we can deprioritize it.
-        item_id = None
-        if row:
-            parts = row.split("\t", 1)
-            if len(parts) >= 2:
-                try:
-                    actions = json.loads(base64.b64decode(parts[1].split("\t", 1)[0]).decode())
-                    for a in actions:
-                        if a.get("key") == key or (key == "" and a.get("primary")):
-                            item_id = a.get("_item_id")
-                            break
-                except Exception:
-                    pass
-
-        act(key, row)
-
-        # Track the acted item for deprioritization on the next render,
-        # re-inserted last so it counts as newest -- a plain set has no
-        # order, so evicting "the oldest" from one can evict the item
-        # just added instead.
-        if item_id:
-            recently_acted.pop(item_id, None)
-            recently_acted[item_id] = True
-            if len(recently_acted) > 10:
-                del recently_acted[next(iter(recently_acted))]
+    controller = dashboard.DashboardController(
+        plugin_names, dashboard.FzfPresenter(), declared_action_keys(config),
+        fetch_plugin=fetch_plugin,
+        build_snapshot=build_snapshot,
+        render_rows=render_dashboard_rows,
+        act=act,
+    )
+    try:
+        found_something = controller.run(refresh_interval)
+    except FileNotFoundError:
+        print("attention: `fzf` is required but was not found on PATH.", file=sys.stderr)
+        sys.exit(1)
+    except (dashboard.PresenterLaunchTimeout, OSError) as e:
+        print(f"attention: could not start the interactive dashboard: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not found_something:
+        print("Nothing needs attention right now.")
 
 
 if __name__ == "__main__":

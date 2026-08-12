@@ -35,6 +35,43 @@ def act(key: str, payload) -> None:
     """
 ```
 
+### Declaring hotkeys for the interactive dashboard (optional)
+
+```python
+def declared_action_keys(config: dict) -> list[str]:
+    """Every literal action "key" this plugin's fetch() might attach to
+    an item, decidable without I/O (no fetch() call, no command
+    execution). Optional -- a plugin that omits both this and
+    ACTION_KEYS still fully works via fetch()/act()/list/expect-keys;
+    only its non-primary hotkeys go unbound in the interactive
+    dashboard, and core prints one stderr warning naming the plugin.
+    """
+```
+
+If your action keys never depend on `config` (the common case), skip
+the function and declare a plain module-level constant instead --
+core checks for `ACTION_KEYS` when `declared_action_keys` is absent:
+
+```python
+ACTION_KEYS = ["alt-o", "alt-s"]
+```
+
+Either way, list every literal key `fetch()` can attach to an item's
+`actions`, before cross-link merging's collision-renaming -- core
+already accounts for the alt-stripped-and-uppercased fallback and the
+bare-digit fallbacks merging can introduce. This only affects the
+interactive dashboard's fixed launch-time keybindings; `attention
+list`/`expect-keys`/`act` compute their own key set fresh from
+whatever `fetch()` actually returned and need neither hook.
+
+Every declared key must be a plain fzf key token -- `alt-<letter>` or a
+bare letter/digit, matching the same shape `fetch()`'s own action
+`"key"` fields use (see "Item shape" below). Core embeds each declared
+key verbatim in the dashboard's launch-time binds
+(`KEY:print(KEY)+accept`) and in the focus transform's comma-joined
+`unbind(...)`/`rebind(...)` lists; nothing validates it, so a key
+containing `,`, `:`, `+`, `(`, or `)` breaks those binds.
+
 ### Item shape
 
 Enforced at the plugin boundary: right after a plugin's `fetch()`

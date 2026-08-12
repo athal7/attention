@@ -44,6 +44,36 @@ from _util import dispatch_background, run_cmd
 _PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
 
 
+def declared_action_keys(config):
+    """Every action key any configured provider's fetch() could attach
+    to an item -- known directly from config, no command execution.
+    Tolerant of a malformed config["generic"] value (not a dict), a
+    malformed provider spec (not a dict, already guarded), or a
+    malformed actions list/entry (not a list, or an entry that isn't a
+    dict): each just contributes no keys instead of raising, matching
+    fetch()'s own per-provider isolation.
+    """
+    keys = []
+    seen = set()
+    providers = config.get("generic", {})
+    if not isinstance(providers, dict):
+        return keys
+    for spec in providers.values():
+        if not isinstance(spec, dict):
+            continue
+        actions = spec.get("actions", [])
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            key = action.get("key", "")
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
+
+
 def _lookup(record, path):
     val = record
     for part in path.split("."):

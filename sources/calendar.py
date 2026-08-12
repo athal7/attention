@@ -11,6 +11,8 @@ from pathlib import Path
 
 from _util import copy_to_clipboard
 
+ACTION_KEYS = ["alt-y"]
+
 
 def _get_ical_path():
     # Prefer a fixed known-good path over PATH resolution: a stray dev
