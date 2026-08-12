@@ -44,6 +44,23 @@ from _util import dispatch_background, run_cmd
 _PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
 
 
+def declared_action_keys(config):
+    """Every action key any configured provider's fetch() could attach
+    to an item -- known directly from config, no command execution.
+    """
+    keys = []
+    seen = set()
+    for spec in config.get("generic", {}).values():
+        if not isinstance(spec, dict):
+            continue
+        for action in spec.get("actions", []):
+            key = action.get("key", "")
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
+
+
 def _lookup(record, path):
     val = record
     for part in path.split("."):

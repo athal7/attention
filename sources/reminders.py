@@ -10,6 +10,8 @@ from datetime import date
 
 from _util import run_cmd
 
+ACTION_KEYS = ["alt-x"]
+
 
 def fetch(config):
     list_names = config.get("reminders", {}).get("lists", [])
