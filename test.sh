@@ -369,7 +369,7 @@ JSON
     ;;
   "pr view 3 -R myorg/kb"*)
     cat <<'JSON'
-{"mergeable": "CONFLICTING", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [{"conclusion": "FAILURE"}], "comments": [{"author": {"login": "someone-else"}}]}
+{"mergeable": "CONFLICTING", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [{"conclusion": "FAILURE"}], "reviews": [{"author": {"login": "someone-else"}, "state": "CHANGES_REQUESTED"}, {"author": {"login": "another-reviewer"}, "state": "COMMENTED"}]}
 JSON
     ;;
   *)
@@ -425,8 +425,8 @@ test_github_source() {
     *) bad "assigned issue gets ASSIGNED status with repo as context (got: $issue_line)" ;;
   esac
   case "$authored_line" in
-    "NEEDS ATTENTION"*"Changes Requested, Merge Conflict, Checks Failing, New Comments"*)
-      ok "authored PR needing attention gets NEEDS ATTENTION status with reasons in details" ;;
+    "NEEDS ATTENTION"*"Changes Requested, Review Commented, Merge Conflict, Checks Failing"*)
+      ok "authored PR review, conflict, and failing-check signals appear as attention reasons" ;;
     *) bad "authored PR needing attention gets NEEDS ATTENTION status with reasons in details (got: $authored_line)" ;;
   esac
   case "$repo_issue_line" in
@@ -510,7 +510,7 @@ JSON
     ;;
   "pr view 11 -R myorg/kb"*)
     cat <<'JSON'
-{"mergeable": "MERGEABLE", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [], "comments": []}
+{"mergeable": "MERGEABLE", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [], "reviews": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"}]}
 JSON
     ;;
   "api user --jq .login")
@@ -1178,7 +1178,8 @@ def fake_gh_json(args):
             return []
         return {
             'mergeable': 'MERGEABLE', 'reviewDecision': 'CHANGES_REQUESTED',
-            'statusCheckRollup': [], 'comments': [],
+            'statusCheckRollup': [],
+            'reviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'}],
         }
     raise AssertionError(args)
 
@@ -1193,6 +1194,59 @@ print([r['number'] for r in result])
     "$out" "[0, 1, 3, 4]"
 }
 test_pr_detail_preserves_submission_order_and_isolates_per_candidate_failures
+
+test_pr_attention_uses_reviews_not_timeline_comments() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import concurrent.futures
+
+prs = [
+    {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
+]
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return prs
+    if args[:2] == ['pr', 'view']:
+        if args[2] == '1':
+            return {
+                'mergeable': 'MERGEABLE', 'reviewDecision': None,
+                'statusCheckRollup': [],
+                'comments': [{'author': {'login': 'reviewer'}}],
+                'reviews': [],
+            }
+        if args[2] == '3':
+            return {
+                'mergeable': 'MERGEABLE', 'reviewDecision': None,
+                'statusCheckRollup': [],
+                'reviews': [
+                    {'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED', 'submittedAt': '2026-01-01T00:00:00Z'},
+                    {'author': {'login': 'reviewer'}, 'state': 'APPROVED', 'submittedAt': '2026-01-02T00:00:00Z'},
+                ],
+            }
+        return {
+            'mergeable': 'MERGEABLE', 'reviewDecision': None,
+            'statusCheckRollup': [],
+            'comments': [],
+            'reviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
+        }
+    raise AssertionError(args)
+
+
+p._gh_json = fake_gh_json
+p._get_gh_login = lambda: 'author'
+with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
+    result = p._fetch_pr_attention('@me', detail_pool)
+print([(r['number'], r['attention_reasons']) for r in result])
+")"
+  check "ordinary comments do not flag authored PRs while non-author COMMENTED reviews do" \
+    "$out" "[(2, ['Review Commented'])]"
+}
+test_pr_attention_uses_reviews_not_timeline_comments
 
 # ---------------------------------------------------------------------------
 echo

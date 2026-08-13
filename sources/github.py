@@ -79,25 +79,31 @@ def _fetch_pr_attention(author, detail_pool):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,comments,isDraft",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,reviews,isDraft",
         ])
         if not isinstance(detail, dict):
             return None
 
         reasons = []
-        if detail.get("reviewDecision") == "CHANGES_REQUESTED":
+        reviews_by_author = {}
+        for review in detail.get("reviews") or []:
+            reviewer = review.get("author", {}).get("login") or ""
+            if not reviewer or reviewer.casefold() == expected_author.casefold():
+                continue
+            submitted_at = review.get("submittedAt") or ""
+            previous = reviews_by_author.get(reviewer.casefold())
+            if previous is None or submitted_at >= previous.get("submittedAt", ""):
+                reviews_by_author[reviewer.casefold()] = review
+        latest_review_states = {review.get("state") for review in reviews_by_author.values()}
+        if "CHANGES_REQUESTED" in latest_review_states:
             reasons.append("Changes Requested")
+        if "COMMENTED" in latest_review_states:
+            reasons.append("Review Commented")
         if detail.get("mergeable") == "CONFLICTING":
             reasons.append("Merge Conflict")
         checks = detail.get("statusCheckRollup") or []
         if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
             reasons.append("Checks Failing")
-        comments = detail.get("comments") or []
-        if expected_author and any(
-            (c.get("author", {}).get("login") or "").casefold() != expected_author.casefold()
-            for c in comments
-        ):
-            reasons.append("New Comments")
 
         if not reasons:
             return None
