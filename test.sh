@@ -1204,6 +1204,7 @@ import concurrent.futures
 prs = [
     {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
     {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
 ]
 
 
@@ -1217,6 +1218,15 @@ def fake_gh_json(args):
                 'statusCheckRollup': [],
                 'comments': [{'author': {'login': 'reviewer'}}],
                 'reviews': [],
+            }
+        if args[2] == '3':
+            return {
+                'mergeable': 'MERGEABLE', 'reviewDecision': None,
+                'statusCheckRollup': [],
+                'reviews': [
+                    {'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED', 'submittedAt': '2026-01-01T00:00:00Z'},
+                    {'author': {'login': 'reviewer'}, 'state': 'APPROVED', 'submittedAt': '2026-01-02T00:00:00Z'},
+                ],
             }
         return {
             'mergeable': 'MERGEABLE', 'reviewDecision': None,
