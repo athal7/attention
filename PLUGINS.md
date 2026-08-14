@@ -96,6 +96,8 @@ omitted.
     "weight":  90,                   # int, required -- sort key, descending (bool rejected)
     "id":      "42",                 # str, optional (default "") -- enables cross-link merging, see below
     "absorb_note": "...",            # str, optional (default "") -- text used if THIS item gets merged into another
+    "identity_key": "github:myorg/myrepo#42", # str, optional (default "") -- provider-qualified association target
+    "association_keys": [],                 # list[str], optional (default []) -- identity keys this item absorbs
     "actions": [                     # list, optional (default [])
         {
             "key": "alt-o",          # str, required -- fzf --expect token: "alt-X", a bare letter/digit, or ""
