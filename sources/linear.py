@@ -100,6 +100,7 @@ query {
             "weight": weight,
             "id": identifier,
             "absorb_note": f"Linear {identifier}: {state.upper()}",
+            "identity_key": f"linear:{identifier}",
             "actions": [
                 {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
                 {"key": "alt-s", "label": "session", "payload": {"kind": "session", "identifier": identifier}},

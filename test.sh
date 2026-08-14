@@ -1430,6 +1430,22 @@ print(sum(1 for a in merged[0]['actions'] if a.get('primary')))
 }
 test_id_shaped_cross_link_merge
 
+test_declared_association_key_merge() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+pr = {'status': 'REVIEW REQUESTED', 'context': 'owner/repo', 'title': 'Fix it', 'details': '', 'weight': 90, 'id': '7', 'identity_key': 'github:owner/repo#7', 'association_keys': ['github:owner/repo#42'], 'actions': []}
+issue = {'status': 'OPEN', 'context': 'owner/repo', 'title': 'Tracked issue', 'details': '', 'weight': 70, 'id': '42', 'identity_key': 'github:owner/repo#42', 'actions': []}
+same_number_elsewhere = {'status': 'OPEN', 'context': 'other/repo', 'title': 'Other issue', 'details': '', 'weight': 70, 'id': '42', 'identity_key': 'github:other/repo#42', 'actions': []}
+import json
+merged = m.merge_cross_links([pr, issue, same_number_elsewhere])
+print(json.dumps(sorted(item['identity_key'] for item in merged)))
+")"
+  check "declared repository-qualified association preserves the equal-number issue in another repository" \
+    "$out" '["github:other/repo#42", "github:owner/repo#7"]'
+}
+test_declared_association_key_merge
+
 test_title_substring_cross_link_merge() {
   local out
   out="$(python3 -c "

@@ -118,6 +118,8 @@ class Item(ItemRequired, total=False):
     absorb_note: str
     created_at: str
     actions: list
+    identity_key: str
+    association_keys: list
 
 
 def validate_and_normalize_item(item, name):
@@ -160,6 +162,16 @@ def validate_and_normalize_item(item, name):
         item["created_at"] = ""
     elif not isinstance(item["created_at"], str):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'created_at' must be of type str, got {type(item['created_at']).__name__}")
+
+    if "identity_key" not in item:
+        item["identity_key"] = ""
+    elif not isinstance(item["identity_key"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'identity_key' must be of type str, got {type(item['identity_key']).__name__}")
+
+    if "association_keys" not in item:
+        item["association_keys"] = []
+    elif not isinstance(item["association_keys"], list) or not all(isinstance(key, str) for key in item["association_keys"]):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'association_keys' must be a list of strings")
 
     if "actions" not in item:
         item["actions"] = []
@@ -270,6 +282,19 @@ def merge_cross_links(items):
     see PLUGINS.md's "Cross-link merging" section for the exact rules.
     Neither pass knows or cares which plugin produced which item.
     """
+    by_identity = {it["identity_key"]: it for it in items if it.get("identity_key")}
+    absorbed_associations = set()
+    for host in items:
+        if id(host) in absorbed_associations:
+            continue
+        for key in host.get("association_keys", []):
+            guest = by_identity.get(key)
+            if guest is None or guest is host or id(guest) in absorbed_associations:
+                continue
+            _absorb(host, guest)
+            absorbed_associations.add(id(guest))
+    items = [it for it in items if id(it) not in absorbed_associations]
+
     # 1. ID-shaped title match (e.g. a PR title mentioning "ABC-123"
     # absorbs whichever other item has id "ABC-123").
     by_id = {it["id"].upper(): it for it in items if it.get("id")}

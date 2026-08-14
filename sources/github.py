@@ -21,6 +21,12 @@ _MAX_PR_DETAIL_WORKERS = 32
 
 ACTION_KEYS = ["alt-o", "alt-s", "alt-l", "alt-a", "alt-m", "alt-c", "alt-g"]
 
+def _body_association_keys(body):
+    return [
+        f"linear:{identifier.upper()}"
+        for identifier in re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", body or "", flags=re.IGNORECASE)
+    ]
+
 
 def _gh_json(args):
     """Run `gh <args...>` and parse its stdout as JSON, returning [] on
@@ -64,7 +70,7 @@ def _fetch_pr_attention(author, detail_pool):
     """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--limit", "50",
-        "--json", "number,title,repository,url,isDraft,createdAt",
+        "--json", "number,title,body,repository,url,isDraft,createdAt",
     ])
     if not prs:
         return []
@@ -79,7 +85,7 @@ def _fetch_pr_attention(author, detail_pool):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,reviews,isDraft",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,reviews,closingIssuesReferences,isDraft",
         ])
         if not isinstance(detail, dict):
             return None
@@ -107,6 +113,7 @@ def _fetch_pr_attention(author, detail_pool):
 
         if not reasons:
             return None
+        p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
         p["attention_reasons"] = reasons
         return p
 
@@ -144,8 +151,6 @@ def _build_repo_dir_index(code_dir):
         return index
     # Strip any inherited GIT_DIR/GIT_WORK_TREE/etc: if the caller's
     # environment has one set (e.g. running inside another git hook),
-    # `-C entry.path` is silently overridden and every git call below
-    # would operate on that unrelated repo instead of entry.path.
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
     def _origin_for(entry):
@@ -177,8 +182,17 @@ def _fetch_raw(config):
     def _review_prs():
         prs = _gh_json([
             "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
-            "--json", "number,title,repository,url,isDraft,createdAt",
+            "--json", "number,title,body,repository,url,isDraft,createdAt",
         ])
+        def _with_closing_references(pr):
+            repo = pr.get("repository", {}).get("nameWithOwner", "")
+            number = pr.get("number")
+            if repo and number is not None:
+                detail = _gh_json(["pr", "view", str(number), "-R", repo, "--json", "closingIssuesReferences"])
+                if isinstance(detail, dict):
+                    pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+            return pr
+        prs = [future.result() for future in [detail_pool.submit(_with_closing_references, pr) for pr in prs]]
         for p in prs:
             p["type"] = "review_request"
         return prs
@@ -308,6 +322,12 @@ def fetch(config):
             "id": number,
             "created_at": g.get("createdAt", ""),
             "absorb_note": f"{status}: {title}",
+            "identity_key": f"github:{repo_name.lower()}#{number}",
+            "association_keys": [
+                f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
+                for reference in g.get("closingIssuesReferences", [])
+                if reference.get("number") is not None
+            ] + _body_association_keys(g.get("body", "")),
             "actions": [
                 {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
                 {"key": "alt-s", "label": "session", "payload": {
