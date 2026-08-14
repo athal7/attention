@@ -54,9 +54,31 @@ _IDLE_HEADER = "Hotkeys act immediately on this row · Enter = primary action ·
 
 
 def _pending_header(pending):
+    import shutil
+    w = shutil.get_terminal_size().columns
+    if w < 80:
+        if w < 50:
+            idle = "Keys act immediately · Enter/Esc"
+        elif w < 65:
+            idle = "Keys act immediately · Enter=primary · Esc=quit"
+        else:
+            idle = "Hotkeys act immediately · Enter = primary · Esc = quit"
+    else:
+        idle = _IDLE_HEADER
+
     if pending:
-        return "Loading: " + ", ".join(pending) + "…"
-    return _IDLE_HEADER
+        msg = "Loading: " + ", ".join(pending) + "…"
+        if w < 80 and len(msg) > w and w >= 15:
+            if w < 40:
+                return "Loading…"
+            else:
+                allowed_len = w - 10
+                plugins_str = ", ".join(pending)
+                if len(plugins_str) > allowed_len:
+                    plugins_str = plugins_str[:allowed_len - 3] + "..."
+                return f"Loading: {plugins_str}…"
+        return msg
+    return idle
 
 
 def build_launch_binds(universe_keys):

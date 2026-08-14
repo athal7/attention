@@ -385,9 +385,18 @@ def _normalize_row_text(items):
 
 
 def _row_columns(items):
-    status_col = min(max((len(i["status"]) for i in items), default=0), _STATUS_MAX)
-    context_col = min(max((len(i["context"]) for i in items), default=0), _CONTEXT_MAX)
-    title_col = min(max((len(i["title"]) for i in items), default=0), _TITLE_MAX)
+    import shutil
+    w = shutil.get_terminal_size().columns
+    if w < 80:
+        status_max = max(8, int(w * 0.15))
+        context_max = max(10, int(w * 0.20))
+        title_max = max(20, int(w * 0.45))
+    else:
+        status_max, context_max, title_max = _STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX
+
+    status_col = min(max((len(i["status"]) for i in items), default=0), status_max)
+    context_col = min(max((len(i["context"]) for i in items), default=0), context_max)
+    title_col = min(max((len(i["title"]) for i in items), default=0), title_max)
     return status_col, context_col, title_col
 
 

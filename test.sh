@@ -1525,6 +1525,80 @@ print(m.hint_for_actions([{'key': 'alt-o', 'label': 'open'}, {'key': 'O', 'label
 
 # ---------------------------------------------------------------------------
 echo
+echo "== core: mobile width support (dynamic column scaling and adaptive headers) =="
+
+test_mobile_width_support() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+$LOAD_DASHBOARD
+import shutil
+
+class DummySize:
+    def __init__(self, columns):
+        self.columns = columns
+
+items = [
+    {'status': 'VERY_LONG_STATUS_HERE', 'context': 'very/long/context/here', 'title': 'Very long title that goes on and on and on', 'details': ''}
+]
+
+# Case 1: Terminal width 50
+shutil.get_terminal_size = lambda: DummySize(50)
+cols_50 = m._row_columns(items)
+print('cols_50:', cols_50)
+
+# Case 2: Terminal width 40
+shutil.get_terminal_size = lambda: DummySize(40)
+cols_40 = m._row_columns(items)
+print('cols_40:', cols_40)
+
+# Case 3: Terminal width 100
+shutil.get_terminal_size = lambda: DummySize(100)
+cols_100 = m._row_columns(items)
+print('cols_100:', cols_100)
+
+# Case 4: Idle header at width 70
+shutil.get_terminal_size = lambda: DummySize(70)
+print('idle_70:', d._pending_header([]))
+
+# Case 5: Idle header at width 60
+shutil.get_terminal_size = lambda: DummySize(60)
+print('idle_60:', d._pending_header([]))
+
+# Case 6: Idle header at width 40
+shutil.get_terminal_size = lambda: DummySize(40)
+print('idle_40:', d._pending_header([]))
+
+# Case 7: Pending list truncation at width 40
+shutil.get_terminal_size = lambda: DummySize(40)
+print('pending_40:', d._pending_header(['calendar', 'reminders', 'github', 'linear']))
+
+# Case 8: Pending list truncation at width 30
+shutil.get_terminal_size = lambda: DummySize(30)
+print('pending_30:', d._pending_header(['calendar', 'reminders', 'github', 'linear']))
+")"
+
+  check "adaptive column widths at w=50" \
+    "$(grep 'cols_50:' <<<"$out")" "cols_50: (8, 10, 22)"
+  check "adaptive column widths at w=40" \
+    "$(grep 'cols_40:' <<<"$out")" "cols_40: (8, 10, 20)"
+  check "standard column widths at w=100" \
+    "$(grep 'cols_100:' <<<"$out")" "cols_100: (20, 22, 42)"
+  check "adaptive idle header at w=70" \
+    "$(grep 'idle_70:' <<<"$out")" "idle_70: Hotkeys act immediately · Enter = primary · Esc = quit"
+  check "adaptive idle header at w=60" \
+    "$(grep 'idle_60:' <<<"$out")" "idle_60: Keys act immediately · Enter=primary · Esc=quit"
+  check "adaptive idle header at w=40" \
+    "$(grep 'idle_40:' <<<"$out")" "idle_40: Keys act immediately · Enter/Esc"
+  check "adaptive pending list at w=40" \
+    "$(grep 'pending_40:' <<<"$out")" "pending_40: Loading: calendar, reminders, github...…"
+  check "adaptive pending list at w=30" \
+    "$(grep 'pending_30:' <<<"$out")" "pending_30: Loading…"
+}
+test_mobile_width_support
+
+# ---------------------------------------------------------------------------
+echo
 echo "== core: row_identity() / render_dashboard_rows() / render_rows() compatibility =="
 
 test_row_identity_stable_and_context_qualified() {
