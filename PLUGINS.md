@@ -119,13 +119,16 @@ already-established convention elsewhere).
 
 ### Cross-link merging
 
-Core runs two generic, source-agnostic passes over every fetched item,
+Core runs three generic, source-agnostic passes over every fetched item,
 regardless of which plugin produced it:
 
-1. **ID-shaped title match**: if item A's title contains a token shaped
+1. **Declared association**: an item that lists an `association_keys`
+   value absorbs the item whose `identity_key` equals one of those keys. This pass runs
+   first; the declaring item is the host.
+2. **ID-shaped title match**: if item A's title contains a token shaped
    like `[A-Z]+-\d+` (e.g. `ABC-123`) and some other item B's `id`
    (case-insensitive) equals that token, B is absorbed into A.
-2. **Title-substring match**: if item A's title (≥4 chars, not
+3. **Title-substring match**: if item A's title (≥4 chars, not
    "untitled") is a substring of item B's title, B is absorbed into A.
 
 "Absorbed" means: B's `absorb_note` (or a generic status/title fallback)

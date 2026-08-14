@@ -22,7 +22,10 @@ _MAX_PR_DETAIL_WORKERS = 32
 ACTION_KEYS = ["alt-o", "alt-s", "alt-l", "alt-a", "alt-m", "alt-c", "alt-g"]
 
 def _body_association_keys(body):
-    return [f"linear:{identifier}" for identifier in re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", body or "")]
+    return [
+        f"linear:{identifier.upper()}"
+        for identifier in re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", body or "", flags=re.IGNORECASE)
+    ]
 
 
 def _gh_json(args):
