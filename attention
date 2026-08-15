@@ -373,6 +373,8 @@ _STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX = 20, 30, 60
 
 
 def _clip(text, width):
+    if width <= 0:
+        return ""
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
@@ -386,6 +388,7 @@ def _normalize_row_text(items):
 
 def _row_columns(items):
     import shutil
+
     w = shutil.get_terminal_size().columns
     if w < 80:
         status_max = max(8, int(w * 0.15))
@@ -397,14 +400,20 @@ def _row_columns(items):
     status_col = min(max((len(i["status"]) for i in items), default=0), status_max)
     context_col = min(max((len(i["context"]) for i in items), default=0), context_max)
     title_col = min(max((len(i["title"]) for i in items), default=0), title_max)
+    title_col = max(0, title_col - max(0, status_col + context_col + title_col + 7 - w))
     return status_col, context_col, title_col
 
 
 def _visible_row_text(item, status_col, context_col, title_col):
+    import shutil
+
     status = _clip(item["status"], status_col)
     context = _clip(item["context"], context_col)
     title = _clip(item["title"], title_col)
-    return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {item['details']} "
+    w = shutil.get_terminal_size().columns
+    details_width = max(0, w - status_col - context_col - title_col - 7)
+    details = _clip(item["details"], details_width) if w < 80 else item["details"]
+    return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {details} "
 
 
 def render_rows(items):

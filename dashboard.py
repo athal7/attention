@@ -57,7 +57,9 @@ def _pending_header(pending):
     import shutil
     w = shutil.get_terminal_size().columns
     if w < 80:
-        if w < 50:
+        if w < 32:
+            idle = "Enter/Esc"
+        elif w < 50:
             idle = "Keys act immediately · Enter/Esc"
         elif w < 65:
             idle = "Keys act immediately · Enter=primary · Esc=quit"

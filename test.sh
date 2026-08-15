@@ -1539,7 +1539,7 @@ class DummySize:
         self.columns = columns
 
 items = [
-    {'status': 'VERY_LONG_STATUS_HERE', 'context': 'very/long/context/here', 'title': 'Very long title that goes on and on and on', 'details': ''}
+    {'status': 'VERY_LONG_STATUS_HERE', 'context': 'very/long/context/here', 'title': 'Very long title that goes on and on and on', 'details': 'More details than will fit'}
 ]
 
 # Case 1: Terminal width 50
@@ -1576,12 +1576,21 @@ print('pending_40:', d._pending_header(['calendar', 'reminders', 'github', 'line
 # Case 8: Pending list truncation at width 30
 shutil.get_terminal_size = lambda: DummySize(30)
 print('pending_30:', d._pending_header(['calendar', 'reminders', 'github', 'linear']))
+
+# Case 9: Rendered rows remain visible within narrow terminals
+shutil.get_terminal_size = lambda: DummySize(40)
+print('visible_40_fits:', len(m.render_rows(items)[0].split('\t', 1)[0]) <= 40)
+shutil.get_terminal_size = lambda: DummySize(30)
+print('visible_30_fits:', len(m.render_rows(items)[0].split('\t', 1)[0]) <= 30)
+
+# Case 10: Idle header remains visible within the narrowest terminal
+print('idle_30_fits:', len(d._pending_header([])) <= 30)
 ")"
 
   check "adaptive column widths at w=50" \
     "$(grep 'cols_50:' <<<"$out")" "cols_50: (8, 10, 22)"
   check "adaptive column widths at w=40" \
-    "$(grep 'cols_40:' <<<"$out")" "cols_40: (8, 10, 20)"
+    "$(grep 'cols_40:' <<<"$out")" "cols_40: (8, 10, 15)"
   check "standard column widths at w=100" \
     "$(grep 'cols_100:' <<<"$out")" "cols_100: (20, 22, 42)"
   check "adaptive idle header at w=70" \
@@ -1594,6 +1603,12 @@ print('pending_30:', d._pending_header(['calendar', 'reminders', 'github', 'line
     "$(grep 'pending_40:' <<<"$out")" "pending_40: Loading: calendar, reminders, github...…"
   check "adaptive pending list at w=30" \
     "$(grep 'pending_30:' <<<"$out")" "pending_30: Loading…"
+  check "visible row fits at w=40" \
+    "$(grep 'visible_40_fits:' <<<"$out")" "visible_40_fits: True"
+  check "visible row fits at w=30" \
+    "$(grep 'visible_30_fits:' <<<"$out")" "visible_30_fits: True"
+  check "idle header fits at w=30" \
+    "$(grep 'idle_30_fits:' <<<"$out")" "idle_30_fits: True"
 }
 test_mobile_width_support
 
