@@ -69,7 +69,7 @@ def _fetch_pr_attention(author, detail_pool):
     fixed cap.
     """
     prs = _gh_json([
-        "search", "prs", f"--author={author}", "--state=open", "--limit", "50",
+        "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
         "--json", "number,title,body,repository,url,isDraft,createdAt",
     ])
     if not prs:
@@ -126,7 +126,7 @@ def _fetch_my_repo_issues():
     # the assignee=@me query below, which only catches issues explicitly
     # assigned to me and misses everything else in my own repos.
     return _gh_json([
-        "search", "issues", "--owner=@me", "--state=open", "--limit", "50",
+        "search", "issues", "--owner=@me", "--state=open", "--archived=false", "--limit", "50",
         "--json", "number,title,repository,url,createdAt",
     ])
 
@@ -181,7 +181,7 @@ def _fetch_raw(config):
     # global cross-repo search subcommands.
     def _review_prs():
         prs = _gh_json([
-            "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
+            "search", "prs", "--review-requested=@me", "--state=open", "--archived=false", "--limit", "50",
             "--json", "number,title,body,repository,url,isDraft,createdAt",
         ])
         def _with_closing_references(pr):
@@ -199,7 +199,7 @@ def _fetch_raw(config):
 
     def _assigned_issues():
         issues = _gh_json([
-            "search", "issues", "--assignee=@me", "--state=open", "--limit", "50",
+            "search", "issues", "--assignee=@me", "--state=open", "--archived=false", "--limit", "50",
             "--json", "number,title,repository,url,createdAt",
         ])
         for i in issues:
