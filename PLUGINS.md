@@ -158,6 +158,30 @@ your settings under a top-level key matching your plugin's name (e.g.
 `config["jira"]`), since that's what the bundled plugins do, but nothing
 in core enforces this.
 
+Bundled plugins (e.g., `github`, `linear`, `calendar`, `reminders`) accept
+an `actions` array in their config section to attach non-inherent custom actions
+(shortcuts and command templates) to fetched items:
+
+```json
+{
+  "github": {
+    "actions": [
+      {
+        "key": "alt-s",
+        "label": "session",
+        "background": true,
+        "command": ["aoe-cmd", "-d", "{repo_path}", "-n", "{slug}", "-b", "-w", "{slug}", "Work on issue {id} in this repo"]
+      },
+      {
+        "key": "alt-l",
+        "label": "lumen",
+        "command": ["lumen", "diff", "--pr", "{url}"]
+      }
+    ]
+  }
+}
+```
+
 
 ## Config-only providers (no Python required)
 

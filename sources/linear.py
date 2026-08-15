@@ -8,11 +8,21 @@ import os
 import urllib.error
 import urllib.request
 
-from _util import dispatch_background, run_cmd
+from _util import dispatch_background, resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 GRAPHQL_URL = "https://api.linear.app/graphql"
 
-ACTION_KEYS = ["alt-o", "alt-s", "alt-c", "alt-t"]
+ACTION_KEYS = ["alt-o", "alt-c", "alt-t"]
+
+
+def declared_action_keys(config):
+    keys = list(ACTION_KEYS)
+    actions = config.get("linear", {}).get("actions", [])
+    if isinstance(actions, list):
+        for a in actions:
+            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
+                keys.append(a["key"])
+    return keys
 
 
 def _get_token(config):
@@ -92,6 +102,26 @@ query {
 
         weight = 80 if state.lower() == "in progress" else 65
 
+        record = {
+            "url": url,
+            "identifier": identifier,
+            "identifier_lower": identifier.lower(),
+            "id": identifier,
+            "slug": slugify(title),
+            "db_id": db_id,
+            "title": title,
+            "context": project,
+            "status": state,
+        }
+
+        actions = [
+            {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
+            {"key": "alt-t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
+        ]
+        configured_actions = config.get("linear", {}).get("actions", [])
+        actions.extend(resolve_configured_actions(configured_actions, record))
+
         items.append({
             "status": state.upper(),
             "context": project,
@@ -101,12 +131,7 @@ query {
             "id": identifier,
             "absorb_note": f"Linear {identifier}: {state.upper()}",
             "identity_key": f"linear:{identifier}",
-            "actions": [
-                {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-                {"key": "alt-s", "label": "session", "payload": {"kind": "session", "identifier": identifier}},
-                {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
-                {"key": "alt-t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
-            ],
+            "actions": actions,
         })
 
     # Stash the token on every comment/transition payload -- act() is a
@@ -211,12 +236,12 @@ def _linear_transition(db_id, token):
 
 
 def act(key, payload):
+    if "command" in payload:
+        run_configured_action(payload)
+        return
     kind = payload.get("kind")
     if kind == "open":
         run_cmd(["open", payload["url"]]) if payload.get("url") else print("No URL.")
-    elif kind == "session":
-        identifier = payload["identifier"]
-        dispatch_background(["aoe-cmd", "-d", os.getcwd(), "-n", identifier.lower(), f"Work on Linear issue {identifier}"])
     elif kind == "comment":
         _linear_comment(payload.get("db_id"), payload.get("token"))
     elif kind == "transition":

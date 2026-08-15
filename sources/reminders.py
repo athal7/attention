@@ -8,9 +8,19 @@ import json
 import subprocess
 from datetime import date
 
-from _util import run_cmd
+from _util import resolve_configured_actions, run_cmd, run_configured_action
 
 ACTION_KEYS = ["alt-x"]
+
+
+def declared_action_keys(config):
+    keys = list(ACTION_KEYS)
+    actions = config.get("reminders", {}).get("actions", [])
+    if isinstance(actions, list):
+        for a in actions:
+            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
+                keys.append(a["key"])
+    return keys
 
 
 def fetch(config):
@@ -53,6 +63,19 @@ def fetch(config):
         else:
             weight = {"high": 70, "medium": 50, "low": 30}.get(prio, 15)
 
+        record = {
+            "id": reminder_id,
+            "title": title,
+            "context": list_name,
+            "status": status,
+            "details": details,
+        }
+        actions = [
+            {"key": "alt-x", "label": "complete", "payload": {"id": reminder_id}},
+        ]
+        configured_actions = config.get("reminders", {}).get("actions", [])
+        actions.extend(resolve_configured_actions(configured_actions, record))
+
         items.append({
             "status": status,
             "context": list_name,
@@ -61,13 +84,14 @@ def fetch(config):
             "weight": weight,
             "id": reminder_id,
             "absorb_note": f"Reminder: {title}",
-            "actions": [
-                {"key": "alt-x", "label": "complete", "payload": {"id": reminder_id}},
-            ],
+            "actions": actions,
         })
     return items
 
 
 def act(key, payload):
+    if "command" in payload:
+        run_configured_action(payload)
+        return
     if key == "alt-x":
         run_cmd(["remindctl", "complete", payload["id"]])

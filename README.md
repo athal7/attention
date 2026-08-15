@@ -35,15 +35,8 @@ row without leaving the list. `Esc` quits.
 |---|---|
 | Calendar event | `⌥y` yank to clipboard; `⌥x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
 | Reminder | `⌥x` complete |
-| GitHub PR/issue | `⌥o` open · `⌥s` dispatch a work session (background) · `⌥l` review diff in [`lumen`](https://github.com/jnsahaj/lumen) · `⌥a` approve · `⌥m` merge (squash + delete branch, confirms first) · `⌥c` comment · `⌥g` add label. If the item cross-links to a Linear issue (title contains its identifier): `O`/`C`/`T` open/comment/transition the *linked Linear issue* instead |
-| Linear issue | `⌥o` open · `⌥s` dispatch a work session (background) · `⌥c` comment · `⌥t` transition (lists the issue's own team's workflow states) |
-
-Session dispatch (`⌥s`) shells out to an `aoe-cmd` binary if present on
-`PATH` (a thin personal wrapper around
-[`aoe`](https://github.com/agent-of-empires/agent-of-empires) that creates a
-session, optionally in a new git worktree, and sends it a message); the
-session/worktree-branch name is a slug derived from the item's title, not
-its number.
+| GitHub PR/issue | `⌥o` open · `⌥a` approve · `⌥m` merge (squash + delete branch, confirms first) · `⌥c` comment · `⌥g` add label. If the item cross-links to a Linear issue (title contains its identifier): `O`/`C`/`T` open/comment/transition the *linked Linear issue* instead |
+| Linear issue | `⌥o` open · `⌥c` comment · `⌥t` transition (lists the issue's own team's workflow states) |
 
 ## Configuration
 
@@ -56,7 +49,21 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "plugins": ["calendar", "reminders", "github", "linear"],
   "calendar":  { "names": ["Work"] },
   "reminders": { "lists": ["Personal", "Work"] },
-  "github":    {},
+  "github":    {
+    "actions": [
+      {
+        "key": "alt-s",
+        "label": "session",
+        "background": true,
+        "command": ["aoe-cmd", "-d", "{repo_path}", "-n", "{slug}", "-b", "-w", "{slug}", "Work on issue {id} in this repo"]
+      },
+      {
+        "key": "alt-l",
+        "label": "lumen",
+        "command": ["lumen", "diff", "--pr", "{url}"]
+      }
+    ]
+  },
   "linear":    { "apiToken": "lin_api_..." }
 }
 ```
@@ -68,6 +75,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
+| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`), and optional `"background": true`. |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 
 ## What each bundled plugin surfaces
@@ -111,7 +119,3 @@ just point `config["plugins"]` at it.
 - [`gh`](https://cli.github.com) -- `github` plugin (authenticated)
 - [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
 - [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
-- [`lumen`](https://github.com/jnsahaj/lumen) -- `⌥l` review-diff hotkey (github)
-- `aoe-cmd` -- `⌥s` session-dispatch hotkey (github, linear; your own wrapper
-  around [`aoe`](https://github.com/agent-of-empires/agent-of-empires), not a
-  standalone published tool)

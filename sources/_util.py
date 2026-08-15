@@ -57,3 +57,64 @@ def copy_to_clipboard(text):
         print("Copied to clipboard!")
     except Exception as e:
         print(f"Failed to copy: {e}")
+
+
+_PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
+
+
+def _lookup(record, path):
+    val = record
+    for part in path.split("."):
+        if not isinstance(val, dict):
+            return None
+        val = val.get(part)
+    return val
+
+
+def resolve_template(template, record):
+    if not isinstance(template, str):
+        return template
+
+    def _sub(m):
+        val = _lookup(record, m.group(1))
+        return "" if val is None else str(val)
+
+    return _PLACEHOLDER.sub(_sub, template)
+
+
+def resolve_configured_actions(configured_actions, record):
+    if not isinstance(configured_actions, list):
+        return []
+    actions = []
+    for a in configured_actions:
+        if not isinstance(a, dict):
+            continue
+        key = a.get("key", "")
+        if not key:
+            continue
+        cmd_template = a.get("command", [])
+        if isinstance(cmd_template, list):
+            cmd = [resolve_template(tok, record) for tok in cmd_template]
+        else:
+            cmd = []
+        actions.append({
+            "key": key,
+            "label": a.get("label", ""),
+            "primary": a.get("primary", False),
+            "payload": {
+                "command": cmd,
+                "background": a.get("background", False),
+            },
+        })
+    return actions
+
+
+def run_configured_action(payload):
+    command = payload.get("command")
+    if not command:
+        print("No command configured.")
+        return
+    if payload.get("background"):
+        dispatch_background(command)
+    else:
+        run_cmd(command)
