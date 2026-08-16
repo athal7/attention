@@ -1585,6 +1585,18 @@ print('visible_30_fits:', len(m.render_rows(items)[0].split('\t', 1)[0]) <= 30)
 
 # Case 10: Idle header remains visible within the narrowest terminal
 print('idle_30_fits:', len(d._pending_header([])) <= 30)
+import unicodedata
+display_width = lambda text: sum(
+    0 if unicodedata.combining(char)
+    else 2 if unicodedata.east_asian_width(char) in ('W', 'F')
+    else 1
+    for char in text
+)
+wide_items = [
+    {'status': '漢' * 8, 'context': '漢' * 10, 'title': '漢' * 20, 'details': ''}
+]
+print('wide_visible_30_fits:', display_width(m.render_rows(wide_items)[0].split('\t', 1)[0]) <= 30)
+print('wide_pending_30_fits:', display_width(d._pending_header(['漢' * 11])) <= 30)
 ")"
 
   check "adaptive column widths at w=50" \
@@ -1606,9 +1618,13 @@ print('idle_30_fits:', len(d._pending_header([])) <= 30)
   check "visible row fits at w=40" \
     "$(grep 'visible_40_fits:' <<<"$out")" "visible_40_fits: True"
   check "visible row fits at w=30" \
-    "$(grep 'visible_30_fits:' <<<"$out")" "visible_30_fits: True"
+    "$(grep '^visible_30_fits:' <<<"$out")" "visible_30_fits: True"
   check "idle header fits at w=30" \
     "$(grep 'idle_30_fits:' <<<"$out")" "idle_30_fits: True"
+  check "wide-character row fits at w=30" \
+    "$(grep 'wide_visible_30_fits:' <<<"$out")" "wide_visible_30_fits: True"
+  check "wide-character pending header fits at w=30" \
+    "$(grep 'wide_pending_30_fits:' <<<"$out")" "wide_pending_30_fits: True"
 }
 test_mobile_width_support
 

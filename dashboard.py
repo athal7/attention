@@ -35,6 +35,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from typing import Callable, NamedTuple, Protocol
 
 
@@ -53,8 +54,41 @@ class Presenter(Protocol):
 _IDLE_HEADER = "Hotkeys act immediately on this row · Enter = primary action · Esc = quit"
 
 
+def _display_width(text):
+    return sum(
+        0 if unicodedata.combining(char)
+        else 2 if unicodedata.east_asian_width(char) in ("W", "F")
+        else 1
+        for char in text
+    )
+
+
+def _clip(text, width, suffix="…"):
+    if width <= 0:
+        return ""
+    if _display_width(text) <= width:
+        return text
+
+    suffix_width = _display_width(suffix)
+    if suffix_width >= width:
+        return suffix if suffix_width == width else suffix[:width]
+
+    clipped = []
+    used = 0
+    for char in text:
+        char_width = _display_width(char)
+        if used + char_width > width - suffix_width:
+            break
+        clipped.append(char)
+        used += char_width
+    return "".join(clipped) + suffix
+
+
+
+
 def _pending_header(pending):
     import shutil
+
     w = shutil.get_terminal_size().columns
     if w < 80:
         if w < 32:
@@ -69,18 +103,14 @@ def _pending_header(pending):
         idle = _IDLE_HEADER
 
     if pending:
-        msg = "Loading: " + ", ".join(pending) + "…"
-        if w < 80 and len(msg) > w and w >= 15:
+        plugins = ", ".join(pending)
+        message = f"Loading: {plugins}…"
+        if w < 80 and _display_width(message) > w:
             if w < 40:
-                return "Loading…"
-            else:
-                allowed_len = w - 10
-                plugins_str = ", ".join(pending)
-                if len(plugins_str) > allowed_len:
-                    plugins_str = plugins_str[:allowed_len - 3] + "..."
-                return f"Loading: {plugins_str}…"
-        return msg
-    return idle
+                return _clip("Loading…", w)
+            return f"Loading: {_clip(plugins, w - 10, '...')}…"
+        return message
+    return _clip(idle, w)
 
 
 def build_launch_binds(universe_keys):

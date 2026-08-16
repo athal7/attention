@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone
 import concurrent.futures
@@ -372,10 +373,36 @@ def hint_for_actions(actions):
 _STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX = 20, 30, 60
 
 
+def _display_width(text):
+    return sum(
+        0 if unicodedata.combining(char)
+        else 2 if unicodedata.east_asian_width(char) in ("W", "F")
+        else 1
+        for char in text
+    )
+
+
 def _clip(text, width):
     if width <= 0:
         return ""
-    return text if len(text) <= width else text[: width - 1] + "…"
+    if _display_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+
+    clipped = []
+    used = 0
+    for char in text:
+        char_width = _display_width(char)
+        if used + char_width > width - 1:
+            break
+        clipped.append(char)
+        used += char_width
+    return "".join(clipped) + "…"
+
+
+def _pad(text, width):
+    return text + " " * max(0, width - _display_width(text))
 
 
 def _normalize_row_text(items):
@@ -397,9 +424,9 @@ def _row_columns(items):
     else:
         status_max, context_max, title_max = _STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX
 
-    status_col = min(max((len(i["status"]) for i in items), default=0), status_max)
-    context_col = min(max((len(i["context"]) for i in items), default=0), context_max)
-    title_col = min(max((len(i["title"]) for i in items), default=0), title_max)
+    status_col = min(max((_display_width(i["status"]) for i in items), default=0), status_max)
+    context_col = min(max((_display_width(i["context"]) for i in items), default=0), context_max)
+    title_col = min(max((_display_width(i["title"]) for i in items), default=0), title_max)
     title_col = max(0, title_col - max(0, status_col + context_col + title_col + 7 - w))
     return status_col, context_col, title_col
 
@@ -407,13 +434,13 @@ def _row_columns(items):
 def _visible_row_text(item, status_col, context_col, title_col):
     import shutil
 
-    status = _clip(item["status"], status_col)
-    context = _clip(item["context"], context_col)
-    title = _clip(item["title"], title_col)
+    status = _pad(_clip(item["status"], status_col), status_col)
+    context = _pad(_clip(item["context"], context_col), context_col)
+    title = _pad(_clip(item["title"], title_col), title_col)
     w = shutil.get_terminal_size().columns
     details_width = max(0, w - status_col - context_col - title_col - 7)
     details = _clip(item["details"], details_width) if w < 80 else item["details"]
-    return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {details} "
+    return f"{status}  {context}  {title}  {details} "
 
 
 def render_rows(items):
