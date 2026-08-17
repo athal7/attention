@@ -855,6 +855,15 @@ p.run_configured_action({'command': ['record-args', '--msg', '{input}'], 'inputs
   PATH="$INPUT_BIN:$PATH" python3 -c "
 $(load_plugin_py _util)
 import io, sys
+sys.stdin = io.StringIO('\n')
+p.run_configured_action({'command': ['record-args', '--before', '{input}', '--after'], 'inputs': [{'name': '', 'prompt': 'Message', 'default': ''}]})
+" >/dev/null 2>&1
+  check "an explicit empty default dispatches an empty argument" "$(cat "$INPUT_LOG")" '--before  --after'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
 sys.stdin = io.StringIO('2\n')
 p.run_configured_action({'command': ['record-args', '--prio', '{input}'], 'inputs': [{'name': '', 'prompt': 'Priority', 'choices': ['p0', 'p1', 'p2']}]})
 " >/dev/null 2>&1

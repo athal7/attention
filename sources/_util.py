@@ -111,7 +111,7 @@ def _resolve_input_spec(raw, label, record):
     spec = {"prompt": prompt}
     if choices:
         spec["choices"] = choices
-    if default:
+    if default is not None:
         spec["default"] = default
     return spec
 
@@ -198,7 +198,7 @@ def prompt_for_input(spec):
         print("Invalid choice.")
         return None
 
-    if default:
+    if default is not None:
         prompt = f"{prompt} [{default}]"
     try:
         raw = input(f"{prompt}: ").strip()
@@ -207,7 +207,7 @@ def prompt_for_input(spec):
         return None
     if raw:
         return raw
-    if default:
+    if default is not None:
         return default
     print("Canceled.")
     return None

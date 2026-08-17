@@ -248,9 +248,9 @@ template parsed as one (falling back to `50` if that fails). An action
 may set `"background": true` to dispatch via `dispatch_background`
 (fire-and-forget, e.g. starting a long-running session) instead of the
 default `run_cmd` (blocks, prints failures). Provider actions support
-the same optional `"input"` field as the bundled plugins' configured
-actions above -- a text prompt or a `{"choices": [...]}` pick-one, with
-the answer substituted into any `{input}` token in the command.
+the same optional `"input"` or `"inputs"` declarations as bundled
+plugins: text or pick-one prompts fill `{input}` or
+`{input.<name>}` placeholders in the command.
 
 Each named provider is fetched and mapped independently -- one with a
 missing/failing `command` or non-JSON-array output contributes nothing,
