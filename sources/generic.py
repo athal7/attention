@@ -39,7 +39,7 @@ import json
 import re
 import subprocess
 
-from _util import dispatch_background, run_cmd
+from _util import resolve_configured_actions, run_configured_action
 
 _PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
 
@@ -126,17 +126,6 @@ def _fetch_provider(name, spec):
     for record in records:
         if not isinstance(record, dict):
             continue
-        actions = []
-        for a in spec.get("actions", []):
-            actions.append({
-                "key": a.get("key", ""),
-                "label": a.get("label", ""),
-                "primary": a.get("primary", False),
-                "payload": {
-                    "command": [_resolve(tok, record) for tok in a.get("command", [])],
-                    "background": a.get("background", False),
-                },
-            })
         items.append({
             "status": _resolve(spec.get("status", name), record),
             "context": _resolve(spec.get("context", name), record),
@@ -144,7 +133,7 @@ def _fetch_provider(name, spec):
             "details": _resolve(spec.get("details", ""), record),
             "weight": _resolve_weight(spec.get("weight"), record),
             "id": _resolve(spec.get("id", ""), record),
-            "actions": actions,
+            "actions": resolve_configured_actions(spec.get("actions", []), record),
         })
     return items
 
@@ -171,11 +160,4 @@ def fetch(config):
 
 
 def act(key, payload):
-    command = payload.get("command")
-    if not command:
-        print("No command configured.")
-        return
-    if payload.get("background"):
-        dispatch_background(command)
-    else:
-        run_cmd(command)
+    run_configured_action(payload)

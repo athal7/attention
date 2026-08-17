@@ -61,6 +61,8 @@ def copy_to_clipboard(text):
 
 _PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
 
+_INPUT_PLACEHOLDER = "input"
+
 
 def _lookup(record, path):
     val = record
@@ -76,10 +78,65 @@ def resolve_template(template, record):
         return template
 
     def _sub(m):
-        val = _lookup(record, m.group(1))
+        name = m.group(1)
+        if name == _INPUT_PLACEHOLDER or name.startswith(_INPUT_PLACEHOLDER + "."):
+            return m.group(0)
+        val = _lookup(record, name)
         return "" if val is None else str(val)
 
     return _PLACEHOLDER.sub(_sub, template)
+
+
+def _resolve_input_spec(raw, label, record):
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        prompt, choices, default = raw, None, None
+    elif isinstance(raw, dict):
+        prompt = raw.get("prompt")
+        choices = raw.get("choices")
+        default = raw.get("default")
+    else:
+        return None
+
+    prompt = resolve_template(prompt if prompt else (label or "Input"), record)
+    if isinstance(choices, list):
+        choices = [str(resolve_template(c, record)) for c in choices]
+    else:
+        choices = None
+    if default is not None:
+        default = resolve_template(default, record)
+
+    spec = {"prompt": prompt}
+    if choices:
+        spec["choices"] = choices
+    if default is not None:
+        spec["default"] = default
+    return spec
+
+
+def _resolve_input_specs(action, label, record):
+
+    raw_inputs = action.get("inputs")
+    if isinstance(raw_inputs, list):
+        specs = []
+        for raw in raw_inputs:
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name", "")
+            if not name:
+                continue
+            spec = _resolve_input_spec(raw, label, record)
+            if spec is not None:
+                spec["name"] = name
+                specs.append(spec)
+        return specs
+    spec = _resolve_input_spec(action.get("input"), label, record)
+    if spec is None:
+        return []
+    spec["name"] = ""
+    return [spec]
 
 
 def resolve_configured_actions(configured_actions, record):
@@ -97,16 +154,63 @@ def resolve_configured_actions(configured_actions, record):
             cmd = [resolve_template(tok, record) for tok in cmd_template]
         else:
             cmd = []
+        payload = {
+            "command": cmd,
+            "background": a.get("background", False),
+        }
+        input_specs = _resolve_input_specs(a, a.get("label", ""), record)
+        if input_specs:
+            payload["inputs"] = input_specs
         actions.append({
             "key": key,
             "label": a.get("label", ""),
             "primary": a.get("primary", False),
-            "payload": {
-                "command": cmd,
-                "background": a.get("background", False),
-            },
+            "payload": payload,
         })
     return actions
+
+
+def prompt_for_input(spec):
+
+    prompt = spec.get("prompt") or "Input"
+    choices = spec.get("choices")
+    default = spec.get("default")
+
+    if choices:
+        print()
+        for i, c in enumerate(choices, 1):
+            print(f"{i}) {c}")
+        default_idx = 0
+        if default in choices:
+            default_idx = choices.index(default) + 1
+        prompt_suffix = f" [1-{len(choices)}]"
+        if default_idx:
+            prompt_suffix += f" (Enter={default_idx})"
+        try:
+            raw = input(f"{prompt}{prompt_suffix}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCanceled.")
+            return None
+        if raw == "" and default_idx:
+            return choices[default_idx - 1]
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        print("Invalid choice.")
+        return None
+
+    if default is not None:
+        prompt = f"{prompt} [{default}]"
+    try:
+        raw = input(f"{prompt}: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCanceled.")
+        return None
+    if raw:
+        return raw
+    if default is not None:
+        return default
+    print("Canceled.")
+    return None
 
 
 def run_configured_action(payload):
@@ -114,6 +218,25 @@ def run_configured_action(payload):
     if not command:
         print("No command configured.")
         return
+    specs = payload.get("inputs")
+    if specs:
+        values = {}
+        for spec in specs:
+            name = spec.get("name", "")
+            value = prompt_for_input(spec)
+            if value is None:
+                return
+            values[name] = value
+
+        def _fill(tok):
+            if not isinstance(tok, str):
+                return tok
+            for name, value in values.items():
+                placeholder = "{input}" if not name else f"{{input.{name}}}"
+                tok = tok.replace(placeholder, value)
+            return tok
+
+        command = [_fill(tok) for tok in command]
     if payload.get("background"):
         dispatch_background(command)
     else:

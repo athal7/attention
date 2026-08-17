@@ -781,6 +781,195 @@ print(json.dumps(items[0]['actions'][5]['payload']['command']))
 }
 test_plugin_configurable_actions
 
+echo
+echo "== action input: text/choice prompts, {input} substitution, cancel =="
+
+INPUT_BIN="$WORK/bin-action-input"
+mkdir -p "$INPUT_BIN"
+INPUT_LOG="$WORK/action-input.log"; : > "$INPUT_LOG"
+
+cat > "$INPUT_BIN/record-args" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$INPUT_LOG"
+STUB
+chmod +x "$INPUT_BIN/record-args"
+
+test_util_input_resolve() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py _util)
+record = {'id': '42', 'url': 'https://x/42'}
+actions = p.resolve_configured_actions([
+    {'key': 'alt-s', 'label': 'session', 'command': ['run', '-m', '{input}'], 'input': {'prompt': 'Msg', 'default': 'Work on issue {id}'}},
+    {'key': 'alt-p', 'label': 'prio', 'command': ['run', '--prio', '{input}'], 'input': {'prompt': 'Priority', 'choices': ['p0', 'p1']}},
+    {'key': 'alt-s2', 'label': 'multi', 'command': ['run', '--agent', '{input.tool}', '--msg', '{input.command}'], 'inputs': [
+        {'name': 'tool', 'prompt': 'Agent', 'choices': ['opencode', 'omp']},
+        {'name': 'command', 'prompt': 'Command', 'default': 'Work on issue {id}'},
+    ]},
+], record)
+print(actions[0]['payload']['command'][2])
+print(actions[0]['payload']['inputs'][0]['default'])
+print(','.join(actions[1]['payload']['inputs'][0]['choices']))
+print(actions[2]['payload']['command'][2])
+print(actions[2]['payload']['command'][4])
+print(actions[2]['payload']['inputs'][0]['name'])
+print(actions[2]['payload']['inputs'][1]['default'])
+")"
+  check "resolve leaves the reserved {input} placeholder for act-time substitution" \
+    "$(sed -n 1p <<<"$out")" '{input}'
+  check "resolve resolves record placeholders in the input default" \
+    "$(sed -n 2p <<<"$out")" 'Work on issue 42'
+  check "resolve carries choice mode into the payload input spec" \
+    "$(sed -n 3p <<<"$out")" 'p0,p1'
+  check "resolve leaves named {input.<name>} placeholders verbatim" \
+    "$(sed -n 4p <<<"$out")" '{input.tool}'
+  check "resolve leaves a second named placeholder verbatim" \
+    "$(sed -n 5p <<<"$out")" '{input.command}'
+  check "resolve names each multi-input spec" \
+    "$(sed -n 6p <<<"$out")" 'tool'
+  check "resolve resolves record placeholders in a named input's default" \
+    "$(sed -n 7p <<<"$out")" 'Work on issue 42'
+}
+test_util_input_resolve
+
+test_util_input_prompt_and_run() {
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('fix the login\n')
+p.run_configured_action({'command': ['record-args', '--msg', '{input}'], 'inputs': [{'name': '', 'prompt': 'Message'}]})
+" >/dev/null 2>&1
+  check "text input is substituted into the command" "$(cat "$INPUT_LOG")" '--msg fix the login'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('\n')
+p.run_configured_action({'command': ['record-args', '--msg', '{input}'], 'inputs': [{'name': '', 'prompt': 'Message', 'default': 'Work on issue 42'}]})
+" >/dev/null 2>&1
+  check "an empty answer falls back to the declared default" "$(cat "$INPUT_LOG")" '--msg Work on issue 42'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('\n')
+p.run_configured_action({'command': ['record-args', '--before', '{input}', '--after'], 'inputs': [{'name': '', 'prompt': 'Message', 'default': ''}]})
+" >/dev/null 2>&1
+  check "an explicit empty default dispatches an empty argument" "$(cat "$INPUT_LOG")" '--before  --after'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('2\n')
+p.run_configured_action({'command': ['record-args', '--prio', '{input}'], 'inputs': [{'name': '', 'prompt': 'Priority', 'choices': ['p0', 'p1', 'p2']}]})
+" >/dev/null 2>&1
+  check "choice input substitutes the chosen value" "$(cat "$INPUT_LOG")" '--prio p1'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('\n')
+p.run_configured_action({'command': ['record-args', '--msg', '{input}'], 'inputs': [{'name': '', 'prompt': 'Message'}]})
+" >/dev/null 2>&1
+  if [ -s "$INPUT_LOG" ]; then
+    bad "an empty answer with no default cancels without running the command (got: $(cat "$INPUT_LOG"))"
+  else
+    ok "an empty answer with no default cancels without running the command"
+  fi
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('9\n')
+p.run_configured_action({'command': ['record-args', '--prio', '{input}'], 'inputs': [{'name': '', 'prompt': 'Priority', 'choices': ['p0', 'p1']}]})
+" >/dev/null 2>&1
+  if [ -s "$INPUT_LOG" ]; then
+    bad "an out-of-range choice cancels without running the command (got: $(cat "$INPUT_LOG"))"
+  else
+    ok "an out-of-range choice cancels without running the command"
+  fi
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('')
+p.run_configured_action({'command': ['record-args', '--msg', '{input}'], 'inputs': [{'name': '', 'prompt': 'Message'}]})
+" >/dev/null 2>&1
+  if [ -s "$INPUT_LOG" ]; then
+    bad "EOF cancels without running the command (got: $(cat "$INPUT_LOG"))"
+  else
+    ok "EOF cancels without running the command"
+  fi
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('2\nmy custom command\n')
+p.run_configured_action({'command': ['record-args', '--agent', '{input.tool}', '--msg', '{input.command}'], 'inputs': [
+    {'name': 'tool', 'prompt': 'Agent', 'choices': ['opencode', 'omp']},
+    {'name': 'command', 'prompt': 'Command', 'default': 'Work on issue 42'},
+]})
+" >/dev/null 2>&1
+  check "multi-input substitutes each named prompt into the command" "$(cat "$INPUT_LOG")" '--agent omp --msg my custom command'
+
+  : > "$INPUT_LOG"
+  PATH="$INPUT_BIN:$PATH" python3 -c "
+$(load_plugin_py _util)
+import io, sys
+sys.stdin = io.StringIO('\n')
+p.run_configured_action({'command': ['record-args', '--agent', '{input.tool}'], 'inputs': [
+    {'name': 'tool', 'prompt': 'Agent', 'choices': ['opencode', 'omp'], 'default': 'opencode'},
+]})
+" >/dev/null 2>&1
+  check "choice mode with a default accepts Enter to pick it" "$(cat "$INPUT_LOG")" '--agent opencode'
+}
+test_util_input_prompt_and_run
+
+test_generic_provider_input() {
+  write_config <<JSON
+{
+  "plugins": ["generic"],
+  "generic": {
+    "input-source": {
+      "command": ["my-source-cli"],
+      "status": "TODO",
+      "context": "input",
+      "title": "{name}",
+      "id": "{num}",
+      "weight": 50,
+      "actions": [
+        {"key": "alt-t", "label": "text", "command": ["record-args", "--msg", "{input}"], "input": {"prompt": "Message", "default": "default-msg-{num}"}},
+        {"key": "alt-c", "label": "choice", "command": ["record-args", "--prio", "{input}"], "input": {"prompt": "Priority", "choices": ["low", "high"]}}
+      ]
+    }
+  }
+}
+JSON
+  local line
+  line="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" list | grep 'GENERICTEST-first')"
+
+  : > "$INPUT_LOG"
+  printf 'typed message\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "alt-t" "$line" >/dev/null 2>&1
+  check "generic provider text input reaches the command" "$(cat "$INPUT_LOG")" '--msg typed message'
+
+  : > "$INPUT_LOG"
+  printf '\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "alt-t" "$line" >/dev/null 2>&1
+  check "generic provider empty input uses the record-resolved default" "$(cat "$INPUT_LOG")" '--msg default-msg-7'
+
+  : > "$INPUT_LOG"
+  printf '2\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "alt-c" "$line" >/dev/null 2>&1
+  check "generic provider choice input reaches the command" "$(cat "$INPUT_LOG")" '--prio high'
+}
+test_generic_provider_input
+
 # ---------------------------------------------------------------------------
 echo
 echo "== core: build_prioritized_items() deprioritizes recently-acted items =="

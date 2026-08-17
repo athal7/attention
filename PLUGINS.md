@@ -170,17 +170,45 @@ an `actions` array in their config section to attach non-inherent custom actions
         "key": "alt-s",
         "label": "session",
         "background": true,
-        "command": ["aoe-cmd", "-d", "{repo_path}", "-n", "{slug}", "-b", "-w", "{slug}", "Work on issue {id} in this repo"]
+        "command": ["my-session", "-d", "{repo_path}", "--agent", "{input.tool}", "{input.command}"],
+        "inputs": [
+          { "name": "tool", "prompt": "Agent harness", "choices": ["opencode", "omp"], "default": "opencode" },
+          { "name": "command", "prompt": "Session message", "default": "Work on issue {id} in this repo" }
+        ]
       },
       {
         "key": "alt-l",
         "label": "lumen",
-        "command": ["lumen", "diff", "--pr", "{url}"]
+        "command": ["lumen", "diff", "{url}"]
+      },
+      {
+        "key": "alt-p",
+        "label": "priority",
+        "command": ["gh", "issue", "edit", "{id}", "-R", "{repo}", "--add-label", "priority:{input}"],
+        "input": { "prompt": "Priority", "choices": ["p0", "p1", "p2"] }
       }
     ]
   }
 }
 ```
+
+An action may declare `"input"` (a single prompt) or `"inputs"` (a list
+of named prompts) to collect values before its command runs. The typed
+(or chosen) values replace the reserved placeholders in the command
+tokens: `{input}` for a single prompt, `{input.<name>}` for each named
+entry in `"inputs"`. A plain string is a text prompt; a dict supports
+`"prompt"` (defaults to the action's `"label"`), `"choices"` (a list ->
+a numbered pick-one prompt instead of free text), and `"default"`
+(text-mode fallback shown in the prompt and used when the user answers
+with nothing; in choice mode it's the pre-selected option, picked by
+pressing Enter). Prompt, choice, and default strings are themselves
+`{field}` templates resolved against the item, so a default like
+`"Work on issue {id} in this repo"` carries item context. Text input
+reads one line; an empty answer (or Ctrl-C/EOF, or an out-of-range
+choice) cancels the action, unless a `"default"` is set, in which case
+answering with nothing runs the default. `{input}` and `{input.<name>}`
+are reserved -- they always mean prompted values, so a record field
+literally named `input` can't be referenced by name.
 
 
 ## Config-only providers (no Python required)
@@ -219,7 +247,10 @@ as-is, and `{dotted.path}` substitutes that field from the record
 template parsed as one (falling back to `50` if that fails). An action
 may set `"background": true` to dispatch via `dispatch_background`
 (fire-and-forget, e.g. starting a long-running session) instead of the
-default `run_cmd` (blocks, prints failures).
+default `run_cmd` (blocks, prints failures). Provider actions support
+the same optional `"input"` or `"inputs"` declarations as bundled
+plugins: text or pick-one prompts fill `{input}` or
+`{input.<name>}` placeholders in the command.
 
 Each named provider is fetched and mapped independently -- one with a
 missing/failing `command` or non-JSON-array output contributes nothing,
