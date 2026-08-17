@@ -57,6 +57,18 @@ jobs:
             bump=major
           fi
 
+
+          if [ "$bump" = none ]; then
+            if [ "$last_tag" = v0.0.0 ]; then
+              changed=$(git ls-tree -r --name-only HEAD -- attention dashboard.py sources)
+            else
+              changed=$(git diff --name-only "$range" -- attention dashboard.py sources)
+            fi
+            if [ -n "$changed" ]; then
+              echo "::error::Release source changed since ${last_tag}, but no Conventional Commit declares a version bump."
+              exit 1
+            fi
+          fi
           if [ "$bump" = none ]; then
             echo "No feat/fix/breaking commits since ${last_tag} — skipping release."
             echo "new_tag=" >> "$GITHUB_OUTPUT"
