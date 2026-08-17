@@ -8,7 +8,7 @@ import os
 import urllib.error
 import urllib.request
 
-from _util import dispatch_background, resolve_configured_actions, run_cmd, run_configured_action, slugify
+from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 GRAPHQL_URL = "https://api.linear.app/graphql"
 

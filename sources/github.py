@@ -13,7 +13,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from _util import dispatch_background, resolve_configured_actions, run_cmd, run_configured_action, slugify
+from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 _MAX_WORKERS = 8
 
