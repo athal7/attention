@@ -55,12 +55,13 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
         "key": "alt-s",
         "label": "session",
         "background": true,
-        "command": ["aoe-cmd", "-d", "{repo_path}", "-n", "{slug}", "-b", "-w", "{slug}", "Work on issue {id} in this repo"]
+        "command": ["my-session", "-d", "{repo_path}", "-n", "{slug}", "{input}"],
+        "input": { "prompt": "Session message", "default": "Work on issue {id} in this repo" }
       },
       {
         "key": "alt-l",
         "label": "lumen",
-        "command": ["lumen", "diff", "--pr", "{url}"]
+        "command": ["lumen", "diff", "{url}"]
       }
     ]
   },
@@ -75,7 +76,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
-| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`), and optional `"background": true`. |
+| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 
 ## What each bundled plugin surfaces
