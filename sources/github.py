@@ -13,13 +13,23 @@ import re
 import subprocess
 from pathlib import Path
 
-from _util import dispatch_background, run_cmd, slugify
+from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 _MAX_WORKERS = 8
 
 _MAX_PR_DETAIL_WORKERS = 32
 
-ACTION_KEYS = ["alt-o", "alt-s", "alt-l", "alt-a", "alt-m", "alt-c", "alt-g"]
+ACTION_KEYS = ["alt-o", "alt-a", "alt-m", "alt-c", "alt-g"]
+
+
+def declared_action_keys(config):
+    keys = list(ACTION_KEYS)
+    actions = config.get("github", {}).get("actions", [])
+    if isinstance(actions, list):
+        for a in actions:
+            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
+                keys.append(a["key"])
+    return keys
 
 def _body_association_keys(body):
     return [
@@ -313,6 +323,29 @@ def fetch(config):
         repo_path = os.path.join(code_dir, dir_name)
         slug = slugify(title)
 
+        record = {
+            "url": url,
+            "number": number,
+            "id": number,
+            "repo_path": repo_path,
+            "slug": slug,
+            "repo": repo_name,
+            "context": repo_name,
+            "title": title,
+            "status": status,
+            "details": details,
+        }
+
+        actions = [
+            {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
+            {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
+            {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
+            {"key": "alt-g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
+        ]
+        configured_actions = config.get("github", {}).get("actions", [])
+        actions.extend(resolve_configured_actions(configured_actions, record))
+
         items.append({
             "status": status,
             "context": repo_name,
@@ -328,17 +361,7 @@ def fetch(config):
                 for reference in g.get("closingIssuesReferences", [])
                 if reference.get("number") is not None
             ] + _body_association_keys(g.get("body", "")),
-            "actions": [
-                {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-                {"key": "alt-s", "label": "session", "payload": {
-                    "kind": "session", "repo_path": repo_path, "slug": slug, "item_id": number,
-                }},
-                {"key": "alt-l", "label": "lumen", "payload": {"kind": "lumen", "url": url}},
-                {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
-                {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
-                {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
-                {"key": "alt-g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
-            ],
+            "actions": actions,
         })
     return items
 
@@ -364,18 +387,12 @@ def _confirm_and_merge(item_id, url):
 
 
 def act(key, payload):
+    if "command" in payload:
+        run_configured_action(payload)
+        return
     kind = payload.get("kind")
     if kind == "open":
         run_cmd(["open", payload["url"]]) if payload.get("url") else print("No URL.")
-    elif kind == "session":
-        repo_path = payload.get("repo_path")
-        if not repo_path:
-            print("No local repo path mapped.")
-            return
-        slug, item_id = payload["slug"], payload["item_id"]
-        dispatch_background(["aoe-cmd", "-d", repo_path, "-n", slug, "-b", "-w", slug, f"Work on issue {item_id} in this repo"])
-    elif kind == "lumen":
-        run_cmd(["lumen", "diff", "--pr", payload["url"]]) if payload.get("url") else print("No URL.")
     elif kind == "approve":
         url = payload.get("url")
         if not url:

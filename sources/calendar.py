@@ -9,9 +9,19 @@ import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from _util import copy_to_clipboard
+from _util import copy_to_clipboard, resolve_configured_actions, run_configured_action
 
 ACTION_KEYS = ["alt-y"]
+
+
+def declared_action_keys(config):
+    keys = list(ACTION_KEYS)
+    actions = config.get("calendar", {}).get("actions", [])
+    if isinstance(actions, list):
+        for a in actions:
+            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
+                keys.append(a["key"])
+    return keys
 
 
 def _get_ical_path():
@@ -92,20 +102,36 @@ def fetch(config):
                 status = "UPCOMING"
 
         display_text = f"{title} - {time_tag}" if time_tag else title
+        event_id = e.get("id", "")
+        record = {
+            "id": event_id,
+            "title": title,
+            "display_text": display_text,
+            "context": calendar_name,
+            "details": time_tag,
+            "status": status,
+        }
+        actions = [
+            {"key": "alt-y", "label": "yank", "payload": {"text": display_text}},
+        ]
+        configured_actions = config.get("calendar", {}).get("actions", [])
+        actions.extend(resolve_configured_actions(configured_actions, record))
+
         items.append({
             "status": status,
             "context": calendar_name,
             "title": title,
             "details": time_tag,
             "weight": weight,
-            "id": e.get("id", ""),
-            "actions": [
-                {"key": "alt-y", "label": "yank", "payload": {"text": display_text}},
-            ],
+            "id": event_id,
+            "actions": actions,
         })
     return items
 
 
 def act(key, payload):
+    if "command" in payload:
+        run_configured_action(payload)
+        return
     if key == "alt-y":
         copy_to_clipboard(payload["text"])

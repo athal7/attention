@@ -472,7 +472,7 @@ STUB
 chmod +x "$REPODIR_BIN/gh"
 
 write_config <<JSON
-{"plugins": ["github"], "codeDir": "$FAKE_CODE_DIR", "github": {}}
+{"plugins": ["github"], "codeDir": "$FAKE_CODE_DIR", "github": {"actions": [{"key": "alt-s", "label": "session", "background": true, "command": ["aoe-cmd", "-d", "{repo_path}"]}]}}
 JSON
 
 test_repo_path_git_remote_autodetect() {
@@ -480,15 +480,15 @@ test_repo_path_git_remote_autodetect() {
   out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$REPODIR_BIN:$PATH" python3 "$ATTENTION" list)"
   repo_line="$(grep 'REPODIRTEST-shorthand' <<<"$out" || true)"
   # repo_path isn't a visible column anymore -- decode the row's action
-  # blob and check the "session" action's payload.repo_path instead.
+  # blob and check the "session" action's command payload instead.
   local decoded
   decoded="$(python3 -c "
 import sys, base64, json
 line = sys.argv[1]
 blob = line.split(chr(9), 2)[1]
 actions = json.loads(base64.b64decode(blob))
-session = next(a for a in actions if a['payload'].get('kind') == 'session')
-print(session['payload']['repo_path'])
+session = next(a for a in actions if a.get('key') == 'alt-s')
+print(session['payload']['command'][2])
 " "$repo_line" 2>/dev/null || true)"
   check "repo_path matches the shorthand-named local clone via its git remote" "$decoded" "$FAKE_CODE_DIR/bigproj"
 }
@@ -747,6 +747,39 @@ for it in items:
   fi
 }
 test_generic_provider
+
+echo
+echo "== configurable actions in plugin configs (github, linear, etc.) =="
+
+test_plugin_configurable_actions() {
+  local gh_out
+  gh_out="$(python3 -c "
+$(load_plugin_py github)
+import json
+config = {
+    'codeDir': '/tmp/repo',
+    'github': {
+        'actions': [
+            {'key': 'alt-s', 'label': 'session', 'background': True, 'command': ['my-session', '-d', '{repo_path}', '-n', '{slug}']},
+            {'key': 'alt-l', 'label': 'lumen', 'command': ['my-lumen', '{url}']}
+        ]
+    }
+}
+p._fetch_raw = lambda cfg: [{'number': 42, 'title': 'Fix bug', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/42', 'type': 'review_request'}]
+items = p.fetch(config)
+keys = p.declared_action_keys(config)
+print(','.join(keys))
+print(json.dumps([a['key'] for a in items[0]['actions']]))
+print(json.dumps(items[0]['actions'][5]['payload']['command']))
+")"
+  check "github declared_action_keys includes configured keys" \
+    "$(sed -n 1p <<<"$gh_out")" "alt-o,alt-a,alt-m,alt-c,alt-g,alt-s,alt-l"
+  check "github fetch attaches configured actions" \
+    "$(sed -n 2p <<<"$gh_out")" '["alt-o", "alt-a", "alt-m", "alt-c", "alt-g", "alt-s", "alt-l"]'
+  check "github fetch resolves template in configured action command" \
+    "$(sed -n 3p <<<"$gh_out")" '["my-session", "-d", "/tmp/repo/repo", "-n", "fix-bug"]'
+}
+test_plugin_configurable_actions
 
 # ---------------------------------------------------------------------------
 echo
@@ -1992,8 +2025,8 @@ chmod +x "$INTERACT_BIN/aoe-cmd"
 GH_OPEN_ACTIONS='[{"key": "alt-o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"}]'
 GH_FULL_ACTIONS='[
   {"key": "alt-o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "alt-s", "label": "session", "payload": {"kind": "session", "repo_path": "/tmp/repo", "slug": "test-pr", "item_id": "42"}, "_plugin": "github"},
-  {"key": "alt-l", "label": "lumen", "payload": {"kind": "lumen", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "alt-s", "label": "session", "payload": {"command": ["aoe-cmd", "-d", "/tmp/repo", "-n", "test-pr", "-b", "-w", "test-pr", "Work on issue 42 in this repo"], "background": true}, "_plugin": "github"},
+  {"key": "alt-l", "label": "lumen", "payload": {"command": ["lumen", "diff", "--pr", "https://github.com/myorg/kb/pull/42"]}, "_plugin": "github"},
   {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
   {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
   {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
@@ -2009,7 +2042,7 @@ CAL_MULTI_ACTIONS='[
 ]'
 LIN_ACTIONS='[
   {"key": "alt-o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://linear.app/abc/issue/ABC-1"}, "_plugin": "linear"},
-  {"key": "alt-s", "label": "session", "payload": {"kind": "session", "identifier": "ABC-1"}, "_plugin": "linear"}
+  {"key": "alt-s", "label": "session", "payload": {"command": ["aoe-cmd", "-d", ".", "-n", "abc-1", "Work on Linear issue ABC-1"], "background": true}, "_plugin": "linear"}
 ]'
 
 FIX_GH_LINE="REVIEW REQUESTED  myorg/kb  Test PR   ${TAB}$(echo "$GH_OPEN_ACTIONS" | blob_for)${TAB}hint"
