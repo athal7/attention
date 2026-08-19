@@ -329,18 +329,6 @@ def merge_cross_links(items):
     return [it for it in items if id(it) not in absorbed_titles]
 
 
-def row_identity(item):
-    """Stable, source-qualified identity for one item: (originating
-    plugin, context, id-or-title), joined on a control character no
-    plugin field legitimately contains. Used only by the interactive
-    dashboard's fzf `--track --id-nth` selection tracking (Decision 3
-    in design.md) -- qualifying by context matters because
-    sources/github.py's bare PR/issue numbers repeat across repos.
-    Survives cross-link absorption for free: the surviving host's own
-    _plugin/context/id never change when a guest is merged into it.
-    """
-    ident = item.get("id") or item.get("title", "")
-    return f"{item.get('_plugin', '')}\x1f{item.get('context', '')}\x1f{ident}"
 
 
 def expect_keys_for(items):
@@ -386,7 +374,7 @@ def _normalize_row_text(items):
         item["details"] = item.get("details", "").replace("\t", " ")
 
 
-def _row_columns(items):
+def _row_columns(items, include_status=True):
     import shutil
 
     w = shutil.get_terminal_size().columns
@@ -400,20 +388,26 @@ def _row_columns(items):
     status_col = min(max((len(i["status"]) for i in items), default=0), status_max)
     context_col = min(max((len(i["context"]) for i in items), default=0), context_max)
     title_col = min(max((len(i["title"]) for i in items), default=0), title_max)
-    title_col = max(0, title_col - max(0, status_col + context_col + title_col + 7 - w))
+    if not include_status:
+        status_col = 0
+    separator_width = 7 if include_status else 5
+    title_col = max(0, title_col - max(0, status_col + context_col + title_col + separator_width - w))
     return status_col, context_col, title_col
 
 
-def _visible_row_text(item, status_col, context_col, title_col):
+def _visible_row_text(item, status_col, context_col, title_col, include_status=True):
     import shutil
 
     status = _clip(item["status"], status_col)
     context = _clip(item["context"], context_col)
     title = _clip(item["title"], title_col)
     w = shutil.get_terminal_size().columns
-    details_width = max(0, w - status_col - context_col - title_col - 7)
+    separator_width = 7 if include_status else 5
+    details_width = max(0, w - status_col - context_col - title_col - separator_width)
     details = _clip(item["details"], details_width) if w < 80 else item["details"]
-    return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {details} "
+    if include_status:
+        return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {details} "
+    return f"{context:<{context_col}}  {title:<{title_col}}  {details} "
 
 
 def render_rows(items):
@@ -425,14 +419,11 @@ def render_rows(items):
     plugin's payload can be arbitrary JSON) -- act() decodes it, never
     needing to know which plugin produced the row until dispatch time.
     Row shape: STATUS  CONTEXT  TITLE  DETAILS \t<base64 actions>\tHINT
-    The third (hint) field is never rendered as a list row (the
-    dashboard's --with-nth 1 hides fields 2+), only surfaced via a
-    --bind transform-footer that reads {3} on cursor movement.
 
     Used only by the blocking `attention list`/`expect-keys` commands --
     byte-for-byte unchanged by the interactive dashboard's progressive
-    rendering. See render_dashboard_rows() for the dashboard's own,
-    additive 5-field format.
+    rendering. See render_dashboard_rows() for the dashboard's own
+    four-field format.
     """
     _normalize_row_text(items)
     status_col, context_col, title_col = _row_columns(items)
@@ -448,29 +439,26 @@ def render_rows(items):
 
 
 def render_dashboard_rows(items):
-    """Interactive-dashboard-only row renderer: same visible columns as
-    render_rows(), plus two additional hidden fields render_rows() never
-    emits -- a stable row identity (field 3, row_identity()) for fzf's
-    `--track --id-nth` selection tracking, and a comma-joined CSV of
-    this item's own action keys (field 4), read by the focus-scoped
-    `transform` bind to decide which keys to rebind live. The hint
-    (field 5) is the same content render_rows() puts in field 3, just
-    shifted one position over.
-    Row shape: STATUS  CONTEXT  TITLE  DETAILS \t<base64 actions>\t
-               <row identity>\t<row keys csv>\tHINT
+    """Interactive-dashboard-only row renderer: context, title, and details
+    are visible; a status column is omitted. The three hidden fields are the
+    opaque action list, this item's action-key CSV for focus-scoped rebinding,
+    and the footer hint.
+
+    Row shape: CONTEXT  TITLE  DETAILS \t<base64 actions>\t<row keys csv>\tHINT
     """
     _normalize_row_text(items)
-    status_col, context_col, title_col = _row_columns(items)
+    status_col, context_col, title_col = _row_columns(items, include_status=False)
 
     rows = []
     for item in items:
-        visible = _visible_row_text(item, status_col, context_col, title_col)
+        visible = _visible_row_text(
+            item, status_col, context_col, title_col, include_status=False,
+        )
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
-        identity = row_identity(item)
         keys_csv = ",".join(a["key"] for a in actions)
         hint = hint_for_actions(actions)
-        rows.append(f"{visible}\t{blob}\t{identity}\t{keys_csv}\t{hint}")
+        rows.append(f"{visible}\t{blob}\t{keys_csv}\t{hint}")
     return rows
 
 

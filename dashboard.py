@@ -13,7 +13,7 @@ needs as a plain callable:
   flatten/cross-link/age-boost/recently-acted/sort pipeline, extracted
   from `attention.build_prioritized_items`.
 - `render_rows(items) -> list[str]` -- the dashboard-only row renderer
-  (`attention.render_dashboard_rows`), producing the 5-field row text a
+  (`attention.render_dashboard_rows`), producing the 4-field row text a
   `Presenter` actually displays. Kept as its own injected callable
   (distinct from `build_snapshot`, whose typed return is items, not
   strings) so this module never needs to know `render_dashboard_rows`
@@ -98,13 +98,13 @@ def build_launch_binds(universe_keys):
 def build_focus_transform(universe_keys):
     """The shell snippet run by the `start,focus` `transform` bind:
     unconditionally unbinds every key in the declared universe, then --
-    only when the newly-focused row's field-4 CSV (`{4}`) is non-empty --
+    only when the newly-focused row's field-3 CSV (`{3}`) is non-empty --
     rebinds exactly those keys, restoring their launch-time
     `print(KEY)+accept` binding. A key that isn't rebound falls back to
     fzf's own default per-character behavior (ordinary query typing for
     a letter/digit), never an unconditional accept.
 
-    A row with no actions at all (empty field 4) must never produce
+    A row with no actions at all (empty field 3) must never produce
     `rebind()`: fzf requires a non-empty target for `rebind(...)` and
     parses the whole transform result before running any of it, so an
     empty `rebind()` makes fzf discard the entire result -- leaving
@@ -114,7 +114,7 @@ def build_focus_transform(universe_keys):
     """
     universe_csv = ",".join(universe_keys)
     return (
-        f'k={{4}}; if [ -z "$k" ]; then printf "unbind({universe_csv})"; '
+        f'k={{3}}; if [ -z "$k" ]; then printf "unbind({universe_csv})"; '
         f'else printf "unbind({universe_csv})+rebind(%s)" "$k"; fi'
     )
 
@@ -384,13 +384,12 @@ class FzfPresenter:
         focus_cmd = build_focus_transform(expect_keys)
         args = [
             "fzf", "--ansi", "--layout=reverse", "--height", "10",
-            "-d", "\t", "--with-nth", "1", "--id-nth", "3", "--track",
-            "--listen", sock_path, "--footer-border=line",
-            "--header", header,
+            "-d", "\t", "--with-nth", "1", "--listen", sock_path,
+            "--footer-border=line", "--header", header,
         ]
         for bind in build_launch_binds(expect_keys):
             args += ["--bind", bind]
-        args += ["--bind", 'start,focus:transform[' + focus_cmd + ']+transform-footer:printf "%s\\n" {5}']
+        args += ["--bind", 'start,focus:transform[' + focus_cmd + ']+transform-footer:printf "%s\\n" {4}']
         try:
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
@@ -436,7 +435,7 @@ class FzfPresenter:
             # of it above and this mkstemp; the presenter is gone, so there's
             # nothing left to publish to.
             return
-        body = f'reload[cat "{path}"]+change-header:{_pending_header(pending)}'
+        body = f'reload[cat "{path}"]+first+change-header:{_pending_header(pending)}'
         try:
             unix_request(sock_path, "POST", "/", body=body.encode())
         except OSError:
