@@ -1836,28 +1836,8 @@ test_mobile_width_support
 
 # ---------------------------------------------------------------------------
 echo
-echo "== core: row_identity() / render_dashboard_rows() / render_rows() compatibility =="
+echo "== core: render_dashboard_rows() / render_rows() compatibility =="
 
-test_row_identity_stable_and_context_qualified() {
-  local out
-  out="$(python3 -c "
-$LOAD_CORE
-a = {'_plugin': 'github', 'context': 'myorg/a', 'id': '42', 'title': 'Fix bug'}
-b = dict(a)
-c = {'_plugin': 'github', 'context': 'myorg/b', 'id': '42', 'title': 'Other bug'}
-no_id = {'_plugin': 'github', 'context': 'myorg/a', 'id': '', 'title': 'Untitled thing'}
-print('same' if m.row_identity(a) == m.row_identity(b) else 'different')
-print('same' if m.row_identity(a) == m.row_identity(c) else 'different')
-print(m.row_identity(no_id))
-")"
-  check "row_identity(): same (_plugin, context, id) twice produces the same string" \
-    "$(sed -n 1p <<<"$out")" "same"
-  check "row_identity(): same id, different context produces different strings" \
-    "$(sed -n 2p <<<"$out")" "different"
-  check "row_identity(): no id falls back to title" \
-    "$(sed -n 3p <<<"$out")" "$(printf 'github\x1fmyorg/a\x1fUntitled thing')"
-}
-test_row_identity_stable_and_context_qualified
 
 test_render_rows_byte_for_byte_unchanged() {
   local out
@@ -1882,7 +1862,7 @@ print(fields[2])
 }
 test_render_rows_byte_for_byte_unchanged
 
-test_render_dashboard_rows_adds_hidden_identity_and_keys_fields() {
+test_render_dashboard_rows_omits_status_and_retains_action_fields() {
   local out
   out="$(python3 -c "
 $LOAD_CORE
@@ -1898,22 +1878,20 @@ rows = m.render_dashboard_rows(items)
 print(len(rows))
 fields = rows[0].split(chr(9))
 print(len(fields))
+print(fields[0].strip())
 print(fields[2])
 print(fields[3])
-print(fields[4])
 list_fields = m.render_rows([dict(items[0])])[0].split(chr(9))
-print(fields[0] == list_fields[0])
 print(fields[1] == list_fields[1])
 ")"
   check "render_dashboard_rows() emits exactly one row per item" "$(sed -n 1p <<<"$out")" "1"
-  check "render_dashboard_rows() emits exactly 5 tab-delimited fields" "$(sed -n 2p <<<"$out")" "5"
-  check "render_dashboard_rows() field 3 is row_identity()" "$(sed -n 3p <<<"$out")" "github$(printf '\x1f')myorg/kb$(printf '\x1f')42"
-  check "render_dashboard_rows() field 4 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "alt-o,alt-s"
-  check "render_dashboard_rows() field 5 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "⌥o open  ⌥s session"
-  check "render_dashboard_rows() shares render_rows()'s visible-column formatting (field 1)" "$(sed -n 6p <<<"$out")" "True"
-  check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 7p <<<"$out")" "True"
+  check "render_dashboard_rows() emits exactly 4 tab-delimited fields" "$(sed -n 2p <<<"$out")" "4"
+  check "render_dashboard_rows() field 1 omits status and begins with context" "$(sed -n 3p <<<"$out")" "myorg/kb  Fix the login bug"
+  check "render_dashboard_rows() field 3 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "alt-o,alt-s"
+  check "render_dashboard_rows() field 4 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "⌥o open  ⌥s session"
+  check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 6p <<<"$out")" "True"
 }
-test_render_dashboard_rows_adds_hidden_identity_and_keys_fields
+test_render_dashboard_rows_omits_status_and_retains_action_fields
 
 DECL_KEYS_A_PLUGIN="$WORK/decl_keys_a_plugin.py"
 cat > "$DECL_KEYS_A_PLUGIN" <<'PY'
@@ -2955,16 +2933,16 @@ print(d.build_launch_binds(['alt-o', 'alt-s', 'O']))
 }
 test_build_launch_binds_one_print_accept_per_key_plus_enter
 
-test_build_focus_transform_unbind_then_rebind_from_field4() {
+test_build_focus_transform_unbind_then_rebind_from_field3() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
 print(repr(d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])))
 ")"
-  check "build_focus_transform() emits a shell snippet unbinding the whole universe then rebinding only {4}'s keys when {4} is non-empty" \
-    "$out" "'k={4}; if [ -z \"\$k\" ]; then printf \"unbind(alt-o,alt-s,O,S,1)\"; else printf \"unbind(alt-o,alt-s,O,S,1)+rebind(%s)\" \"\$k\"; fi'"
+  check "build_focus_transform() emits a shell snippet unbinding the whole universe then rebinding only {3}'s keys when {3} is non-empty" \
+    "$out" "'k={3}; if [ -z \"\$k\" ]; then printf \"unbind(alt-o,alt-s,O,S,1)\"; else printf \"unbind(alt-o,alt-s,O,S,1)+rebind(%s)\" \"\$k\"; fi'"
 }
-test_build_focus_transform_unbind_then_rebind_from_field4
+test_build_focus_transform_unbind_then_rebind_from_field3
 
 test_build_focus_transform_emits_unbind_only_when_row_has_no_keys() {
   local out
@@ -2974,16 +2952,16 @@ import shlex, subprocess
 
 cmd = d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])
 
-def run_for_field4(value):
-    substituted = cmd.replace('{4}', shlex.quote(value))
+def run_for_field3(value):
+    substituted = cmd.replace('{3}', shlex.quote(value))
     return subprocess.run(['sh', '-c', substituted], capture_output=True, text=True, check=True).stdout
 
-print(repr(run_for_field4('alt-o,O')))
-print(repr(run_for_field4('')))
+print(repr(run_for_field3('alt-o,O')))
+print(repr(run_for_field3('')))
 ")"
-  check "a row with keys in field 4 gets unbind(universe)+rebind(that row's keys)" \
+  check "a row with keys in field 3 gets unbind(universe)+rebind(that row's keys)" \
     "$(sed -n 1p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)+rebind(alt-o,O)'"
-  check "a row with no keys in field 4 gets unbind(universe) only -- never an empty rebind() fzf would reject, so the previous row's binding cannot persist" \
+  check "a row with no keys in field 3 gets unbind(universe) only -- never an empty rebind() fzf would reject, so the previous row's binding cannot persist" \
     "$(sed -n 2p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)'"
 }
 test_build_focus_transform_emits_unbind_only_when_row_has_no_keys
@@ -3018,9 +2996,11 @@ $LOAD_DASHBOARD
 import fcntl, json, os, pty, shutil, struct, tempfile, termios, threading, time
 
 UNIVERSE = ['alt-o', 'alt-s', 'O', 'S', '1', '2']
-ROWS_TEXT = 'row1' + chr(9) + 'blob1' + chr(9) + 'id1' + chr(9) + 'alt-o,O' + chr(9) + 'hint1' + chr(10) + 'row2' + chr(9) + 'blob2' + chr(9) + 'id2' + chr(9) + 'alt-s,1' + chr(9) + 'hint2'
+ROWS_TEXT = 'row1' + chr(9) + 'blob1' + chr(9) + 'alt-o,O' + chr(9) + 'hint1' + chr(10) + 'row2' + chr(9) + 'blob2' + chr(9) + 'alt-s,1' + chr(9) + 'hint2'
+RELOADED_ROWS_TEXT = 'new-first' + chr(9) + 'blob3' + chr(9) + 'alt-o,O' + chr(9) + 'hint3' + chr(10) + 'row2' + chr(9) + 'blob2' + chr(9) + 'alt-s,1' + chr(9) + 'hint2'
 ROW1_LINE = ROWS_TEXT.split(chr(10))[0]
 ROW2_LINE = ROWS_TEXT.split(chr(10))[1]
+RELOADED_ROW1_LINE = RELOADED_ROWS_TEXT.split(chr(10))[0]
 
 
 def spawn_session():
@@ -3033,8 +3013,7 @@ def spawn_session():
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
     out_r, out_w = os.pipe()
     args = ['fzf', '--ansi', '--layout=reverse', '--height', '10', '-d', chr(9),
-            '--with-nth', '1', '--id-nth', '3', '--track',
-            '--listen', sock_path, '--footer-border=line']
+            '--with-nth', '1', '--listen', sock_path, '--footer-border=line']
     for b in d.build_launch_binds(UNIVERSE):
         args += ['--bind', b]
     args += ['--bind', 'start,focus:transform[' + d.build_focus_transform(UNIVERSE) + ']']
@@ -3081,7 +3060,7 @@ def spawn_session():
     deadline = time.monotonic() + 5
     while not os.path.exists(sock_path) and time.monotonic() < deadline:
         time.sleep(0.02)
-    reload_body = ('reload[cat ' + chr(34) + rows_path + chr(34) + ']').encode()
+    reload_body = ('reload[cat ' + chr(34) + rows_path + chr(34) + ']+first').encode()
     d.unix_request(sock_path, 'POST', '/', body=reload_body)
     return {'pid': pid, 'master_fd': master_fd, 'out_r': out_r, 'sock_path': sock_path,
             'tmpdir': tmpdir, 'stop': stop, 'thread': thread}
@@ -3186,6 +3165,23 @@ results.append(wait_exit(session2, timeout=5) is not None)
 results.append(read_output(session2) == '1' + chr(10) + ROW2_LINE + chr(10))
 cleanup(session2)
 
+session3 = spawn_session()
+wait_for_state(session3, lambda s: s.get('totalCount') == 2)
+os.write(session3['master_fd'], b'\x0e')
+wait_for_state(session3, lambda s: s.get('current') and s['current']['index'] == 1)
+reloaded_rows_path = os.path.join(session3['tmpdir'], 'reloaded-rows.tsv')
+with open(reloaded_rows_path, 'w') as f:
+    f.write(RELOADED_ROWS_TEXT)
+reload_body = ('reload[cat ' + chr(34) + reloaded_rows_path + chr(34) + ']+first').encode()
+d.unix_request(session3['sock_path'], 'POST', '/', body=reload_body)
+state = wait_for_state(
+    session3,
+    lambda s: s.get('current') and s['current']['index'] == 0 and
+    s['current']['text'] == RELOADED_ROW1_LINE,
+)
+results.append(state is not None and state['current']['index'] == 0 and state['current']['text'] == RELOADED_ROW1_LINE)
+cleanup(session3)
+
 for r in results:
     print(r)
 "
@@ -3203,6 +3199,7 @@ test_real_pty_row_scoped_hotkeys() {
   check "moving focus to row 2 updates the --listen state's current index" "$(sed -n 8p <<<"$out")" "True"
   check "the key inert on row 1 (1) exits fzf once focus moves to row 2, where it is bound" "$(sed -n 9p <<<"$out")" "True"
   check "the row-2 exit output is exactly KEY\\n<row 2's line>" "$(sed -n 10p <<<"$out")" "True"
+  check "a snapshot reload resets focus to its newly first row" "$(sed -n 11p <<<"$out")" "True"
 }
 
 if command -v fzf >/dev/null 2>&1; then
@@ -3358,25 +3355,22 @@ def child_launch_push_stop():
     sock_exists = os.path.exists(sock_path)
     proc_running = proc.poll() is None
     no_expect_flag = '--expect' not in proc.args
-    has_track_and_id_nth_3 = (
-        '--track' in proc.args and '--id-nth' in proc.args and
-        proc.args[proc.args.index('--id-nth') + 1] == '3'
-    )
+    has_no_tracking_flags = '--track' not in proc.args and '--id-nth' not in proc.args
 
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], ['gh'])
+    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], ['gh'])
     state1 = wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
     first_push_reflected = state1 is not None and [m['text'] for m in state1['matches']] == [
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
+        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
     ]
 
     presenter.push_snapshot([
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
-        'rowB' + chr(9) + 'blobB' + chr(9) + 'idB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
+        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
+        'rowB' + chr(9) + 'blobB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
     ], [])
     state2 = wait_for_state(presenter, lambda s: s.get('totalCount') == 2)
     second_push_replaces = state2 is not None and [m['text'] for m in state2['matches']] == [
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
-        'rowB' + chr(9) + 'blobB' + chr(9) + 'idB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
+        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
+        'rowB' + chr(9) + 'blobB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
     ]
 
     presenter.stop()
@@ -3384,7 +3378,7 @@ def child_launch_push_stop():
         'sock_exists_after_launch': sock_exists,
         'proc_running_after_launch': proc_running,
         'launch_has_no_expect_flag': no_expect_flag,
-        'launch_has_track_and_id_nth_3': has_track_and_id_nth_3,
+        'launch_has_no_tracking_flags': has_no_tracking_flags,
         'first_push_reflected': first_push_reflected,
         'second_push_replaces_not_appends': second_push_replaces,
         'proc_exited_after_stop': proc.poll() is not None,
@@ -3396,7 +3390,7 @@ def child_wait_for_exit_timeout_escalates():
     presenter = d.FzfPresenter()
     presenter.launch(['alt-o'], 'header')
     tmpdir, proc = presenter._tmpdir, presenter._proc
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
+    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
     wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
 
     start = time.monotonic()
@@ -3418,7 +3412,7 @@ def child_stop_after_process_already_exited():
     presenter = d.FzfPresenter()
     presenter.launch(['alt-o'], 'header')
     tmpdir, proc, sock_path = presenter._tmpdir, presenter._proc, presenter._sock_path
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
+    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
     wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
     d.unix_request(sock_path, 'POST', '/', body=b'abort', timeout=2)
     presenter.wait_for_exit(5)
@@ -3454,7 +3448,7 @@ def child_push_snapshot_survives_teardown_race():
     def call_push():
         try:
             presenter.push_snapshot(
-                ['rowA' + chr(9) + 'blobA' + chr(9) + 'idA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [],
+                ['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [],
             )
         except Exception as e:
             push_raised.append(repr(e))
@@ -3495,7 +3489,7 @@ r3 = run_in_pty_session(child_stop_after_process_already_exited)
 r4 = run_in_pty_session(child_push_snapshot_survives_teardown_race)
 for key in (
     'sock_exists_after_launch', 'proc_running_after_launch', 'launch_has_no_expect_flag',
-    'launch_has_track_and_id_nth_3', 'first_push_reflected', 'second_push_replaces_not_appends',
+    'launch_has_no_tracking_flags', 'first_push_reflected', 'second_push_replaces_not_appends',
     'proc_exited_after_stop', 'tmpdir_removed_after_stop',
 ):
     print(r1.get(key))
@@ -3522,7 +3516,7 @@ test_fzf_presenter_real_lifecycle() {
   check "FzfPresenter.launch() waits for the --listen socket to exist before returning" "$(sed -n 1p <<<"$out")" "True"
   check "FzfPresenter.launch() leaves a live fzf process running" "$(sed -n 2p <<<"$out")" "True"
   check "FzfPresenter.launch() never passes --expect" "$(sed -n 3p <<<"$out")" "True"
-  check "FzfPresenter.launch() passes --track and --id-nth 3" "$(sed -n 4p <<<"$out")" "True"
+  check "FzfPresenter.launch() omits selection-tracking flags" "$(sed -n 4p <<<"$out")" "True"
   check "FzfPresenter.push_snapshot() reload is reflected in the --listen state" "$(sed -n 5p <<<"$out")" "True"
   check "a second push_snapshot() replaces the list rather than appending to it" "$(sed -n 6p <<<"$out")" "True"
   check "FzfPresenter.stop() terminates the still-running fzf process" "$(sed -n 7p <<<"$out")" "True"
