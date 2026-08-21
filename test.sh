@@ -3981,6 +3981,81 @@ m.run_dashboard(refresh_interval=1)
 }
 test_periodic_refresh_interrupts_stuck_fzf
 
+echo
+echo "== dashboard groups =="
+
+test_dashboard_group_rules_and_rows() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, error = m.dashboard_groups({
+    'dashboard': {
+        'groups': [
+            {'name': 'Needs Attention', 'match': {'statuses': ['NEEDS']}},
+            {'name': 'Ready to Ship', 'match': {'contexts': ['Release']}},
+            {'name': 'Ready for Something New', 'fallback': True},
+        ],
+    },
+})
+items = [
+    {'status': 'RELEASE', 'context': 'Release', 'title': 'Ship it', 'details': '', 'weight': 90, 'id': 'ship', 'actions': [], '_plugin': 'github'},
+    {'status': 'NEEDS', 'context': 'Inbox', 'title': 'Review it', 'details': '', 'weight': 80, 'id': 'review', 'actions': [], '_plugin': 'github'},
+    {'status': 'PENDING', 'context': 'Inbox', 'title': 'Plan it', 'details': '', 'weight': 70, 'id': 'plan', 'actions': [], '_plugin': 'reminders'},
+]
+rows = m.render_grouped_dashboard_rows(items, groups)
+print(error)
+print(','.join(row.rpartition(chr(9))[2] for row in rows))
+print(all(len(row.split(chr(9))) == 5 for row in rows))
+first_match, first_error = m.dashboard_groups({
+    'dashboard': {
+        'groups': [
+            {'name': 'First', 'match': {'plugins': ['github']}},
+            {'name': 'Second', 'match': {'statuses': ['NEEDS']}},
+            {'name': 'Other', 'fallback': True},
+        ],
+    },
+})
+first_row = m.render_grouped_dashboard_rows([items[1]], first_match)[0]
+print(first_error)
+print(first_row.rpartition(chr(9))[2])
+_, invalid_error = m.dashboard_groups({
+    'dashboard': {'groups': [{'name': 'A', 'fallback': True}, {'name': 'B', 'fallback': True}]},
+})
+print(invalid_error)
+")"
+  check "valid dashboard group configuration has no validation error" "$(sed -n 1p <<<"$out")" "None"
+  check "grouped dashboard rows follow configured custom group order" "$(sed -n 2p <<<"$out")" "Needs Attention,Ready to Ship,Ready for Something New"
+  check "grouped dashboard rows add exactly one hidden group field" "$(sed -n 3p <<<"$out")" "True"
+  check "first matching dashboard group wins" "$(sed -n 5p <<<"$out")" "First"
+  check "multiple fallback groups are rejected" "$(sed -n 6p <<<"$out")" "dashboard.groups must declare exactly one fallback group"
+}
+test_dashboard_group_rules_and_rows
+
+test_curses_presenter_scopes_fzf_rows() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+class Child:
+    def __init__(self):
+        self.calls = []
+    def push_snapshot(self, rows, pending):
+        self.calls.append((rows, pending))
+
+presenter = d.CursesGroupPresenter(['Needs Attention', 'Other'])
+child = Child()
+presenter._active_group = 'Needs Attention'
+presenter._active_fzf = child
+presenter.push_snapshot([
+    'needs' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'Needs Attention',
+    'other' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'Other',
+], ['github'])
+print(child.calls)
+")"
+  check "curses group presenter forwards only the selected group's rows to fzf" \
+    "$(sed -n 1p <<<"$out")" "[(['needs\tblob\talt-o\thint'], ['github'])]"
+}
+test_curses_presenter_scopes_fzf_rows
+
 # ---------------------------------------------------------------------------
 echo
 echo "== --help =="

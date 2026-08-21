@@ -461,6 +461,89 @@ def render_dashboard_rows(items):
         rows.append(f"{visible}\t{blob}\t{keys_csv}\t{hint}")
     return rows
 
+def dashboard_groups(config):
+    dashboard_config = config.get("dashboard")
+    if dashboard_config is None:
+        return None, None
+    if not isinstance(dashboard_config, dict):
+        return None, "dashboard configuration must be an object"
+    raw_groups = dashboard_config.get("groups")
+    if raw_groups is None:
+        return None, None
+    if not isinstance(raw_groups, list) or not raw_groups:
+        return None, "dashboard.groups must be a non-empty list"
+
+    groups = []
+    names = set()
+    fallback_count = 0
+    for index, raw_group in enumerate(raw_groups, 1):
+        if not isinstance(raw_group, dict):
+            return None, f"dashboard.groups[{index}] must be an object"
+        if set(raw_group) - {"name", "match", "fallback"}:
+            return None, f"dashboard.groups[{index}] has an unsupported field"
+        name = raw_group.get("name")
+        if not isinstance(name, str) or not name.strip() or "\t" in name or "\n" in name:
+            return None, f"dashboard.groups[{index}].name must be a non-empty single-line string"
+        name = name.strip()
+        if name in names:
+            return None, f"dashboard.groups contains duplicate name {name!r}"
+        names.add(name)
+
+        is_fallback = raw_group.get("fallback") is True
+        has_match = "match" in raw_group
+        if is_fallback == has_match:
+            return None, f"dashboard.groups[{index}] must declare exactly one of match or fallback"
+        if is_fallback:
+            fallback_count += 1
+            groups.append({"name": name, "fallback": True})
+            continue
+
+        match = raw_group["match"]
+        if not isinstance(match, dict) or set(match) - {"plugins", "contexts", "statuses"}:
+            return None, f"dashboard.groups[{index}].match must contain only plugins, contexts, or statuses"
+        normalized_match = {}
+        for key in ("plugins", "contexts", "statuses"):
+            values = match.get(key)
+            if values is None:
+                continue
+            if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+                return None, f"dashboard.groups[{index}].match.{key} must be a non-empty list of strings"
+            normalized_match[key] = list(values)
+        groups.append({"name": name, "match": normalized_match})
+
+    if fallback_count != 1:
+        return None, "dashboard.groups must declare exactly one fallback group"
+    return groups, None
+
+
+def _group_matches(item, match):
+    fields = {
+        "plugins": item.get("_plugin", ""),
+        "contexts": item.get("context", ""),
+        "statuses": item.get("status", ""),
+    }
+    return all(fields[key] in values for key, values in match.items())
+
+
+def render_grouped_dashboard_rows(items, groups):
+    grouped_rows = {group["name"]: [] for group in groups}
+    fallback = next(group["name"] for group in groups if group.get("fallback"))
+    for item, row in zip(items, render_dashboard_rows(items)):
+        group_name = next(
+            (
+                group["name"]
+                for group in groups
+                if "match" in group and _group_matches(item, group["match"])
+            ),
+            fallback,
+        )
+        grouped_rows[group_name].append(f"{row}\t{group_name}")
+    return [
+        row
+        for group in groups
+        for row in grouped_rows[group["name"]]
+    ]
+
 
 _warned_missing_action_keys = set()
 _warned_broken_action_keys = set()
@@ -695,6 +778,9 @@ def run_dashboard(refresh_interval=60):
     were designed to receive as plain injected arguments.
     """
     config = load_config()
+    groups, group_error = dashboard_groups(config)
+    if group_error:
+        print(f"attention: invalid dashboard.groups configuration: {group_error}; using flat dashboard.", file=sys.stderr)
     plugin_names = config.get("plugins", DEFAULT_PLUGINS)
     if not plugin_names:
         print("Nothing needs attention right now.")
@@ -725,11 +811,18 @@ def run_dashboard(refresh_interval=60):
                 action["_item_id"] = item.get("id")
         return fetched
 
+    if groups:
+        presenter = dashboard.CursesGroupPresenter([group["name"] for group in groups])
+        render_rows = lambda items: render_grouped_dashboard_rows(items, groups)
+    else:
+        presenter = dashboard.FzfPresenter()
+        render_rows = render_dashboard_rows
+
     controller = dashboard.DashboardController(
-        plugin_names, dashboard.FzfPresenter(), declared_action_keys(config),
+        plugin_names, presenter, declared_action_keys(config),
         fetch_plugin=fetch_plugin,
         build_snapshot=build_snapshot,
-        render_rows=render_dashboard_rows,
+        render_rows=render_rows,
         act=act,
     )
     try:

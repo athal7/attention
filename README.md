@@ -65,7 +65,14 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
       }
     ]
   },
-  "linear":    { "apiToken": "lin_api_..." }
+  "linear":    { "apiToken": "lin_api_..." },
+  "dashboard": {
+    "groups": [
+      { "name": "Needs Attention", "match": { "statuses": ["REVIEW REQUESTED", "NEEDS ATTENTION", "OVERDUE"] } },
+      { "name": "Ready to Ship", "match": { "statuses": ["READY TO SHIP"] } },
+      { "name": "Ready for Something New", "fallback": true }
+    ]
+  }
 }
 ```
 
@@ -78,6 +85,21 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
+| `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, and/or `statuses`) or `fallback: true`. Exactly one fallback is required when groups are configured. |
+
+### Dashboard groups
+
+When `dashboard.groups` is configured, `attention` opens a curses overview
+instead of the flat fzf list. It shows the non-empty groups and their current
+item counts; use Up/Down or `j`/`k` to select a group, Enter to open its scoped
+fzf list, and Esc to quit. Esc in a scoped fzf list returns to the overview.
+
+Group rules are evaluated in configuration order. Values within a rule field
+are alternatives, while specified fields are combined: a rule with both
+`plugins` and `statuses` matches only items satisfying both. The first matching
+group wins; the fallback receives every remaining item. Invalid grouping
+configuration emits a warning and uses the existing flat dashboard, so it
+cannot hide attention items.
 
 ## What each bundled plugin surfaces
 

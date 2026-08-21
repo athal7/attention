@@ -310,6 +310,153 @@ class DashboardController:
                 del self._recently_acted[next(iter(self._recently_acted))]
 
 
+class CursesGroupPresenter:
+    def __init__(self, group_names):
+        self._group_names = list(group_names)
+        self._lock = threading.Lock()
+        self._rows = []
+        self._pending = []
+        self._expect_keys = []
+        self._header = ""
+        self._active_group = None
+        self._active_fzf = None
+        self._stopped = False
+
+    def launch(self, expect_keys, header):
+        with self._lock:
+            self._expect_keys = list(expect_keys)
+            self._header = header
+            self._stopped = False
+
+    def push_snapshot(self, rows, pending):
+        with self._lock:
+            self._rows = list(rows)
+            self._pending = list(pending)
+            group = self._active_group
+            presenter = self._active_fzf
+            scoped_rows = self._rows_for_group(group, self._rows) if group else []
+        if presenter is not None:
+            presenter.push_snapshot(scoped_rows, pending)
+
+    def wait_for_exit(self, timeout):
+        import curses
+
+        return curses.wrapper(self._run, time.monotonic() + timeout)
+
+    def stop(self):
+        with self._lock:
+            self._stopped = True
+            presenter = self._active_fzf
+        if presenter is not None:
+            presenter.stop()
+
+    def _rows_for_group(self, group, rows):
+        return [
+            row.rpartition("\t")[0]
+            for row in rows
+            if row.rpartition("\t")[2] == group
+        ]
+
+    def _snapshot(self):
+        with self._lock:
+            rows = list(self._rows)
+            pending = list(self._pending)
+            stopped = self._stopped
+        counts = {
+            group: sum(1 for row in rows if row.rpartition("\t")[2] == group)
+            for group in self._group_names
+        }
+        return rows, pending, stopped, counts
+
+    def _draw(self, screen, pending, counts, selected):
+        import curses
+
+        height, width = screen.getmaxyx()
+        screen.erase()
+
+        def write(line, text, attr=0):
+            if line < height and width > 1:
+                try:
+                    screen.addnstr(line, 0, text, width - 1, attr)
+                except curses.error:
+                    pass
+
+        write(0, "Attention groups", curses.A_BOLD)
+        write(1, _pending_header(pending))
+        visible_groups = [group for group in self._group_names if counts[group]]
+        if not visible_groups:
+            write(3, "No items in any group yet.")
+        for index, group in enumerate(visible_groups):
+            marker = "›" if index == selected else " "
+            attr = curses.A_REVERSE if index == selected else 0
+            write(3 + index, f"{marker} {group} ({counts[group]})", attr)
+        write(height - 1, "↑/↓ select  Enter open group  Esc quit")
+        screen.refresh()
+        return visible_groups
+
+    def _open_group(self, screen, group, deadline):
+        import curses
+
+        presenter = FzfPresenter()
+        with self._lock:
+            self._active_group = group
+            self._active_fzf = presenter
+            expect_keys = list(self._expect_keys)
+            header = f"{group} · {self._header}"
+            rows = self._rows_for_group(group, self._rows)
+            pending = list(self._pending)
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            presenter.launch(expect_keys, header)
+            with self._lock:
+                rows = self._rows_for_group(group, self._rows)
+                pending = list(self._pending)
+            presenter.push_snapshot(rows, pending)
+            return presenter.wait_for_exit(max(0.01, deadline - time.monotonic()))
+        finally:
+            presenter.stop()
+            with self._lock:
+                if self._active_fzf is presenter:
+                    self._active_fzf = None
+                    self._active_group = None
+            curses.reset_prog_mode()
+            screen.refresh()
+
+    def _run(self, screen, deadline):
+        import curses
+
+        screen.keypad(True)
+        screen.timeout(100)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        selected = 0
+        while True:
+            _, pending, stopped, counts = self._snapshot()
+            if stopped:
+                return PresenterResult("", "")
+            visible_groups = self._draw(screen, pending, counts, selected)
+            if visible_groups:
+                selected %= len(visible_groups)
+            else:
+                selected = 0
+            if time.monotonic() >= deadline:
+                return PresenterResult(None, "")
+            key = screen.getch()
+            if key in (27, ord("q")):
+                return PresenterResult("", "")
+            if key in (curses.KEY_UP, ord("k")) and visible_groups:
+                selected = (selected - 1) % len(visible_groups)
+            elif key in (curses.KEY_DOWN, ord("j")) and visible_groups:
+                selected = (selected + 1) % len(visible_groups)
+            elif key in (curses.KEY_ENTER, 10, 13) and visible_groups:
+                result = self._open_group(screen, visible_groups[selected], deadline)
+                if result.key is None:
+                    return result
+                if result.key or result.row:
+                    return result
 class UnixHTTPConnection(http.client.HTTPConnection):
     """`http.client.HTTPConnection` whose `connect()` opens an `AF_UNIX`
     socket at a fixed path instead of resolving a host:port over TCP --
