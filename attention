@@ -499,10 +499,10 @@ def dashboard_groups(config):
             continue
 
         match = raw_group["match"]
-        if not isinstance(match, dict) or set(match) - {"plugins", "contexts", "statuses"}:
-            return None, f"dashboard.groups[{index}].match must contain only plugins, contexts, or statuses"
+        if not isinstance(match, dict) or set(match) - {"plugins", "contexts", "contextPrefixes", "statuses"}:
+            return None, f"dashboard.groups[{index}].match must contain only plugins, contexts, contextPrefixes, or statuses"
         normalized_match = {}
-        for key in ("plugins", "contexts", "statuses"):
+        for key in ("plugins", "contexts", "contextPrefixes", "statuses"):
             values = match.get(key)
             if values is None:
                 continue
@@ -517,12 +517,21 @@ def dashboard_groups(config):
 
 
 def _group_matches(item, match):
+    context = item.get("context", "")
+    if "contextPrefixes" in match and not any(
+        context.startswith(prefix) for prefix in match["contextPrefixes"]
+    ):
+        return False
     fields = {
         "plugins": item.get("_plugin", ""),
-        "contexts": item.get("context", ""),
+        "contexts": context,
         "statuses": item.get("status", ""),
     }
-    return all(fields[key] in values for key, values in match.items())
+    return all(
+        fields[key] in values
+        for key, values in match.items()
+        if key != "contextPrefixes"
+    )
 
 
 def render_grouped_dashboard_rows(items, groups):

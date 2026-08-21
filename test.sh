@@ -3992,6 +3992,7 @@ groups, error = m.dashboard_groups({
     'dashboard': {
         'groups': [
             {'name': 'Needs Attention', 'match': {'statuses': ['NEEDS']}},
+            {'name': 'My Repositories', 'match': {'contextPrefixes': ['athal7/']}},
             {'name': 'Ready to Ship', 'match': {'contexts': ['Release']}},
             {'name': 'Ready for Something New', 'fallback': True},
         ],
@@ -4001,6 +4002,7 @@ items = [
     {'status': 'RELEASE', 'context': 'Release', 'title': 'Ship it', 'details': '', 'weight': 90, 'id': 'ship', 'actions': [], '_plugin': 'github'},
     {'status': 'NEEDS', 'context': 'Inbox', 'title': 'Review it', 'details': '', 'weight': 80, 'id': 'review', 'actions': [], '_plugin': 'github'},
     {'status': 'PENDING', 'context': 'Inbox', 'title': 'Plan it', 'details': '', 'weight': 70, 'id': 'plan', 'actions': [], '_plugin': 'reminders'},
+    {'status': 'PENDING', 'context': 'athal7/attention', 'title': 'Prefix it', 'details': '', 'weight': 60, 'id': 'prefix', 'actions': [], '_plugin': 'generic'},
 ]
 rows = m.render_grouped_dashboard_rows(items, groups)
 print(error)
@@ -4021,13 +4023,23 @@ print(first_row.rpartition(chr(9))[2])
 _, invalid_error = m.dashboard_groups({
     'dashboard': {'groups': [{'name': 'A', 'fallback': True}, {'name': 'B', 'fallback': True}]},
 })
+_, empty_prefix_error = m.dashboard_groups({
+    'dashboard': {'groups': [{'name': 'A', 'match': {'contextPrefixes': []}}, {'name': 'B', 'fallback': True}]},
+})
+_, typed_prefix_error = m.dashboard_groups({
+    'dashboard': {'groups': [{'name': 'A', 'match': {'contextPrefixes': ['athal7/', 7]}}, {'name': 'B', 'fallback': True}]},
+})
 print(invalid_error)
+print(empty_prefix_error)
+print(typed_prefix_error)
 ")"
   check "valid dashboard group configuration has no validation error" "$(sed -n 1p <<<"$out")" "None"
-  check "grouped dashboard rows follow configured custom group order" "$(sed -n 2p <<<"$out")" "Needs Attention,Ready to Ship,Ready for Something New"
+  check "context prefixes group matching uses item context startswith" "$(sed -n 2p <<<"$out")" "Needs Attention,My Repositories,Ready to Ship,Ready for Something New"
   check "grouped dashboard rows add exactly one hidden group field" "$(sed -n 3p <<<"$out")" "True"
   check "first matching dashboard group wins" "$(sed -n 5p <<<"$out")" "First"
   check "multiple fallback groups are rejected" "$(sed -n 6p <<<"$out")" "dashboard.groups must declare exactly one fallback group"
+  check "empty context prefix list is rejected" "$(sed -n 7p <<<"$out")" "dashboard.groups[1].match.contextPrefixes must be a non-empty list of strings"
+  check "non-string context prefix is rejected" "$(sed -n 8p <<<"$out")" "dashboard.groups[1].match.contextPrefixes must be a non-empty list of strings"
 }
 test_dashboard_group_rules_and_rows
 
