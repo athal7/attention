@@ -69,6 +69,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "dashboard": {
     "groups": [
       { "name": "Needs Attention", "match": { "statuses": ["REVIEW REQUESTED", "NEEDS ATTENTION", "OVERDUE"] } },
+      { "name": "My Repositories", "match": { "contextPrefixes": ["athal7/"] } },
       { "name": "Ready to Ship", "match": { "statuses": ["READY TO SHIP"] } },
       { "name": "Ready for Something New", "fallback": true }
     ]
@@ -85,7 +86,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
-| `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, and/or `statuses`) or `fallback: true`. Exactly one fallback is required when groups are configured. |
+| `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. `contextPrefixes` matches item contexts that start with one of its values. Exactly one fallback is required when groups are configured. |
 
 ### Dashboard groups
 
