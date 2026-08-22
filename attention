@@ -15,11 +15,13 @@ contribute nothing until configured; github/linear still work out of
 the box, gated only by their own auth availability.
 """
 import base64
+import fcntl
 import importlib.util
 import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 import concurrent.futures
@@ -38,6 +40,102 @@ See PLUGINS.md for the source-plugin interface and config["plugins"].
 """
 
 DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear", "generic"]
+
+WIP_ACTION_KEY = "alt-w"
+_WIP_STATE_FILENAME = "wip.json"
+_wip_items = None
+
+
+def get_wip_state_path():
+    xdg_state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg_state_home) / "attention" / _WIP_STATE_FILENAME
+
+
+def _read_wip_items():
+    try:
+        with open(get_wip_state_path()) as f:
+            stored_items = json.load(f)
+    except Exception:
+        return set()
+    if not isinstance(stored_items, list):
+        return set()
+    return {item_id for item_id in stored_items if isinstance(item_id, str)}
+
+
+def get_wip_items():
+    global _wip_items
+    if _wip_items is None:
+        _wip_items = _read_wip_items()
+    return _wip_items
+
+
+def toggle_wip_item(item_id):
+    global _wip_items
+    if not item_id:
+        return False
+    state_path = get_wip_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(".lock")
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        wip_items = _read_wip_items()
+        if item_id in wip_items:
+            wip_items.remove(item_id)
+            marked = False
+        else:
+            wip_items.add(item_id)
+            marked = True
+        descriptor, temp_path = tempfile.mkstemp(
+            dir=state_path.parent, prefix=f".{state_path.name}.", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "w") as f:
+                json.dump(sorted(wip_items), f)
+            os.replace(temp_path, state_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    _wip_items = wip_items
+    return marked
+
+
+def get_wip_item_id(item):
+    identifier = item.get("id") or item.get("identity_key")
+    if identifier:
+        return f"{item.get('_plugin', '')}:{identifier}"
+    return json.dumps([
+        item.get("_plugin", ""),
+        item.get("context", ""),
+        item.get("title", ""),
+        item.get("details", ""),
+    ], separators=(",", ":"))
+
+
+def add_wip_action(item, wip_items):
+    action_keys = {action["key"] for action in item["actions"]}
+    for action in item["actions"]:
+        if action["key"] != WIP_ACTION_KEY:
+            continue
+        replacement = next(
+            (key for key in ["W", *"123456789"] if key not in action_keys), None,
+        )
+        if replacement is None:
+            return
+        action_keys.add(replacement)
+        action["key"] = replacement
+        action["_original_key"] = WIP_ACTION_KEY
+        action["label"] = f"{action['label']} (remapped)"
+    item_id = get_wip_item_id(item)
+    marked = item_id in wip_items
+    item["actions"].insert(0, {
+        "key": WIP_ACTION_KEY,
+        "label": "clear work in progress" if marked else "work in progress",
+        "payload": {"id": item_id},
+        "_plugin": "__attention__",
+    })
+    if marked:
+        details = item.get("details", "")
+        item["details"] = f"WORK IN PROGRESS | {details}" if details else "WORK IN PROGRESS"
 
 
 def get_config_path():
@@ -588,8 +686,8 @@ def declared_action_keys(config):
     -- it never aborts the rest of the dashboard.
     """
     plugin_names = config.get("plugins", DEFAULT_PLUGINS)
-    declared = []
-    seen = set()
+    declared = [WIP_ACTION_KEY]
+    seen = {WIP_ACTION_KEY}
     for name in plugin_names:
         try:
             mod = load_plugin(name)
@@ -683,6 +781,10 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     ]
     items = merge_cross_links(items)
 
+    wip_items = get_wip_items()
+    for it in items:
+        add_wip_action(it, wip_items)
+
     now = datetime.now(timezone.utc)
     for it in items:
         age_boost = 0
@@ -761,6 +863,10 @@ def act(key, line):
 
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
+        if action.get("_plugin") == "__attention__":
+            marked = toggle_wip_item(action.get("payload", {}).get("id"))
+            print("Marked work in progress." if marked else "Cleared work in progress.")
+            return
         mod = load_plugin(action["_plugin"])
         payload = action.get("payload")
         if not isinstance(payload, dict):

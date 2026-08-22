@@ -31,6 +31,8 @@ In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
 row without leaving the list. `Esc` quits.
 
+Press `⌥w` to mark an item as work in progress. Press it again to clear the mark. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
+
 | Row type | Hotkeys |
 |---|---|
 | Calendar event | `⌥y` yank to clipboard; `⌥x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
