@@ -95,22 +95,18 @@ def _fetch_pr_attention(author, detail_pool):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,reviews,closingIssuesReferences,isDraft",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft",
         ])
         if not isinstance(detail, dict):
             return None
 
         reasons = []
-        reviews_by_author = {}
-        for review in detail.get("reviews") or []:
+        latest_review_states = set()
+        for review in detail.get("latestReviews") or []:
             reviewer = review.get("author", {}).get("login") or ""
             if not reviewer or reviewer.casefold() == expected_author.casefold():
                 continue
-            submitted_at = review.get("submittedAt") or ""
-            previous = reviews_by_author.get(reviewer.casefold())
-            if previous is None or submitted_at >= previous.get("submittedAt", ""):
-                reviews_by_author[reviewer.casefold()] = review
-        latest_review_states = {review.get("state") for review in reviews_by_author.values()}
+            latest_review_states.add(review.get("state"))
         if "CHANGES_REQUESTED" in latest_review_states:
             reasons.append("Changes Requested")
         if "COMMENTED" in latest_review_states:

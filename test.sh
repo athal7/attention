@@ -369,7 +369,7 @@ JSON
     ;;
   "pr view 3 -R myorg/kb"*)
     cat <<'JSON'
-{"mergeable": "CONFLICTING", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [{"conclusion": "FAILURE"}], "reviews": [{"author": {"login": "someone-else"}, "state": "CHANGES_REQUESTED"}, {"author": {"login": "another-reviewer"}, "state": "COMMENTED"}]}
+{"mergeable": "CONFLICTING", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [{"conclusion": "FAILURE"}], "latestReviews": [{"author": {"login": "someone-else"}, "state": "CHANGES_REQUESTED"}, {"author": {"login": "another-reviewer"}, "state": "COMMENTED"}]}
 JSON
     ;;
   *)
@@ -510,7 +510,7 @@ JSON
     ;;
   "pr view 11 -R myorg/kb"*)
     cat <<'JSON'
-{"mergeable": "MERGEABLE", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [], "reviews": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"}]}
+{"mergeable": "MERGEABLE", "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": [], "latestReviews": [{"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"}]}
 JSON
     ;;
   "api user --jq .login")
@@ -1016,6 +1016,74 @@ print(items[0]['actions'][0]['_item_id'])
 }
 test_recently_acted_deprioritized
 
+test_work_in_progress_marker() {
+  local row marked_row cleared_row
+  row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" act "alt-w" "$row" >/dev/null
+  marked_row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
+  case "$marked_row" in
+    *"WORK IN PROGRESS"*) ok "work-in-progress action persists and marks the item in the next dashboard snapshot" ;;
+    *) bad "work-in-progress action persists and marks the item in the next dashboard snapshot (got: $marked_row)" ;;
+  esac
+
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" act "alt-w" "$marked_row" >/dev/null
+  cleared_row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
+  case "$cleared_row" in
+    *"WORK IN PROGRESS"*) bad "work-in-progress action clears the persisted mark (got: $cleared_row)" ;;
+    *) ok "work-in-progress action clears the persisted mark" ;;
+  esac
+}
+test_work_in_progress_marker
+
+test_work_in_progress_reliability() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+import multiprocessing
+import os
+import tempfile
+
+state_dir = tempfile.mkdtemp()
+os.environ['XDG_STATE_HOME'] = state_dir
+m._wip_items = None
+item = {
+    'status': 'OPEN', 'context': 'generic', 'title': 'No ID', 'details': '', 'weight': 1,
+    'id': '', 'actions': [{'key': 'alt-w', 'label': 'custom action', 'payload': {}}],
+    '_plugin': 'generic',
+}
+snapshot = m.build_snapshot({'generic': [item]})
+print([(action['key'], action['label']) for action in snapshot[0]['actions']])
+
+def mark(item_id):
+    m._wip_items = None
+    m.toggle_wip_item(item_id)
+
+context = multiprocessing.get_context('fork')
+first = context.Process(target=mark, args=('first',))
+second = context.Process(target=mark, args=('second',))
+first.start()
+second.start()
+first.join()
+second.join()
+m._wip_items = None
+print(sorted(m.get_wip_items()))
+
+blocked_state_home = tempfile.NamedTemporaryFile(delete=False)
+blocked_state_home.close()
+os.environ['XDG_STATE_HOME'] = blocked_state_home.name
+m._wip_items = None
+m.act('alt-w', m.render_rows(snapshot)[0])
+")"
+  check "WIP supports items without an explicit id and remaps a colliding alt-w action" \
+    "$(sed -n 1p <<<"$out")" "[('alt-w', 'work in progress'), ('W', 'custom action (remapped)')]"
+  check "concurrent WIP updates preserve both item markers" "$(sed -n 2p <<<"$out")" "['first', 'second']"
+  case "$(sed -n 3p <<<"$out")" in
+    "Action failed: "*) ok "WIP persistence failure stays in the action error boundary" ;;
+    *) bad "WIP persistence failure stays in the action error boundary (got: $(sed -n 3p <<<"$out"))" ;;
+  esac
+}
+test_work_in_progress_reliability
+
 test_build_snapshot_matches_build_prioritized_items_flattened_equivalent() {
   local out
   out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
@@ -1401,7 +1469,7 @@ def fake_gh_json(args):
         return {
             'mergeable': 'MERGEABLE', 'reviewDecision': 'CHANGES_REQUESTED',
             'statusCheckRollup': [],
-            'reviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'}],
+            'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'}],
         }
     raise AssertionError(args)
 
@@ -1428,33 +1496,36 @@ prs = [
     {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
     {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
 ]
+requested_detail_fields = []
+
 
 
 def fake_gh_json(args):
     if args[:2] == ['search', 'prs']:
         return prs
     if args[:2] == ['pr', 'view']:
+        requested_detail_fields.append(args[-1])
+
         if args[2] == '1':
             return {
                 'mergeable': 'MERGEABLE', 'reviewDecision': None,
                 'statusCheckRollup': [],
                 'comments': [{'author': {'login': 'reviewer'}}],
-                'reviews': [],
+                'latestReviews': [],
             }
         if args[2] == '3':
             return {
                 'mergeable': 'MERGEABLE', 'reviewDecision': None,
                 'statusCheckRollup': [],
-                'reviews': [
-                    {'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED', 'submittedAt': '2026-01-01T00:00:00Z'},
-                    {'author': {'login': 'reviewer'}, 'state': 'APPROVED', 'submittedAt': '2026-01-02T00:00:00Z'},
+                'latestReviews': [
+                    {'author': {'login': 'reviewer'}, 'state': 'APPROVED'},
                 ],
             }
         return {
             'mergeable': 'MERGEABLE', 'reviewDecision': None,
             'statusCheckRollup': [],
             'comments': [],
-            'reviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
+            'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
         }
     raise AssertionError(args)
 
@@ -1464,9 +1535,13 @@ p._get_gh_login = lambda: 'author'
 with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
     result = p._fetch_pr_attention('@me', detail_pool)
 print([(r['number'], r['attention_reasons']) for r in result])
+print(all('latestReviews' in fields.split(',') for fields in requested_detail_fields))
+
 ")"
-  check "ordinary comments do not flag authored PRs while non-author COMMENTED reviews do" \
-    "$out" "[(2, ['Review Commented'])]"
+  check "ordinary comments do not flag authored PRs while non-author COMMENTED latest reviews do" \
+    "$(sed -n 1p <<<"$out")" "[(2, ['Review Commented'])]"
+  check "PR attention requests each reviewer's latest review" \
+    "$(sed -n 2p <<<"$out")" "True"
 }
 test_pr_attention_uses_reviews_not_timeline_comments
 
@@ -1922,8 +1997,8 @@ test_declared_action_keys_unions_and_expands_fallbacks() {
 $LOAD_CORE
 print(','.join(m.declared_action_keys(m.load_config())))
 ")"
-  check "declared_action_keys(): de-duped union of ACTION_KEYS + declared_action_keys(), plus alt-stripped-uppercase and digit fallbacks, with zero fetch() calls" \
-    "$out" "alt-o,alt-b,alt-q,O,B,Q,1,2,3,4,5,6,7,8,9"
+  check "declared_action_keys(): includes the core WIP key, de-duped plugin keys, uppercase fallbacks, and digit fallbacks without fetch calls" \
+    "$out" "alt-w,alt-o,alt-b,alt-q,W,O,B,Q,1,2,3,4,5,6,7,8,9"
 }
 test_declared_action_keys_unions_and_expands_fallbacks
 
@@ -1956,7 +2031,7 @@ print('$NO_HOOK_PLUGIN' in warnings[0] if warnings else '')
 " 2>&1)"
   keys="$(sed -n 1p <<<"$out")"
   warnings="$(sed -n 2p <<<"$out")"
-  check "a plugin with neither ACTION_KEYS nor declared_action_keys() contributes no keys of its own (only the fixed digit fallback universe remains)" "$keys" "1,2,3,4,5,6,7,8,9"
+  check "a plugin with neither ACTION_KEYS nor declared_action_keys() contributes no keys of its own (only the core WIP and digit fallback universe remains)" "$keys" "alt-w,W,1,2,3,4,5,6,7,8,9"
   check "exactly one stderr warning fires per dashboard run (not per call), regardless of how many times declared_action_keys() runs" "$warnings" "1"
   check "the warning names the plugin lacking the hook" "$(sed -n 3p <<<"$out")" "True"
 }
@@ -2002,8 +2077,8 @@ print('$MALFORMED_KEYS_PLUGIN' in warnings[1] if len(warnings) > 1 else '')
 " 2>&1)"
   keys="$(sed -n 1p <<<"$out")"
   warnings="$(sed -n 2p <<<"$out")"
-  check "a plugin whose declared_action_keys() raises contributes no keys, and a plugin whose ACTION_KEYS is a bare string ('alt-o') also contributes no keys -- neither aborts the dashboard, the good plugin's keys still land" \
-    "$keys" "alt-o,alt-b,O,B,1,2,3,4,5,6,7,8,9"
+  check "a plugin whose declared_action_keys() raises contributes no keys, and a plugin whose ACTION_KEYS is a bare string ('alt-o') also contributes no keys -- neither aborts the dashboard, the core and good plugin keys still land" \
+    "$keys" "alt-w,alt-o,alt-b,W,O,B,1,2,3,4,5,6,7,8,9"
   check "declared_action_keys() warns exactly once for the raising hook and once for the malformed-string ACTION_KEYS (two isolated plugins, two warnings)" \
     "$warnings" "2"
   check "the first warning names the plugin whose hook raised" "$(sed -n 3p <<<"$out")" "True"
@@ -2044,7 +2119,7 @@ print('$MIXED_KEYS_PLUGIN' in warnings[0] if len(warnings) > 0 else '')
   keys2="$(sed -n 2p <<<"$out")"
   warnings="$(sed -n 3p <<<"$out")"
   check "a plugin whose ACTION_KEYS mixes strings with non-strings (['alt-z', 5]) contributes zero keys, not just the non-string entries stripped" \
-    "$keys1" "alt-o,alt-b,O,B,1,2,3,4,5,6,7,8,9"
+    "$keys1" "alt-w,alt-o,alt-b,W,O,B,1,2,3,4,5,6,7,8,9"
   check "declared_action_keys() is stable across repeated calls for a mixed-type-list plugin" "$keys2" "$keys1"
   check "a mixed-type ACTION_KEYS list warns exactly once even though declared_action_keys() ran twice" "$warnings" "1"
   check "the warning names the plugin whose ACTION_KEYS was a mixed-type list" "$(sed -n 4p <<<"$out")" "True"
