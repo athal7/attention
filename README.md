@@ -145,3 +145,4 @@ just point `config["plugins"]` at it.
 - [`gh`](https://cli.github.com) -- `github` plugin (authenticated)
 - [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
 - [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
+
