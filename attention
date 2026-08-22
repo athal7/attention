@@ -504,19 +504,19 @@ def _visible_row_text(item, status_col, context_col, title_col, include_status=T
     details_width = max(0, w - status_col - context_col - title_col - separator_width)
     details = _clip(item["details"], details_width) if w < 80 else item["details"]
     if include_status:
-        return f"{status:<{status_col}}  {context:<{context_col}}  {title:<{title_col}}  {details} "
-    return f"{context:<{context_col}}  {title:<{title_col}}  {details} "
+        return f"{status:<{status_col}}  {title:<{title_col}}  {context:<{context_col}}  {details} "
+    return f"{title:<{title_col}}  {context:<{context_col}}  {details} "
 
 
 def render_rows(items):
     """Format the (already merged, already sorted) item list for fzf:
-    STATUS/CONTEXT/TITLE columns sized to this run's longest value
+    STATUS/TITLE/CONTEXT columns sized to this run's longest value
     (capped, so one outlier doesn't blow out the whole table) keep every
     row's fields lined up. Each row's hidden second field is its actions
     list, base64(JSON)-encoded (opaque and delimiter-safe, since a
     plugin's payload can be arbitrary JSON) -- act() decodes it, never
     needing to know which plugin produced the row until dispatch time.
-    Row shape: STATUS  CONTEXT  TITLE  DETAILS \t<base64 actions>\tHINT
+    Row shape: STATUS  TITLE  CONTEXT  DETAILS \t<base64 actions>\tHINT
 
     Used only by the blocking `attention list`/`expect-keys` commands --
     byte-for-byte unchanged by the interactive dashboard's progressive
@@ -537,12 +537,12 @@ def render_rows(items):
 
 
 def render_dashboard_rows(items):
-    """Interactive-dashboard-only row renderer: context, title, and details
+    """Interactive-dashboard-only row renderer: title, context, and details
     are visible; a status column is omitted. The three hidden fields are the
     opaque action list, this item's action-key CSV for focus-scoped rebinding,
     and the footer hint.
 
-    Row shape: CONTEXT  TITLE  DETAILS \t<base64 actions>\t<row keys csv>\tHINT
+    Row shape: TITLE  CONTEXT  DETAILS \t<base64 actions>\t<row keys csv>\tHINT
     """
     _normalize_row_text(items)
     status_col, context_col, title_col = _row_columns(items, include_status=False)
