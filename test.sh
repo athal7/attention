@@ -707,7 +707,7 @@ test_generic_provider() {
   second_line="$(grep 'GENERICTEST-second' <<<"$out" || true)"
 
   case "$first_line" in
-    "NEEDS REVIEW"*"backend"*"GENERICTEST-first"*"prio 12"*)
+    "NEEDS REVIEW"*"GENERICTEST-first"*"backend"*"prio 12"*)
       ok "status/context/title/details resolve {dotted.path} templates against the record" ;;
     *) bad "status/context/title/details resolve {dotted.path} templates against the record (got: $first_line)" ;;
   esac
@@ -1931,7 +1931,7 @@ print(fields[2])
   check "render_rows() still emits exactly one row per item" "$(sed -n 1p <<<"$out")" "1"
   check "render_rows() output is still exactly 3 tab-delimited fields (unchanged by the dashboard renderer's addition)" \
     "$(sed -n 2p <<<"$out")" "3"
-  check "render_rows() field 1 (visible columns) is unchanged" "$(sed -n 3p <<<"$out")" "REVIEW REQUESTED  myorg/kb  Fix the login bug"
+  check "render_rows() field 1 (visible columns) is unchanged" "$(sed -n 3p <<<"$out")" "REVIEW REQUESTED  Fix the login bug  myorg/kb"
   check "render_rows() field 2 (actions blob) is unchanged" "$(sed -n 4p <<<"$out")" "alt-o"
   check "render_rows() field 3 (hint) is unchanged" "$(sed -n 5p <<<"$out")" "⌥o open"
 }
@@ -1961,7 +1961,7 @@ print(fields[1] == list_fields[1])
 ")"
   check "render_dashboard_rows() emits exactly one row per item" "$(sed -n 1p <<<"$out")" "1"
   check "render_dashboard_rows() emits exactly 4 tab-delimited fields" "$(sed -n 2p <<<"$out")" "4"
-  check "render_dashboard_rows() field 1 omits status and begins with context" "$(sed -n 3p <<<"$out")" "myorg/kb  Fix the login bug"
+  check "render_dashboard_rows() field 1 omits status and begins with title" "$(sed -n 3p <<<"$out")" "Fix the login bug  myorg/kb"
   check "render_dashboard_rows() field 3 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "alt-o,alt-s"
   check "render_dashboard_rows() field 4 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "⌥o open  ⌥s session"
   check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 6p <<<"$out")" "True"
