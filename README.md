@@ -95,7 +95,10 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 When `dashboard.groups` is configured, `attention` opens a curses overview
 instead of the flat fzf list. It shows the non-empty groups and their current
 item counts; use Up/Down or `j`/`k` to select a group, Enter to open its scoped
-fzf list, and Esc to quit. Esc in a scoped fzf list returns to the overview.
+fzf list, and Esc to quit. Esc in a scoped fzf list returns to the overview;
+taking an action (or a background refresh ticking over) reopens the same
+scoped list instead, so you can act on an item or its section repeatedly
+without being bounced back to the overview.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
