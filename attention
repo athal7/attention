@@ -218,6 +218,7 @@ class Item(ItemRequired, total=False):
     actions: list
     identity_key: str
     association_keys: list
+    status_priority: int
 
 
 def validate_and_normalize_item(item, name):
@@ -270,6 +271,11 @@ def validate_and_normalize_item(item, name):
         item["association_keys"] = []
     elif not isinstance(item["association_keys"], list) or not all(isinstance(key, str) for key in item["association_keys"]):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'association_keys' must be a list of strings")
+
+    if "status_priority" not in item:
+        item["status_priority"] = 0
+    elif isinstance(item["status_priority"], bool) or not isinstance(item["status_priority"], int):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'status_priority' must be of type int, got {type(item['status_priority']).__name__}")
 
     if "actions" not in item:
         item["actions"] = []
@@ -348,15 +354,29 @@ def fetch_all(config):
 
 
 def _absorb(host, guest):
-    """Merge `guest` into `host`: append guest's note to host's details,
-    boost host's weight, and splice guest's actions into host's action
-    list (renamed only on an actual key collision, tried in order: the
-    alt-stripped-and-uppercased variant, then the lowest unused bare
-    digit -- and always labeled "(linked)" so it's visually obvious
-    which actions reach a different, absorbed item).
+    """Merge `guest` into `host`: fold one side's status into the other's
+    details, boost host's weight, and splice guest's actions into host's
+    action list (renamed only on an actual key collision, tried in order:
+    the alt-stripped-and-uppercased variant, then the lowest unused bare
+    digit -- and always labeled "(linked)" so it's visually obvious which
+    actions reach a different, absorbed item).
+
+    Whichever side has the higher `status_priority` (default 0) keeps its
+    `status` visible on the merged row; the other side's status/details
+    become a note instead. This lets a plugin whose status is the
+    authoritative signal for the underlying work (e.g. Linear's workflow
+    state) win over one whose status just describes process mechanics
+    (e.g. a GitHub PR's review/CI state), regardless of which side ended
+    up as the structural host.
     """
-    note = guest.get("absorb_note") or f"{guest.get('status', '')}: {guest.get('title', '')}"
-    host["details"] = f"{host['details']} | {note}" if host.get("details") else note
+    if guest.get("status_priority", 0) > host.get("status_priority", 0):
+        demoted_status, demoted_details = host.get("status", ""), host.get("details", "")
+        host["status"] = guest.get("status", demoted_status)
+        host["status_priority"] = guest.get("status_priority", 0)
+        host["details"] = f"{demoted_status}: {demoted_details}" if demoted_details else demoted_status
+    else:
+        note = guest.get("absorb_note") or f"{guest.get('status', '')}: {guest.get('title', '')}"
+        host["details"] = f"{host['details']} | {note}" if host.get("details") else note
     host["weight"] = max(host.get("weight", 0), guest.get("weight", 0)) + 5
 
     host_actions = host.setdefault("actions", [])

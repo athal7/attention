@@ -1471,6 +1471,10 @@ def fake_gh_json(args):
             'statusCheckRollup': [],
             'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'}],
         }
+    if args[:2] == ['api', 'graphql']:
+        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
+            {'author': {'__typename': 'User', 'login': 'reviewer'}}
+        ]}}}}}
     raise AssertionError(args)
 
 
@@ -1527,6 +1531,10 @@ def fake_gh_json(args):
             'comments': [],
             'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
         }
+    if args[:2] == ['api', 'graphql']:
+        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
+            {'author': {'__typename': 'User', 'login': 'reviewer'}}
+        ]}}}}}
     raise AssertionError(args)
 
 
@@ -1554,22 +1562,36 @@ import concurrent.futures
 prs = [
     {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
     {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 4, 'repository': {'nameWithOwner': 'owner/repo'}},
 ]
+
+# Real \`gh pr view --json latestReviews\` never exposes __typename, and a
+# Bot actor's bare login there never carries a \"[bot]\" suffix (verified
+# against live PRs reviewed by Copilot/CodeRabbit/dependabot) -- only the
+# separate \`api graphql\` lookup in _fetch_review_bot_flags() can tell a
+# bot review from a human one.
+reviewer_by_number = {'1': 'dependabot', '2': 'coderabbitai', '3': 'human-reviewer', '4': 'legacy-bot[bot]'}
+typename_by_number = {'1': 'Bot', '2': 'Bot', '3': 'User'}
 
 
 def fake_gh_json(args):
     if args[:2] == ['search', 'prs']:
         return prs
     if args[:2] == ['pr', 'view']:
-        if args[2] == '1':
-            reviewer = 'dependabot[bot]'
-        else:
-            reviewer = 'coderabbitai[bot]'
+        reviewer = reviewer_by_number[args[2]]
         return {
             'mergeable': 'MERGEABLE', 'reviewDecision': None,
             'statusCheckRollup': [],
             'latestReviews': [{'author': {'login': reviewer}, 'state': 'COMMENTED'}],
         }
+    if args[:2] == ['api', 'graphql']:
+        number = next(a.split('=', 1)[1] for a in args if a.startswith('number='))
+        if number == '4':
+            return []  # simulate the graphql lookup itself being unreachable
+        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
+            {'author': {'__typename': typename_by_number[number], 'login': reviewer_by_number[number]}}
+        ]}}}}}
     raise AssertionError(args)
 
 
@@ -1581,10 +1603,10 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
 print([(r['number'], r['attention_reasons']) for r in default_result])
 print([(r['number'], r['attention_reasons']) for r in allowlisted_result])
 ")"
-  check "an unlisted bot's review comment never flags a PR by default" \
-    "$(sed -n 1p <<<"$out")" "[]"
-  check "allowlisting a bot login lets its review comment flag the PR, while a non-allowlisted bot still doesn't" \
-    "$(sed -n 2p <<<"$out")" "[(2, ['Review Commented'])]"
+  check "unlisted bots (bare GraphQL Bot login, no [bot] suffix) never flag a PR by default -- only the human reviewer does" \
+    "$(sed -n 1p <<<"$out")" "[(3, ['Review Commented'])]"
+  check "allowlisting a bot login (with the [bot] suffix, as documented) admits its bare-login review too" \
+    "$(sed -n 2p <<<"$out")" "[(2, ['Review Commented']), (3, ['Review Commented'])]"
 }
 test_pr_attention_ignores_bot_review_comments_unless_allowlisted
 
@@ -1636,6 +1658,11 @@ print(json.dumps({'query': captured['query'], 'result': result}))
     *) bad "assignedIssues filters by state.type (got: $out)" ;;
   esac
   case "$out" in
+    *'cycle: { isActive: { eq: true } }'*)
+      ok "assignedIssues is scoped to the current cycle" ;;
+    *) bad "assignedIssues is scoped to the current cycle (got: $out)" ;;
+  esac
+  case "$out" in
     *'first: 250'*) ok "assignedIssues raises the page size past the 50-item default" ;;
     *) bad "assignedIssues raises the page size past the 50-item default (got: $out)" ;;
   esac
@@ -1643,6 +1670,11 @@ print(json.dumps({'query': captured['query'], 'result': result}))
     *'"context": "Backend"'*'"id": "ABC-1"'*)
       ok "fetch() returns the issue with id=identifier and project as CONTEXT" ;;
     *) bad "fetch() returns the issue with id=identifier and project as CONTEXT (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"status_priority": 10'*)
+      ok "Linear issues outrank a cross-linked host's status on merge" ;;
+    *) bad "Linear issues outrank a cross-linked host's status on merge (got: $out)" ;;
   esac
 }
 test_fetch_linear_functional
@@ -1769,6 +1801,40 @@ print(sum(1 for a in merged[0]['actions'] if a.get('primary')))
   check "only the host's own action keeps primary=true after merging" "$primary_count" "1"
 }
 test_id_shaped_cross_link_merge
+
+test_status_priority_swaps_visible_status_on_merge() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+gh_item = {
+    'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the thing ABC-1', 'details': 'Review Commented',
+    'weight': 90, 'id': '1', 'actions': [],
+}
+lin_item = {
+    'status': 'IN PROGRESS', 'context': 'Backend', 'title': 'Fix it', 'details': '',
+    'weight': 80, 'id': 'ABC-1', 'absorb_note': 'Linear ABC-1: IN PROGRESS',
+    'status_priority': 10, 'actions': [],
+}
+merged = m.merge_cross_links([gh_item, lin_item])
+import json
+print(json.dumps(merged))
+")"
+
+  case "$out" in
+    *'"status": "IN PROGRESS"'*) ok "guest's higher status_priority makes its status the merged row's visible status" ;;
+    *) bad "guest's higher status_priority makes its status the merged row's visible status (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"details": "REVIEW REQUESTED: Review Commented"'*)
+      ok "the demoted host status/details survive as a note instead of the guest's absorb_note" ;;
+    *) bad "the demoted host status/details survive as a note (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"status_priority": 10'*) ok "the merged row's status_priority carries the winning side's value" ;;
+    *) bad "the merged row's status_priority carries the winning side's value (got: $out)" ;;
+  esac
+}
+test_status_priority_swaps_visible_status_on_merge
 
 test_declared_association_key_merge() {
   local out

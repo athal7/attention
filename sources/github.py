@@ -5,8 +5,9 @@ assigned to you or open in repos you own, via the `gh` CLI
 Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
 checkout. botReviewAllowlist optionally re-admits specific bot logins
-(e.g. "coderabbitai[bot]") into the "needs attention" review-comment
-check, which otherwise ignores every "[bot]"-suffixed reviewer.
+(e.g. "coderabbitai[bot]", with or without the suffix) into the "needs
+attention" review-comment check, which otherwise ignores every
+reviewer GitHub's GraphQL API reports as a Bot actor.
 """
 import concurrent.futures
 import json
@@ -64,7 +65,46 @@ def _get_gh_login():
 
 
 def _is_bot_login(login):
+    # Fallback only, used when _fetch_review_bot_flags() can't be reached:
+    # GitHub's GraphQL `Bot` actor type never actually carries this
+    # suffix on its bare `login` (see _fetch_review_bot_flags), so this
+    # heuristic under-detects on its own.
     return login.casefold().endswith("[bot]")
+
+
+def _fetch_review_bot_flags(repo, number):
+    """login (casefold) -> True if that PR review's author is a GraphQL
+    `Bot` actor. `gh pr view --json latestReviews` flattens each review's
+    author down to a bare `login`, dropping GraphQL's `__typename` -- and
+    a bot's `login` there never carries the "[bot]" suffix REST/UI
+    surfaces show (e.g. Copilot's code-review account is
+    "copilot-pull-request-reviewer", CodeRabbit's is "coderabbitai",
+    dependabot's is "dependabot"), so a suffix check alone silently lets
+    every bot review through as if a person wrote it. This raw GraphQL
+    query is the only way to recover the actor type.
+    """
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        return {}
+    result = _gh_json([
+        "api", "graphql",
+        "-f", "query=query($owner:String!,$name:String!,$number:Int!){"
+              "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+              "latestReviews(first:50){nodes{author{__typename login}}}}}}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+        "-F", f"number={number}",
+    ])
+    repository = ((result or {}).get("data") or {}).get("repository") or {}
+    pr = repository.get("pullRequest") or {}
+    nodes = (pr.get("latestReviews") or {}).get("nodes") or []
+    flags = {}
+    for node in nodes:
+        author = node.get("author") or {}
+        login = (author.get("login") or "").casefold()
+        if login:
+            flags[login] = author.get("__typename") == "Bot"
+    return flags
 
 
 def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
@@ -84,12 +124,15 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
     tracked authors never multiply the concurrency past that single
     fixed cap.
 
-    A review from a bot account (login ending in "[bot]" -- GitHub's
-    own convention for dependabot/renovate/CI-review-bot logins) never
-    counts toward "Review Commented"/"Changes Requested" on its own:
-    automated review noise shouldn't inflate a PR's attention score.
+    A review from a bot account never counts toward "Review
+    Commented"/"Changes Requested" on its own: automated review noise
+    (Copilot's code review, CodeRabbit, dependabot, etc.) shouldn't
+    inflate a PR's attention score. Bot-ness is determined by
+    `_fetch_review_bot_flags()` (GraphQL actor type), falling back to
+    `_is_bot_login()` only if that lookup is unreachable.
     `bot_review_allowlist` (casefolded logins, from
-    config["github"]["botReviewAllowlist"]) opts specific bots back in.
+    config["github"]["botReviewAllowlist"], matched with or without a
+    "[bot]" suffix) opts specific bots back in.
     """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
@@ -115,12 +158,21 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
 
         reasons = []
         latest_review_states = set()
+        bot_flags = None
         for review in detail.get("latestReviews") or []:
             reviewer = review.get("author", {}).get("login") or ""
             if not reviewer or reviewer.casefold() == expected_author.casefold():
                 continue
-            if _is_bot_login(reviewer) and reviewer.casefold() not in bot_review_allowlist:
-                continue
+            reviewer_cf = reviewer.casefold()
+            if bot_flags is None:
+                bot_flags = _fetch_review_bot_flags(repo, number)
+            is_bot = bot_flags.get(reviewer_cf)
+            if is_bot is None:
+                is_bot = _is_bot_login(reviewer)
+            if is_bot:
+                canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
+                if canonical not in bot_review_allowlist and reviewer_cf not in bot_review_allowlist:
+                    continue
             latest_review_states.add(review.get("state"))
         if "CHANGES_REQUESTED" in latest_review_states:
             reasons.append("Changes Requested")

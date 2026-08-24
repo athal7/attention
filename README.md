@@ -86,7 +86,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new review comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
-| `github.botReviewAllowlist` | GitHub bot logins (e.g. `"coderabbitai[bot]"`) whose review comments still count toward "needs attention". Every other `"[bot]"`-suffixed reviewer is ignored by default -- automated review noise doesn't inflate a PR's attention score. Missing/empty = no bot reviews count. |
+| `github.botReviewAllowlist` | GitHub bot logins (e.g. `"coderabbitai[bot]"`, with or without the suffix) whose review comments still count toward "needs attention". Every other reviewer GitHub's API reports as a bot actor is ignored by default -- automated review noise doesn't inflate a PR's attention score. Missing/empty = no bot reviews count. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. `contextPrefixes` matches item contexts that start with one of its values. Exactly one fallback is required when groups are configured. |
@@ -122,8 +122,11 @@ cannot hide attention items.
   of assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
   hidden. De-duplicated by repo+number if an item matches more than one of
   these.
-- **linear**: your assigned issues not in a completed/canceled/duplicate
-  state.
+- **linear**: your assigned issues, not in a completed/canceled/duplicate
+  state, in your current cycle. Its status always wins on a cross-linked
+  dashboard row: a PR title/body mentioning the issue's identifier folds
+  into one row showing the Linear workflow state, not the PR's review/CI
+  status (see [PLUGINS.md](PLUGINS.md#cross-link-merging)).
 - **generic**: config-only providers -- run a command, map its JSON output
   onto the item shape via `{dotted.path}` templates. See
   [PLUGINS.md](PLUGINS.md#config-only-providers-no-python-required) for

@@ -98,6 +98,7 @@ omitted.
     "absorb_note": "...",            # str, optional (default "") -- text used if THIS item gets merged into another
     "identity_key": "github:myorg/myrepo#42", # str, optional (default "") -- provider-qualified association target
     "association_keys": [],                 # list[str], optional (default []) -- identity keys this item absorbs
+    "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
     "actions": [                     # list, optional (default [])
         {
             "key": "alt-o",          # str, required -- fzf --expect token: "alt-X", a bare letter/digit, or ""
@@ -131,13 +132,18 @@ regardless of which plugin produced it:
 3. **Title-substring match**: if item A's title (≥4 chars, not
    "untitled") is a substring of item B's title, B is absorbed into A.
 
-"Absorbed" means: B's `absorb_note` (or a generic status/title fallback)
-gets appended to A's `details`; A's `weight` becomes
-`max(A.weight, B.weight) + 5`; and B's `actions` get appended to A's,
-each renamed only if its key would otherwise collide with one A already
-has (tried in order: the same key stripped of `alt-` and uppercased, then
-the lowest unused bare digit) and labeled `"<label> (linked)"`. B itself
-is dropped from the rendered list.
+"Absorbed" means: whichever of A/B has the higher `status_priority`
+(ties keep A's) keeps its `status` on the merged row; the other's
+`status`/`details` collapse into a note appended to the winner's
+`details` (B's `absorb_note`, if it lost, or a generic status/title
+fallback). A's `weight` becomes `max(A.weight, B.weight) + 5`; and B's
+`actions` get appended to A's, each renamed only if its key would
+otherwise collide with one A already has (tried in order: the same key
+stripped of `alt-` and uppercased, then the lowest unused bare digit)
+and labeled `"<label> (linked)"`. B itself is dropped from the rendered
+list. `status_priority` defaults to 0 for every plugin, so unless a
+plugin opts in, the pre-existing behavior (the declaring/host item A
+always keeps its own status) is unchanged.
 
 ## Registering
 

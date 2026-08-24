@@ -2,6 +2,11 @@
 
 Config (config["linear"]):
     {"apiToken": "lin_api_..."}   # falls back to LINEAR_API_TOKEN/LINEAR_TOKEN env vars
+
+Scope: issues assigned to you, in an active (non-completed/canceled/
+duplicate) state, AND in your current cycle -- past-cycle and
+not-yet-scheduled backlog items are deliberately excluded so this stays
+a short "what's live right now" list rather than your whole backlog.
 """
 import json
 import os
@@ -55,7 +60,7 @@ def fetch(config):
     query = """
 query {
   viewer {
-    assignedIssues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }, first: 250) {
+    assignedIssues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, cycle: { isActive: { eq: true } } }, first: 250) {
       nodes {
         id
         identifier
@@ -131,6 +136,12 @@ query {
             "id": identifier,
             "absorb_note": f"Linear {identifier}: {state.upper()}",
             "identity_key": f"linear:{identifier}",
+            # Linear's workflow state is the authoritative signal for
+            # "where is this work" -- when a PR title/body cross-links to
+            # this issue and the two get merged into one dashboard row,
+            # this outranks the PR's own status (which describes review/CI
+            # mechanics, not progress) so the merged row still shows it.
+            "status_priority": 10,
             "actions": actions,
         })
 
