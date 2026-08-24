@@ -119,6 +119,9 @@ def build_focus_transform(universe_keys):
     )
 
 
+def build_footer_transform():
+    return r'printf "%s\n" {4} | tr "\013" "\n"'
+
 class _Round:
     def __init__(self, plugin_names, generation):
         self.generation = generation
@@ -536,7 +539,7 @@ class FzfPresenter:
         ]
         for bind in build_launch_binds(expect_keys):
             args += ["--bind", bind]
-        args += ["--bind", 'start,focus:transform[' + focus_cmd + ']+transform-footer:printf "%s\\n" {4}']
+        args += ["--bind", 'start,focus:transform[' + focus_cmd + ']+transform-footer:' + build_footer_transform()]
         try:
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
