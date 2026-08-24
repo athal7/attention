@@ -85,7 +85,8 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `codeDir` | Parent directory of your local repo clones (default `~/code`). Used by the `github` plugin, which resolves each item's local checkout by matching each subdirectory's own `git remote origin` against the item's repo -- not by name, so a repo cloned under a shorthand directory name still resolves. |
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
-| `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
+| `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new review comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
+| `github.botReviewAllowlist` | GitHub bot logins (e.g. `"coderabbitai[bot]"`) whose review comments still count toward "needs attention". Every other `"[bot]"`-suffixed reviewer is ignored by default -- automated review noise doesn't inflate a PR's attention score. Missing/empty = no bot reviews count. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. `contextPrefixes` matches item contexts that start with one of its values. Exactly one fallback is required when groups are configured. |
@@ -112,9 +113,10 @@ cannot hide attention items.
   by due date (overdue/due-today) or priority.
 - **github**: PRs where your review is requested; PRs you (or anyone listed
   in `github.trackAuthors`) authored that need attention (failing checks,
-  changes requested, a merge conflict, or a new comment from someone else);
-  issues assigned to you; open issues in repos you own regardless of
-  assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
+  changes requested, a merge conflict, or a new review comment from a
+  non-bot reviewer -- see `github.botReviewAllowlist` to opt specific bots
+  back in); issues assigned to you; open issues in repos you own regardless
+  of assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
   hidden. De-duplicated by repo+number if an item matches more than one of
   these.
 - **linear**: your assigned issues not in a completed/canceled/duplicate

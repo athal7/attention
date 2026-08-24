@@ -1545,6 +1545,49 @@ print(all('latestReviews' in fields.split(',') for fields in requested_detail_fi
 }
 test_pr_attention_uses_reviews_not_timeline_comments
 
+test_pr_attention_ignores_bot_review_comments_unless_allowlisted() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import concurrent.futures
+
+prs = [
+    {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
+]
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return prs
+    if args[:2] == ['pr', 'view']:
+        if args[2] == '1':
+            reviewer = 'dependabot[bot]'
+        else:
+            reviewer = 'coderabbitai[bot]'
+        return {
+            'mergeable': 'MERGEABLE', 'reviewDecision': None,
+            'statusCheckRollup': [],
+            'latestReviews': [{'author': {'login': reviewer}, 'state': 'COMMENTED'}],
+        }
+    raise AssertionError(args)
+
+
+p._gh_json = fake_gh_json
+p._get_gh_login = lambda: 'author'
+with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
+    default_result = p._fetch_pr_attention('@me', detail_pool)
+    allowlisted_result = p._fetch_pr_attention('@me', detail_pool, frozenset(['coderabbitai[bot]']))
+print([(r['number'], r['attention_reasons']) for r in default_result])
+print([(r['number'], r['attention_reasons']) for r in allowlisted_result])
+")"
+  check "an unlisted bot's review comment never flags a PR by default" \
+    "$(sed -n 1p <<<"$out")" "[]"
+  check "allowlisting a bot login lets its review comment flag the PR, while a non-allowlisted bot still doesn't" \
+    "$(sed -n 2p <<<"$out")" "[(2, ['Review Commented'])]"
+}
+test_pr_attention_ignores_bot_review_comments_unless_allowlisted
+
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="

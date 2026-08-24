@@ -4,7 +4,9 @@ assigned to you or open in repos you own, via the `gh` CLI
 
 Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
-checkout.
+checkout. botReviewAllowlist optionally re-admits specific bot logins
+(e.g. "coderabbitai[bot]") into the "needs attention" review-comment
+check, which otherwise ignores every "[bot]"-suffixed reviewer.
 """
 import concurrent.futures
 import json
@@ -61,7 +63,11 @@ def _get_gh_login():
     return ""
 
 
-def _fetch_pr_attention(author, detail_pool):
+def _is_bot_login(login):
+    return login.casefold().endswith("[bot]")
+
+
+def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
     """Open PRs `author` authored that need attention right now: failing
     checks, changes requested, a merge conflict, or a comment from
     someone else. `author` is a `gh search prs --author=` value ("@me"
@@ -77,6 +83,13 @@ def _fetch_pr_attention(author, detail_pool):
     shares across `_authored_prs` and every `_tracked_prs` call, so N
     tracked authors never multiply the concurrency past that single
     fixed cap.
+
+    A review from a bot account (login ending in "[bot]" -- GitHub's
+    own convention for dependabot/renovate/CI-review-bot logins) never
+    counts toward "Review Commented"/"Changes Requested" on its own:
+    automated review noise shouldn't inflate a PR's attention score.
+    `bot_review_allowlist` (casefolded logins, from
+    config["github"]["botReviewAllowlist"]) opts specific bots back in.
     """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
@@ -105,6 +118,8 @@ def _fetch_pr_attention(author, detail_pool):
         for review in detail.get("latestReviews") or []:
             reviewer = review.get("author", {}).get("login") or ""
             if not reviewer or reviewer.casefold() == expected_author.casefold():
+                continue
+            if _is_bot_login(reviewer) and reviewer.casefold() not in bot_review_allowlist:
                 continue
             latest_review_states.add(review.get("state"))
         if "CHANGES_REQUESTED" in latest_review_states:
@@ -213,13 +228,13 @@ def _fetch_raw(config):
         return issues
 
     def _authored_prs():
-        prs = _fetch_pr_attention("@me", detail_pool)
+        prs = _fetch_pr_attention("@me", detail_pool, bot_review_allowlist)
         for p in prs:
             p["type"] = "authored_attention"
         return prs
 
     def _tracked_prs(author):
-        prs = _fetch_pr_attention(author, detail_pool)
+        prs = _fetch_pr_attention(author, detail_pool, bot_review_allowlist)
         for p in prs:
             p["type"] = "tracked_attention"
             p["tracked_author"] = author
@@ -232,6 +247,9 @@ def _fetch_raw(config):
         return issues
 
     track_authors = config.get("github", {}).get("trackAuthors", [])
+    bot_review_allowlist = frozenset(
+        login.casefold() for login in config.get("github", {}).get("botReviewAllowlist", [])
+    )
 
     # These five queries (plus one per tracked author) share no state
     # and each costs at least one gh round trip -- some (authored/tracked
