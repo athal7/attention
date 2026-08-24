@@ -4174,6 +4174,82 @@ print(child.calls)
 }
 test_curses_presenter_scopes_fzf_rows
 
+test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import time
+
+class FakeScreen:
+    def __init__(self, keys):
+        self._keys = list(keys)
+    def keypad(self, v):
+        pass
+    def timeout(self, v):
+        pass
+    def getmaxyx(self):
+        return (24, 80)
+    def erase(self):
+        pass
+    def addnstr(self, *a, **k):
+        pass
+    def refresh(self):
+        pass
+    def getch(self):
+        return self._keys.pop(0) if self._keys else -1
+
+presenter = d.CursesGroupPresenter(['A', 'B'])
+presenter._rows = [
+    'a-item' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'A',
+    'b-item' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'B',
+]
+opened = []
+outcomes = [
+    d.PresenterResult('alt-o', 'a-item' + chr(9) + 'blob'),
+    d.PresenterResult(None, ''),
+    d.PresenterResult('', ''),
+]
+
+def fake_open_group(screen, group, deadline):
+    opened.append(group)
+    return outcomes.pop(0)
+
+presenter._open_group = fake_open_group
+deadline = time.monotonic() + 5
+
+# 1) Enter on the overview's first row opens 'A' and dispatches a hotkey.
+result1 = presenter._run(FakeScreen([10]), deadline)
+reopen_after_action = presenter._reopen_group
+# 2) The next relaunch (e.g. a periodic refresh timeout) must reopen 'A'
+#    directly -- no keypress needed to pick it again.
+result2 = presenter._run(FakeScreen([]), deadline)
+reopen_after_refresh = presenter._reopen_group
+# 3) An explicit Esc inside the reopened group falls through to the
+#    overview, which then consumes a real keypress (Esc) to quit.
+result3 = presenter._run(FakeScreen([27]), deadline)
+
+print(opened)
+print((result1.key, result1.row))
+print(reopen_after_action)
+print((result2.key, result2.row))
+print(reopen_after_refresh)
+print((result3.key, result3.row))
+")"
+  check "one overview keypress opens 'A', and every later reopen stays on 'A' without another overview keypress" \
+    "$(sed -n 1p <<<"$out")" "['A', 'A', 'A']"
+  check "the dispatched action's key/row surface unchanged" \
+    "$(sed -n 2p <<<"$out")" "('alt-o', 'a-item\tblob')"
+  check "acting on an item remembers its group instead of resetting to the overview" \
+    "$(sed -n 3p <<<"$out")" "A"
+  check "the next relaunch reopens the same group with no overview keypress" \
+    "$(sed -n 4p <<<"$out")" "(None, '')"
+  check "a periodic-refresh relaunch inside a group keeps remembering it too" \
+    "$(sed -n 5p <<<"$out")" "A"
+  check "explicit Esc inside the group still returns to the overview" \
+    "$(sed -n 6p <<<"$out")" "('', '')"
+}
+test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview
+
 # ---------------------------------------------------------------------------
 echo
 echo "== --help =="

@@ -324,6 +324,7 @@ class CursesGroupPresenter:
         self._active_group = None
         self._active_fzf = None
         self._stopped = False
+        self._reopen_group = None
 
     def launch(self, expect_keys, header):
         with self._lock:
@@ -426,6 +427,25 @@ class CursesGroupPresenter:
             curses.reset_prog_mode()
             screen.refresh()
 
+    def _open_group_and_track(self, screen, group, deadline):
+        """Runs `group`'s scoped fzf list, then -- unless the user
+        explicitly Esc'd back to the group-list overview -- remembers
+        `group` so the *next* `_run()` call (the presenter relaunch a
+        dispatched action or a periodic background refresh both trigger)
+        reopens straight back into it instead of bouncing to the
+        overview: taking another action on the same item or section, or
+        just sitting on it while a refresh ticks over, must never lose
+        your place. Only an explicit Esc inside the group (`result.key ==
+        result.row == ""`) clears it, since that's the one gesture that
+        means "take me back to the overview".
+        """
+        result = self._open_group(screen, group, deadline)
+        should_return = result.key is None or bool(result.key) or bool(result.row)
+        if should_return:
+            with self._lock:
+                self._reopen_group = group
+        return result, should_return
+
     def _run(self, screen, deadline):
         import curses
 
@@ -436,6 +456,15 @@ class CursesGroupPresenter:
         except curses.error:
             pass
         selected = 0
+        with self._lock:
+            reopen_group = self._reopen_group
+            self._reopen_group = None
+        if reopen_group is not None:
+            _, _, stopped, counts = self._snapshot()
+            if not stopped and counts.get(reopen_group):
+                result, should_return = self._open_group_and_track(screen, reopen_group, deadline)
+                if should_return:
+                    return result
         while True:
             _, pending, stopped, counts = self._snapshot()
             if stopped:
@@ -455,10 +484,8 @@ class CursesGroupPresenter:
             elif key in (curses.KEY_DOWN, ord("j")) and visible_groups:
                 selected = (selected + 1) % len(visible_groups)
             elif key in (curses.KEY_ENTER, 10, 13) and visible_groups:
-                result = self._open_group(screen, visible_groups[selected], deadline)
-                if result.key is None:
-                    return result
-                if result.key or result.row:
+                result, should_return = self._open_group_and_track(screen, visible_groups[selected], deadline)
+                if should_return:
                     return result
 class UnixHTTPConnection(http.client.HTTPConnection):
     """`http.client.HTTPConnection` whose `connect()` opens an `AF_UNIX`
