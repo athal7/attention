@@ -1968,6 +1968,37 @@ print(fields[1] == list_fields[1])
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
 
+test_dashboard_action_hints_wrap_at_footer_width() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+$LOAD_DASHBOARD
+import shlex
+import subprocess
+import shutil
+
+class DummySize:
+    columns = 40
+
+shutil.get_terminal_size = lambda: DummySize()
+actions = [
+    {'key': 'alt-o', 'label': 'open'},
+    {'key': 'alt-a', 'label': 'approve'},
+    {'key': 'alt-m', 'label': 'merge'},
+    {'key': 'alt-c', 'label': 'comment'},
+    {'key': 'alt-g', 'label': 'label'},
+]
+print(repr(m._dashboard_hint_for_actions(actions)))
+cmd = d.build_footer_transform().replace('{4}', shlex.quote(m._dashboard_hint_for_actions(actions)))
+print(repr(subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, check=True).stdout))
+")"
+  check "dashboard action hints use explicit footer lines that fit a 40-column terminal" \
+    "$(sed -n 1p <<<"$out")" "'⌥o open  ⌥a approve  ⌥m merge\\x0b⌥c comment  ⌥g label'"
+  check "the fzf footer transform turns each dashboard action-hint line into a visible footer row" \
+    "$(sed -n 2p <<<"$out")" "'⌥o open  ⌥a approve  ⌥m merge\n⌥c comment  ⌥g label\n'"
+}
+test_dashboard_action_hints_wrap_at_footer_width
+
 DECL_KEYS_A_PLUGIN="$WORK/decl_keys_a_plugin.py"
 cat > "$DECL_KEYS_A_PLUGIN" <<'PY'
 ACTION_KEYS = ["alt-o", "alt-b"]

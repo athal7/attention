@@ -445,14 +445,40 @@ def expect_keys_for(items):
     return keys
 
 
-def hint_for_actions(actions):
-    """Human-readable footer hint, e.g. '⌥o open  ⌥s session'."""
+def _action_hint_parts(actions):
     parts = []
     for a in actions:
         key = a["key"]
         symbol = f"⌥{key[len('alt-'):]}" if key.startswith("alt-") else key
         parts.append(f"{symbol} {a['label']}")
-    return "  ".join(parts)
+    return parts
+
+
+def hint_for_actions(actions):
+    """Human-readable footer hint, e.g. '⌥o open  ⌥s session'."""
+    return "  ".join(_action_hint_parts(actions))
+
+
+def _dashboard_hint_for_actions(actions):
+    import shutil
+
+    width = max(1, shutil.get_terminal_size().columns - 2)
+    lines = []
+    line = ""
+    for part in _action_hint_parts(actions):
+        if len(part) > width:
+            if line:
+                lines.append(line)
+                line = ""
+            lines.extend(part[start:start + width] for start in range(0, len(part), width))
+        elif line and len(line) + 2 + len(part) > width:
+            lines.append(line)
+            line = part
+        else:
+            line = f"{line}  {part}" if line else part
+    if line:
+        lines.append(line)
+    return "\v".join(lines)
 
 
 _STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX = 20, 30, 60
@@ -555,7 +581,7 @@ def render_dashboard_rows(items):
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
         keys_csv = ",".join(a["key"] for a in actions)
-        hint = hint_for_actions(actions)
+        hint = _dashboard_hint_for_actions(actions)
         rows.append(f"{visible}\t{blob}\t{keys_csv}\t{hint}")
     return rows
 
