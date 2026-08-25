@@ -2,8 +2,8 @@
 """attention -- prioritized multi-source triage dashboard, core.
 
 Slim orchestrator: loads config, loads each configured plugin module,
-merges/cross-links/sorts what they return, renders through fzf, and
-routes a pressed hotkey back to whichever plugin's action produced it.
+merges/cross-links/sorts what they return, renders through the terminal UI,
+and routes a pressed hotkey back to whichever plugin's action produced it.
 Contains no source-specific logic itself -- see PLUGINS.md for the
 interface a plugin implements; sources/*.py are the bundled ones.
 
@@ -15,6 +15,7 @@ contribute nothing until configured; github/linear still work out of
 the box, gated only by their own auth availability.
 """
 import base64
+import curses
 import fcntl
 import importlib.util
 import json
@@ -31,8 +32,8 @@ USAGE = """Usage: attention [COMMAND]
 
 Commands:
   (none)         Run the interactive dashboard (default)
-  list           Print the current prioritized list (fzf's raw input format)
-  expect-keys    Print the comma-joined set of hotkeys the dashboard binds
+  list           Print the current prioritized list (raw tab-delimited format)
+  expect-keys    Print the comma-joined set of declared action keys
   act KEY LINE   Dispatch a single hotkey press against one dashboard row
   -h, --help     Show this message
 
@@ -293,6 +294,11 @@ def validate_and_normalize_item(item, name):
             val = action[key]
             if not isinstance(val, expected_type):
                 raise ValueError(f"plugin '{name}' returned a malformed item: action '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
+        if not re.fullmatch(r"alt-[a-z]|[A-Za-z0-9]", action["key"]):
+            raise ValueError(
+                f"plugin '{name}' returned a malformed item: action 'key' must be "
+                "alt-<lowercase letter> or one letter/digit"
+            )
 
         if "primary" not in action:
             action["primary"] = False
@@ -555,8 +561,8 @@ def _visible_row_text(item, status_col, context_col, title_col, include_status=T
 
 
 def render_rows(items):
-    """Format the (already merged, already sorted) item list for fzf:
-    STATUS/TITLE/CONTEXT columns sized to this run's longest value
+    """Format the (already merged, already sorted) item list for `attention
+    list`: STATUS/TITLE/CONTEXT columns sized to this run's longest value
     (capped, so one outlier doesn't blow out the whole table) keep every
     row's fields lined up. Each row's hidden second field is its actions
     list, base64(JSON)-encoded (opaque and delimiter-safe, since a
@@ -698,108 +704,6 @@ def render_grouped_dashboard_rows(items, groups):
     ]
 
 
-_warned_missing_action_keys = set()
-_warned_broken_action_keys = set()
-
-
-def _warn_broken_action_keys(name, reason):
-    if name in _warned_broken_action_keys:
-        return
-    _warned_broken_action_keys.add(name)
-    print(
-        f"attention: plugin '{name}' declared_action_keys()/ACTION_KEYS is broken ({reason}) -- "
-        "ignoring its declared keys for this run. See PLUGINS.md.",
-        file=sys.stderr,
-    )
-
-
-def declared_action_keys(config):
-    """The complete, finite dashboard hotkey universe, computable
-    without calling any plugin's fetch(): the de-duped union of every
-    configured plugin's declared_action_keys(config) (or its ACTION_KEYS
-    constant, if it has no such function) plus the deterministic
-    collision-fallback keys _absorb() can introduce -- each declared
-    alt-X key's stripped-and-uppercased form, and the fixed bare-digit
-    fallbacks "1"-"9". A plugin with neither hook contributes no keys
-    and gets exactly one stderr warning naming it, the first time this
-    runs into it in this process.
-
-    Both the hook call and the ACTION_KEYS read are isolated per plugin:
-    a plugin whose hook raises, or whose config makes it raise, or whose
-    result is a bare string (which would otherwise expand into one key
-    per character) or anything else that isn't a list of key strings,
-    contributes zero keys and gets exactly one stderr warning naming it
-    -- it never aborts the rest of the dashboard.
-    """
-    plugin_names = config.get("plugins", DEFAULT_PLUGINS)
-    declared = [WIP_ACTION_KEY]
-    seen = {WIP_ACTION_KEY}
-    for name in plugin_names:
-        try:
-            mod = load_plugin(name)
-        except Exception:
-            continue
-        if hasattr(mod, "declared_action_keys"):
-            try:
-                plugin_keys = mod.declared_action_keys(config)
-            except Exception as e:
-                _warn_broken_action_keys(name, e)
-                plugin_keys = []
-        elif hasattr(mod, "ACTION_KEYS"):
-            try:
-                plugin_keys = mod.ACTION_KEYS
-            except Exception as e:
-                _warn_broken_action_keys(name, e)
-                plugin_keys = []
-        else:
-            if name not in _warned_missing_action_keys:
-                _warned_missing_action_keys.add(name)
-                print(
-                    f"attention: plugin '{name}' has no declared_action_keys()/ACTION_KEYS -- "
-                    "its non-primary actions won't be bindable in the interactive dashboard "
-                    "(list/expect-keys/act are unaffected). See PLUGINS.md.",
-                    file=sys.stderr,
-                )
-            plugin_keys = []
-
-        if plugin_keys is None:
-            plugin_keys = []
-        elif isinstance(plugin_keys, str):
-            if plugin_keys:
-                _warn_broken_action_keys(
-                    name, "declared keys must be a list of key strings, not a bare string"
-                )
-            plugin_keys = []
-        else:
-            try:
-                plugin_keys = list(plugin_keys)
-            except TypeError as e:
-                _warn_broken_action_keys(name, e)
-                plugin_keys = []
-            else:
-                if not all(isinstance(key, str) for key in plugin_keys):
-                    _warn_broken_action_keys(
-                        name, "declared keys must be a list of key strings, not a mixed-type list"
-                    )
-                    plugin_keys = []
-
-        for key in plugin_keys:
-            if key not in seen:
-                seen.add(key)
-                declared.append(key)
-
-    universe = list(declared)
-    for key in declared:
-        if key.startswith("alt-"):
-            fallback = key[len("alt-"):].upper()
-            if fallback not in seen:
-                seen.add(fallback)
-                universe.append(fallback)
-    for digit in "123456789":
-        if digit not in seen:
-            seen.add(digit)
-            universe.append(digit)
-    return universe
 
 
 def build_snapshot(items_by_plugin, recently_acted=None):
@@ -878,11 +782,9 @@ def print_rows():
 
 
 def act(key, line):
-    """Dispatch a single fzf --expect key press against the highlighted
-    dashboard row. `key` is the literal --expect token fzf reported
-    (e.g. "alt-o"), or "" if the row was accepted with plain Enter.
-    `line` is the full tab-delimited row text, exactly as fzf's
-    --expect output's second line reports it.
+    """Dispatch a single action against one dashboard row.
+    `key` is the literal action key, or "" when plain Enter selected the
+    row. `line` is the complete tab-delimited row text.
     """
     parts = line.split("\t", 1)
     if len(parts) < 2:
@@ -924,19 +826,22 @@ def act(key, line):
         print(f"Action failed: {e}")
 
 
+def acknowledge_action():
+    try:
+        input("Press Enter to return to the dashboard...")
+    except EOFError:
+        pass
+
 def run_dashboard(refresh_interval=60):
     """The interactive loop: fetch every configured plugin concurrently,
-    republish a fresh recomputed snapshot through a single long-lived
-    fzf process as each plugin's fetch() completes, and dispatch
-    whatever hotkey was pressed against the highlighted row -- looping
-    until Esc or the merged snapshot goes permanently empty.
+    then republish a fresh recomputed snapshot to one long-lived curses
+    presenter as each plugin fetch completes. It dispatches the selected
+    row's action and repeats until Esc or the merged snapshot goes empty.
 
-    All of the progressive-fetch/single-in-flight-round/pending-
-    visibility/selection-tracking behavior lives in
-    dashboard.DashboardController and dashboard.FzfPresenter; this
-    function's job is only to supply the real, config-bound callables
-    (fetch_plugin/build_snapshot/render_rows/act) those two classes
-    were designed to receive as plain injected arguments.
+    The progressive-fetch, single-in-flight-round, pending-visibility,
+    and selection-tracking behavior lives in
+    dashboard.DashboardController and dashboard.CursesPresenter. This
+    function supplies the config-bound callables that those classes need.
     """
     config = load_config()
     groups, group_error = dashboard_groups(config)
@@ -976,22 +881,20 @@ def run_dashboard(refresh_interval=60):
         presenter = dashboard.CursesGroupPresenter([group["name"] for group in groups])
         render_rows = lambda items: render_grouped_dashboard_rows(items, groups)
     else:
-        presenter = dashboard.FzfPresenter()
+        presenter = dashboard.CursesPresenter()
         render_rows = render_dashboard_rows
 
     controller = dashboard.DashboardController(
-        plugin_names, presenter, declared_action_keys(config),
+        plugin_names, presenter,
         fetch_plugin=fetch_plugin,
         build_snapshot=build_snapshot,
         render_rows=render_rows,
         act=act,
+        acknowledge_action=acknowledge_action,
     )
     try:
         found_something = controller.run(refresh_interval)
-    except FileNotFoundError:
-        print("attention: `fzf` is required but was not found on PATH.", file=sys.stderr)
-        sys.exit(1)
-    except (dashboard.PresenterLaunchTimeout, OSError) as e:
+    except (OSError, curses.error) as e:
         print(f"attention: could not start the interactive dashboard: {e}", file=sys.stderr)
         sys.exit(1)
     if not found_something:

@@ -17,17 +17,6 @@ from _util import resolve_configured_actions, run_cmd, run_configured_action, sl
 
 GRAPHQL_URL = "https://api.linear.app/graphql"
 
-ACTION_KEYS = ["alt-o", "alt-c", "alt-t"]
-
-
-def declared_action_keys(config):
-    keys = list(ACTION_KEYS)
-    actions = config.get("linear", {}).get("actions", [])
-    if isinstance(actions, list):
-        for a in actions:
-            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
-                keys.append(a["key"])
-    return keys
 
 
 def _get_token(config):

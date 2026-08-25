@@ -22,17 +22,6 @@ _MAX_WORKERS = 8
 
 _MAX_PR_DETAIL_WORKERS = 32
 
-ACTION_KEYS = ["alt-o", "alt-a", "alt-m", "alt-c", "alt-g"]
-
-
-def declared_action_keys(config):
-    keys = list(ACTION_KEYS)
-    actions = config.get("github", {}).get("actions", [])
-    if isinstance(actions, list):
-        for a in actions:
-            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
-                keys.append(a["key"])
-    return keys
 
 def _body_association_keys(body):
     return [
@@ -433,9 +422,8 @@ def fetch(config):
 
 
 def _confirm_and_merge(item_id, url):
-    """Merge confirmation gate, run after fzf has already exited: a
-    plain input() y/n prompt on the bare terminal rather than a second
-    fzf process.
+    """Merge confirmation gate after the terminal UI has exited.
+    It uses a plain input() y/n prompt on the bare terminal.
     """
     if not url:
         print("No URL.")

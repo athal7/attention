@@ -2,8 +2,8 @@
 
 Prioritized multi-source triage dashboard. Pulls near-term calendar events,
 open reminders, GitHub PRs/issues that need your attention, and open Linear
-issues into one [fzf](https://github.com/junegunn/fzf)-driven list, sorted by
-urgency, with per-item hotkeys to act on a row immediately.
+issues into one terminal UI, sorted by urgency, with per-item hotkeys to act
+on a row immediately.
 
 The core has no source-specific logic at all -- everything above is a
 plugin (see [PLUGINS.md](PLUGINS.md)). Enable, disable, or reorder them
@@ -15,21 +15,26 @@ freely, or write your own and point `attention` at it.
 brew install athal7/tap/attention
 ```
 
-Requires [`fzf`](https://github.com/junegunn/fzf) (installed automatically as
-a dependency). Everything else below is optional, per plugin.
+The dashboard uses Python's built-in curses UI. Everything else below is
+optional, per plugin.
 
 ## Usage
 
-```
-attention             # run the interactive dashboard (default)
-attention list        # print the current prioritized list (fzf's raw input)
-attention expect-keys # print the comma-joined set of hotkeys the dashboard binds
+```sh
+attention             # run the interactive terminal dashboard (default)
+attention list        # print the current prioritized list (tab-delimited)
+attention expect-keys # print the action keys in the current item list
 attention act K LINE  # dispatch a single hotkey press against one dashboard row
 ```
 
 In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
-row without leaving the list. `Esc` quits.
+row. Press Enter after an action to return to the dashboard. `Esc` quits.
+
+Type text to filter visible rows. Use Backspace to edit the filter. A bare
+letter or digit action runs first when the selected row supports it. Otherwise,
+use Up/Down or `j`/`k` to move, `q` to quit, and other printable characters to
+filter. Send `Alt` plus a letter for an `alt-<letter>` action.
 
 Press `⌥w` to mark an item as work in progress. Press it again to clear the mark. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
 
@@ -93,13 +98,12 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 
 ### Dashboard groups
 
-When `dashboard.groups` is configured, `attention` opens a curses overview
-instead of the flat fzf list. It shows the non-empty groups and their current
-item counts; use Up/Down or `j`/`k` to select a group, Enter to open its scoped
-fzf list, and Esc to quit. Esc in a scoped fzf list returns to the overview;
-taking an action (or a background refresh ticking over) reopens the same
-scoped list instead, so you can act on an item or its section repeatedly
-without being bounced back to the overview.
+When `dashboard.groups` is configured, `attention` opens a curses overview.
+It shows the non-empty groups and their current item counts. Use Up/Down or
+`j`/`k` to select a group. Press Enter to open its scoped terminal list. Esc
+in a scoped list returns to the overview. An action or background refresh
+reopens the same group list. This lets you act on an item or section
+repeatedly without returning to the overview.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
@@ -149,7 +153,6 @@ just point `config["plugins"]` at it.
 
 ## Dependencies
 
-- [`fzf`](https://github.com/junegunn/fzf) -- required
 - [`gh`](https://cli.github.com) -- `github` plugin (authenticated)
 - [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
 - [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
