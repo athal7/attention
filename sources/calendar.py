@@ -11,17 +11,6 @@ from pathlib import Path
 
 from _util import copy_to_clipboard, resolve_configured_actions, run_configured_action
 
-ACTION_KEYS = ["alt-y"]
-
-
-def declared_action_keys(config):
-    keys = list(ACTION_KEYS)
-    actions = config.get("calendar", {}).get("actions", [])
-    if isinstance(actions, list):
-        for a in actions:
-            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
-                keys.append(a["key"])
-    return keys
 
 
 def _get_ical_path():

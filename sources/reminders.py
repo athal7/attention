@@ -10,17 +10,6 @@ from datetime import date
 
 from _util import resolve_configured_actions, run_cmd, run_configured_action
 
-ACTION_KEYS = ["alt-x"]
-
-
-def declared_action_keys(config):
-    keys = list(ACTION_KEYS)
-    actions = config.get("reminders", {}).get("actions", [])
-    if isinstance(actions, list):
-        for a in actions:
-            if isinstance(a, dict) and a.get("key") and a["key"] not in keys:
-                keys.append(a["key"])
-    return keys
 
 
 def fetch(config):

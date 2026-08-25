@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regression tests for the `attention` CLI's plugin architecture. Plain
-# bash, no bats. Stubs gh/remindctl/ical/fzf/aoe-cmd/lumen/open/pbcopy so
+# bash, no bats. Stubs gh/remindctl/ical/aoe-cmd/lumen/open/pbcopy so
 # the script runs against fixed fixture data instead of live system
-# state, and writes a JSON config file at a temp $XDG_CONFIG_HOME instead
+# data, and writes a JSON config file at a temp $XDG_CONFIG_HOME instead
 # of touching the real one.
 #
 #   ./test.sh
@@ -82,10 +82,10 @@ class FakePresenter:
         self.stopped = False
         self._results = queue.Queue()
 
-    def launch(self, expect_keys, header):
+    def launch(self):
         with self._lock:
             self.launch_count += 1
-            self.calls.append(('launch', list(expect_keys), header))
+            self.calls.append(('launch',))
             self._cond.notify_all()
 
     def push_snapshot(self, rows, pending):
@@ -767,17 +767,13 @@ config = {
 }
 p._fetch_raw = lambda cfg: [{'number': 42, 'title': 'Fix bug', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/42', 'type': 'review_request'}]
 items = p.fetch(config)
-keys = p.declared_action_keys(config)
-print(','.join(keys))
 print(json.dumps([a['key'] for a in items[0]['actions']]))
 print(json.dumps(items[0]['actions'][5]['payload']['command']))
 ")"
-  check "github declared_action_keys includes configured keys" \
-    "$(sed -n 1p <<<"$gh_out")" "alt-o,alt-a,alt-m,alt-c,alt-g,alt-s,alt-l"
   check "github fetch attaches configured actions" \
-    "$(sed -n 2p <<<"$gh_out")" '["alt-o", "alt-a", "alt-m", "alt-c", "alt-g", "alt-s", "alt-l"]'
+    "$(sed -n 1p <<<"$gh_out")" '["alt-o", "alt-a", "alt-m", "alt-c", "alt-g", "alt-s", "alt-l"]'
   check "github fetch resolves template in configured action command" \
-    "$(sed -n 3p <<<"$gh_out")" '["my-session", "-d", "/tmp/repo/repo", "-n", "fix-bug"]'
+    "$(sed -n 2p <<<"$gh_out")" '["my-session", "-d", "/tmp/repo/repo", "-n", "fix-bug"]'
 }
 test_plugin_configurable_actions
 
@@ -1264,6 +1260,16 @@ except ValueError as e:
     print('err:', e)
 " 2>/dev/null || true)"
   check "detects wrong type for action label" "$err" "err: plugin 'badplugin' returned a malformed item: action 'label' must be of type str, got int"
+
+  err="$(python3 -c "
+$LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'ctrl-o', 'label': 'open'}]}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "rejects action keys that the terminal UI cannot receive" "$err" "err: plugin 'badplugin' returned a malformed item: action 'key' must be alt-<lowercase letter> or one letter/digit"
 
   err="$(python3 -c "
 $LOAD_CORE
@@ -2081,9 +2087,6 @@ test_dashboard_action_hints_wrap_at_footer_width() {
   local out
   out="$(python3 -c "
 $LOAD_CORE
-$LOAD_DASHBOARD
-import shlex
-import subprocess
 import shutil
 
 class DummySize:
@@ -2097,250 +2100,27 @@ actions = [
     {'key': 'alt-c', 'label': 'comment'},
     {'key': 'alt-g', 'label': 'label'},
 ]
-print(repr(m._dashboard_hint_for_actions(actions)))
-cmd = d.build_footer_transform().replace('{4}', shlex.quote(m._dashboard_hint_for_actions(actions)))
-print(repr(subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, check=True).stdout))
+hint = m._dashboard_hint_for_actions(actions)
+print(repr(hint))
+print(hint.split(chr(11)))
 ")"
   check "dashboard action hints use explicit footer lines that fit a 40-column terminal" \
     "$(sed -n 1p <<<"$out")" "'⌥o open  ⌥a approve  ⌥m merge\\x0b⌥c comment  ⌥g label'"
-  check "the fzf footer transform turns each dashboard action-hint line into a visible footer row" \
-    "$(sed -n 2p <<<"$out")" "'⌥o open  ⌥a approve  ⌥m merge\n⌥c comment  ⌥g label\n'"
+  check "the curses presenter receives one footer line per wrapped action-hint line" \
+    "$(sed -n 2p <<<"$out")" "['⌥o open  ⌥a approve  ⌥m merge', '⌥c comment  ⌥g label']"
 }
 test_dashboard_action_hints_wrap_at_footer_width
 
-DECL_KEYS_A_PLUGIN="$WORK/decl_keys_a_plugin.py"
-cat > "$DECL_KEYS_A_PLUGIN" <<'PY'
-ACTION_KEYS = ["alt-o", "alt-b"]
-def fetch(config):
-    raise AssertionError("declared_action_keys() must never call fetch()")
-def act(key, payload):
-    pass
-PY
 
-DECL_KEYS_B_PLUGIN="$WORK/decl_keys_b_plugin.py"
-cat > "$DECL_KEYS_B_PLUGIN" <<'PY'
-def declared_action_keys(config):
-    return ["alt-q"]
-def fetch(config):
-    raise AssertionError("declared_action_keys() must never call fetch()")
-def act(key, payload):
-    pass
-PY
-
-write_config <<JSON
-{"plugins": ["$DECL_KEYS_A_PLUGIN", "$DECL_KEYS_B_PLUGIN"]}
-JSON
-
-test_declared_action_keys_unions_and_expands_fallbacks() {
-  local out
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
-$LOAD_CORE
-print(','.join(m.declared_action_keys(m.load_config())))
-")"
-  check "declared_action_keys(): includes the core WIP key, de-duped plugin keys, uppercase fallbacks, and digit fallbacks without fetch calls" \
-    "$out" "alt-w,alt-o,alt-b,alt-q,W,O,B,Q,1,2,3,4,5,6,7,8,9"
-}
-test_declared_action_keys_unions_and_expands_fallbacks
-
-NO_HOOK_PLUGIN="$WORK/no_hook_plugin.py"
-cat > "$NO_HOOK_PLUGIN" <<'PY'
-def fetch(config):
-    return []
-def act(key, payload):
-    pass
-PY
-
-write_config <<JSON
-{"plugins": ["$NO_HOOK_PLUGIN"]}
-JSON
-
-test_declared_action_keys_missing_hook_warns_once_per_run() {
-  local out warnings keys
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
-import contextlib, io
-$LOAD_CORE
-config = m.load_config()
-buf = io.StringIO()
-with contextlib.redirect_stderr(buf):
-    keys1 = m.declared_action_keys(config)
-    keys2 = m.declared_action_keys(config)
-print(','.join(keys1))
-warnings = buf.getvalue().strip().splitlines()
-print(len(warnings))
-print('$NO_HOOK_PLUGIN' in warnings[0] if warnings else '')
-" 2>&1)"
-  keys="$(sed -n 1p <<<"$out")"
-  warnings="$(sed -n 2p <<<"$out")"
-  check "a plugin with neither ACTION_KEYS nor declared_action_keys() contributes no keys of its own (only the core WIP and digit fallback universe remains)" "$keys" "alt-w,W,1,2,3,4,5,6,7,8,9"
-  check "exactly one stderr warning fires per dashboard run (not per call), regardless of how many times declared_action_keys() runs" "$warnings" "1"
-  check "the warning names the plugin lacking the hook" "$(sed -n 3p <<<"$out")" "True"
-}
-test_declared_action_keys_missing_hook_warns_once_per_run
-
-BROKEN_HOOK_PLUGIN="$WORK/broken_hook_plugin.py"
-cat > "$BROKEN_HOOK_PLUGIN" <<'PY'
-def declared_action_keys(config):
-    return config["generic"]["boom"]
-def fetch(config):
-    return []
-def act(key, payload):
-    pass
-PY
-
-MALFORMED_KEYS_PLUGIN="$WORK/malformed_keys_plugin.py"
-cat > "$MALFORMED_KEYS_PLUGIN" <<'PY'
-ACTION_KEYS = "alt-o"
-def fetch(config):
-    return []
-def act(key, payload):
-    pass
-PY
-
-write_config <<JSON
-{"plugins": ["$BROKEN_HOOK_PLUGIN", "$MALFORMED_KEYS_PLUGIN", "$DECL_KEYS_A_PLUGIN"]}
-JSON
-
-test_declared_action_keys_isolates_broken_plugin_hooks() {
-  local out keys warnings
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
-import contextlib, io
-$LOAD_CORE
-config = m.load_config()
-buf = io.StringIO()
-with contextlib.redirect_stderr(buf):
-    keys = m.declared_action_keys(config)
-print(','.join(keys))
-warnings = buf.getvalue().strip().splitlines()
-print(len(warnings))
-print('$BROKEN_HOOK_PLUGIN' in warnings[0] if len(warnings) > 0 else '')
-print('$MALFORMED_KEYS_PLUGIN' in warnings[1] if len(warnings) > 1 else '')
-" 2>&1)"
-  keys="$(sed -n 1p <<<"$out")"
-  warnings="$(sed -n 2p <<<"$out")"
-  check "a plugin whose declared_action_keys() raises contributes no keys, and a plugin whose ACTION_KEYS is a bare string ('alt-o') also contributes no keys -- neither aborts the dashboard, the core and good plugin keys still land" \
-    "$keys" "alt-w,alt-o,alt-b,W,O,B,1,2,3,4,5,6,7,8,9"
-  check "declared_action_keys() warns exactly once for the raising hook and once for the malformed-string ACTION_KEYS (two isolated plugins, two warnings)" \
-    "$warnings" "2"
-  check "the first warning names the plugin whose hook raised" "$(sed -n 3p <<<"$out")" "True"
-  check "the second warning names the plugin whose ACTION_KEYS was a bare string" "$(sed -n 4p <<<"$out")" "True"
-}
-test_declared_action_keys_isolates_broken_plugin_hooks
-
-MIXED_KEYS_PLUGIN="$WORK/mixed_keys_plugin.py"
-cat > "$MIXED_KEYS_PLUGIN" <<'PY'
-ACTION_KEYS = ["alt-z", 5]
-def fetch(config):
-    return []
-def act(key, payload):
-    pass
-PY
-
-write_config <<JSON
-{"plugins": ["$MIXED_KEYS_PLUGIN", "$DECL_KEYS_A_PLUGIN"]}
-JSON
-
-test_declared_action_keys_rejects_mixed_type_list_and_warns_once() {
-  local out keys1 keys2 warnings
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
-import contextlib, io
-$LOAD_CORE
-config = m.load_config()
-buf = io.StringIO()
-with contextlib.redirect_stderr(buf):
-    keys1 = m.declared_action_keys(config)
-    keys2 = m.declared_action_keys(config)
-print(','.join(keys1))
-print(','.join(keys2))
-warnings = buf.getvalue().strip().splitlines()
-print(len(warnings))
-print('$MIXED_KEYS_PLUGIN' in warnings[0] if len(warnings) > 0 else '')
-" 2>&1)"
-  keys1="$(sed -n 1p <<<"$out")"
-  keys2="$(sed -n 2p <<<"$out")"
-  warnings="$(sed -n 3p <<<"$out")"
-  check "a plugin whose ACTION_KEYS mixes strings with non-strings (['alt-z', 5]) contributes zero keys, not just the non-string entries stripped" \
-    "$keys1" "alt-w,alt-o,alt-b,W,O,B,1,2,3,4,5,6,7,8,9"
-  check "declared_action_keys() is stable across repeated calls for a mixed-type-list plugin" "$keys2" "$keys1"
-  check "a mixed-type ACTION_KEYS list warns exactly once even though declared_action_keys() ran twice" "$warnings" "1"
-  check "the warning names the plugin whose ACTION_KEYS was a mixed-type list" "$(sed -n 4p <<<"$out")" "True"
-}
-test_declared_action_keys_rejects_mixed_type_list_and_warns_once
-
-test_action_keys_constants_match_literal_keys_in_fetch() {
-  local plugin expected actual
-  for plugin in calendar reminders linear github; do
-    expected="$(python3 -c "
-$(load_plugin_py $plugin)
-print(','.join(sorted(p.ACTION_KEYS)))
-")"
-    actual="$(python3 -c "
-import re
-src = open('$REPO_ROOT/sources/${plugin}.py').read()
-print(','.join(sorted(set(re.findall(r'\"key\":\s*\"([^\"]+)\"', src)))))
-")"
-    check "sources/${plugin}.py's ACTION_KEYS matches every literal action key in its source" "$expected" "$actual"
-  done
-}
-test_action_keys_constants_match_literal_keys_in_fetch
-
-test_generic_declared_action_keys_reads_config_only() {
-  local out
-  out="$(python3 -c "
-$(load_plugin_py generic)
-config = {
-    'generic': {
-        'with-actions': {'command': ['irrelevant'], 'actions': [
-            {'key': 'alt-o', 'label': 'open'}, {'key': 'alt-s', 'label': 'session'},
-        ]},
-        'no-actions-key': {'command': ['irrelevant']},
-    },
-}
-print(','.join(p.declared_action_keys(config)))
-")"
-  check "generic.py's declared_action_keys() reads actions[].key straight from config, de-duped, ignoring a provider with no actions key" \
-    "$out" "alt-o,alt-s"
-}
-test_generic_declared_action_keys_reads_config_only
-
-test_generic_declared_action_keys_guards_malformed_config() {
-  local out
-  out="$(python3 -c "
-$(load_plugin_py generic)
-configs = [
-    {'generic': ['not', 'a', 'dict']},
-    {'generic': 'not-even-a-list'},
-    {'generic': {'bad-actions-type': {'command': ['x'], 'actions': 'alt-o'}}},
-    {'generic': {'bad-action-entry': {'command': ['x'], 'actions': ['not-a-dict', {'key': 'alt-s', 'label': 'session'}]}}},
-]
-for config in configs:
-    print(','.join(p.declared_action_keys(config)))
-")"
-  check "declared_action_keys() ignores a non-dict config['generic'] value (list) instead of raising" "$(sed -n 1p <<<"$out")" ""
-  check "declared_action_keys() ignores a non-dict config['generic'] value (string) instead of raising" "$(sed -n 2p <<<"$out")" ""
-  check "declared_action_keys() ignores a provider whose actions value is a string instead of raising" "$(sed -n 3p <<<"$out")" ""
-  check "declared_action_keys() skips a non-dict entry in actions[] but still reads the valid sibling entry" "$(sed -n 4p <<<"$out")" "alt-s"
-}
-test_generic_declared_action_keys_guards_malformed_config
-
-test_plugins_md_documents_declared_key_character_constraints() {
+test_plugins_md_documents_terminal_key_constraints() {
   local body
   body="$(python3 -c "
 src = open('$REPO_ROOT/PLUGINS.md').read()
-start = src.index('### Declaring hotkeys for the interactive dashboard')
-end = src.index('### Item shape', start)
-print(src[start:end])
+print('alt-<lowercase letter>' in src and 'bare letter/digit' in src)
 ")"
-  case "$body" in
-    *"alt-<letter>"*"bare letter/digit"*)
-      case "$body" in
-        *","*":"*"+"*"("*")"*) ok "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint and the exact breaking characters (',', ':', '+', '(', ')')" ;;
-        *) bad "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint and the exact breaking characters (',', ':', '+', '(', ')')" ;;
-      esac
-      ;;
-    *) bad "PLUGINS.md's declared-hotkeys section documents the plain-fzf-key-token constraint (alt-<letter> or a bare letter/digit)" ;;
-  esac
+  check "PLUGINS.md documents terminal action key syntax" "$body" "True"
 }
-test_plugins_md_documents_declared_key_character_constraints
+test_plugins_md_documents_terminal_key_constraints
 
 
 
@@ -2705,20 +2485,20 @@ test_dashboard_module_has_no_forbidden_imports() {
   controller_src="$(python3 -c "
 src = open('$REPO_ROOT/dashboard.py').read()
 start = src.index('class DashboardController:')
-end = src.index('class UnixHTTPConnection(')
+end = src.index('class CursesPresenter:')
 print(src[start:end])
 ")"
   case "$controller_src" in
-    *"subprocess"*) bad "DashboardController itself never references subprocess (only FzfPresenter does)" ;;
-    *) ok "DashboardController itself never references subprocess (only FzfPresenter does)" ;;
+    *"subprocess"*) bad "DashboardController itself never references subprocess" ;;
+    *) ok "DashboardController itself never references subprocess" ;;
   esac
   case "$controller_src" in
-    *"socket"*) bad "DashboardController itself never references socket (only FzfPresenter does)" ;;
-    *) ok "DashboardController itself never references socket (only FzfPresenter does)" ;;
+    *"socket"*) bad "DashboardController itself never references socket" ;;
+    *) ok "DashboardController itself never references socket" ;;
   esac
   case "$controller_src" in
-    *"http.client"*) bad "DashboardController itself never references http.client (only FzfPresenter does)" ;;
-    *) ok "DashboardController itself never references http.client (only FzfPresenter does)" ;;
+    *"http.client"*) bad "DashboardController itself never references http.client" ;;
+    *) ok "DashboardController itself never references http.client" ;;
   esac
   case "$controller_src" in
     *"ThreadPoolExecutor("*) bad "DashboardController no longer uses ThreadPoolExecutor (its non-daemon workers are joined at interpreter shutdown)" ;;
@@ -2738,7 +2518,7 @@ $LOAD_DASHBOARD
 $DASHBOARD_FIXTURES
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, ['alt-o'],
+    ['a', 'b'], presenter,
     fetch_plugin=lambda name: [],
     build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows,
@@ -2746,12 +2526,10 @@ controller = d.DashboardController(
 )
 print(isinstance(controller, d.DashboardController))
 print(controller.plugin_names)
-print(controller.expect_keys)
 ")"
-  check "DashboardController constructs from plugin_names/presenter/expect_keys + injected fetch_plugin/build_snapshot/render_rows/act" \
+  check "DashboardController constructs from plugin_names/presenter + injected fetch_plugin/build_snapshot/render_rows/act" \
     "$(sed -n 1p <<<"$out")" "True"
   check "DashboardController keeps the configured plugin_names" "$(sed -n 2p <<<"$out")" "['a', 'b']"
-  check "DashboardController keeps the fixed expect_keys" "$(sed -n 3p <<<"$out")" "['alt-o']"
 }
 test_dashboard_controller_constructs_from_injected_callables
 
@@ -2761,7 +2539,7 @@ test_fake_presenter_records_ordered_pushes_and_blocks_wait_for_exit() {
 $LOAD_DASHBOARD
 $DASHBOARD_FIXTURES
 presenter = FakePresenter()
-presenter.launch(['alt-o'], 'header')
+presenter.launch()
 presenter.push_snapshot(['row1'], ['b'])
 presenter.push_snapshot(['row1', 'row2'], [])
 print([c[1] for c in presenter.push_calls()])
@@ -2793,7 +2571,7 @@ $DASHBOARD_FIXTURES
 import sys
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['solo'], presenter, [],
+    ['solo'], presenter,
     fetch_plugin=lambda name: [{'status': 'S', 'context': 'c', 'title': 'X', 'details': '', 'weight': 1, 'id': 'x'}],
     build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows,
@@ -2807,7 +2585,7 @@ th.join(timeout=5)
 print('attention_core' not in sys.modules)
 print('attention' not in sys.modules)
 ")"
-  check "a DashboardController built entirely from fakes never imports attention_core, real plugin loading, config, gh, or fzf" \
+  check "a DashboardController built entirely from fakes never imports attention_core, real plugin loading, config, or gh" \
     "$(sed -n 1p <<<"$out")" "True"
   check "a DashboardController built entirely from fakes never imports the attention module itself" \
     "$(sed -n 2p <<<"$out")" "True"
@@ -2832,7 +2610,7 @@ calls = []
 fetch_plugin = gated_fetch_plugin(items_by_name, {'b': gate_b}, calls)
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, [],
+    ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
@@ -2874,14 +2652,13 @@ calls = []
 fetch_plugin = gated_fetch_plugin(items_by_name, {'b': gate_b, 'c': gate_c}, calls)
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b', 'c'], presenter, [],
+    ['a', 'b', 'c'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
 th = threading.Thread(target=controller.run, args=(3600,))
 th.start()
 presenter.wait_for_launch_count(1, timeout=5)
-initial_header = presenter.launch_calls()[0][2]
 presenter.wait_for_push_count(2, timeout=5)
 pending_after_a = presenter.push_calls()[-1][2]
 gate_b.set()
@@ -2892,16 +2669,13 @@ presenter.wait_for_push_count(4, timeout=5)
 pending_after_c = presenter.push_calls()[-1][2]
 presenter.send_result('', '')
 th.join(timeout=5)
-print(initial_header)
 print(pending_after_a)
 print(pending_after_b)
 print(pending_after_c)
 ")"
-  check "initial launch header names every configured provider before any has finished" \
-    "$(sed -n 1p <<<"$out")" "Loading: a, b, c…"
-  check "pending after 'a' finishes names exactly the still-unfinished providers" "$(sed -n 2p <<<"$out")" "['b', 'c']"
-  check "pending after 'b' also finishes shrinks to just the remaining provider" "$(sed -n 3p <<<"$out")" "['c']"
-  check "pending is empty once every provider has finished" "$(sed -n 4p <<<"$out")" "[]"
+  check "pending after 'a' finishes names exactly the still-unfinished providers" "$(sed -n 1p <<<"$out")" "['b', 'c']"
+  check "pending after 'b' also finishes shrinks to just the remaining provider" "$(sed -n 2p <<<"$out")" "['c']"
+  check "pending is empty once every provider has finished" "$(sed -n 3p <<<"$out")" "[]"
 }
 test_pending_provider_visibility_names_exactly_the_unfinished_ones
 
@@ -2919,7 +2693,7 @@ calls = CallLog()
 fetch_plugin = gated_fetch_plugin(items_by_name, {'a': gate_a}, calls)
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, [],
+    ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
@@ -2971,7 +2745,7 @@ fetch_plugin = gated_fetch_plugin(items_by_name, {'b': gate_b}, calls)
 acted = []
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, [],
+    ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=blob_render_rows, act=lambda key, row: acted.append((key, row)),
 )
@@ -3018,7 +2792,7 @@ calls = CallLog()
 fetch_plugin = gated_fetch_plugin(items_by_name, {'a': gate_a}, calls)
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, [],
+    ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
@@ -3063,7 +2837,7 @@ $DASHBOARD_FIXTURES
 fetch_plugin = gated_fetch_plugin({'a': [], 'b': []}, {}, [])
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a', 'b'], presenter, [],
+    ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
@@ -3102,7 +2876,7 @@ def fetch_plugin(name):
 
 presenter = FakePresenter()
 controller = d.DashboardController(
-    ['a'], presenter, [],
+    ['a'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
@@ -3135,1068 +2909,81 @@ test_quit_returns_promptly_and_discards_a_later_gated_completion
 
 # ---------------------------------------------------------------------------
 echo
-echo "== dashboard.py: build_launch_binds() / build_focus_transform() pure helpers =="
+echo "== dashboard.py: curses presenter row handling =="
 
-test_build_launch_binds_one_print_accept_per_key_plus_enter() {
+test_curses_presenter_filters_rows_and_reads_row_actions() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
-print(d.build_launch_binds(['alt-o', 'alt-s', 'O']))
+rows = [
+    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'alt-o,O' + chr(9) + '⌥o open' + chr(11) + 'O merge',
+    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'alt-s' + chr(9) + '⌥s session',
+]
+print(d.CursesPresenter._matching_rows(rows, 'fix bug') == [rows[0]])
+print(d.CursesPresenter._matching_rows(rows, 'release') == [rows[1]])
+print(d.CursesPresenter._action_keys(rows[0]))
+print(d.CursesPresenter._hint_lines(rows[0]))
 ")"
-  check "build_launch_binds() returns KEY:print(KEY)+accept per declared key, plus enter:print()+accept last" \
-    "$out" "['alt-o:print(alt-o)+accept', 'alt-s:print(alt-s)+accept', 'O:print(O)+accept', 'enter:print()+accept']"
+  check "curses presenter filters each visible row by every filter term" "$(sed -n 1p <<<"$out")" "True"
+  check "curses presenter matches another row by its visible text" "$(sed -n 2p <<<"$out")" "True"
+  check "curses presenter reads only the selected row's action keys" "$(sed -n 3p <<<"$out")" "['alt-o', 'O']"
+  check "curses presenter splits wrapped action hints into footer lines" \
+    "$(sed -n 4p <<<"$out")" "['⌥o open', 'O merge']"
 }
-test_build_launch_binds_one_print_accept_per_key_plus_enter
+test_curses_presenter_filters_rows_and_reads_row_actions
 
-test_build_focus_transform_unbind_then_rebind_from_field3() {
+test_curses_presenter_dispatches_filtered_and_alt_actions() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
-print(repr(d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])))
-")"
-  check "build_focus_transform() emits a shell snippet unbinding the whole universe then rebinding only {3}'s keys when {3} is non-empty" \
-    "$out" "'k={3}; if [ -z \"\$k\" ]; then printf \"unbind(alt-o,alt-s,O,S,1)\"; else printf \"unbind(alt-o,alt-s,O,S,1)+rebind(%s)\" \"\$k\"; fi'"
-}
-test_build_focus_transform_unbind_then_rebind_from_field3
+import time
 
-test_build_focus_transform_emits_unbind_only_when_row_has_no_keys() {
-  local out
-  out="$(python3 -c "
-$LOAD_DASHBOARD
-import shlex, subprocess
-
-cmd = d.build_focus_transform(['alt-o', 'alt-s', 'O', 'S', '1'])
-
-def run_for_field3(value):
-    substituted = cmd.replace('{3}', shlex.quote(value))
-    return subprocess.run(['sh', '-c', substituted], capture_output=True, text=True, check=True).stdout
-
-print(repr(run_for_field3('alt-o,O')))
-print(repr(run_for_field3('')))
-")"
-  check "a row with keys in field 3 gets unbind(universe)+rebind(that row's keys)" \
-    "$(sed -n 1p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)+rebind(alt-o,O)'"
-  check "a row with no keys in field 3 gets unbind(universe) only -- never an empty rebind() fzf would reject, so the previous row's binding cannot persist" \
-    "$(sed -n 2p <<<"$out")" "'unbind(alt-o,alt-s,O,S,1)'"
-}
-test_build_focus_transform_emits_unbind_only_when_row_has_no_keys
-
-test_build_focus_transform_no_shell_breaking_chars_for_any_declarable_key() {
-  local out
-  out="$(python3 -c "
-$LOAD_DASHBOARD
-universe = ['alt-o', 'alt-b', 'alt-q', 'O', 'B', 'Q'] + list('123456789')
-cmd = d.build_focus_transform(universe)
-binds = d.build_launch_binds(universe)
-universe_csv = ','.join(universe)
-print(all(c not in universe_csv for c in ['\`', '\$', ';', '|', '&', chr(39)]))
-print(universe_csv in cmd)
-print(all(':' in b and '(' not in b.split(':', 1)[0] for b in binds[:-1]))
-")"
-  check "the key-derived universe CSV embedded in build_focus_transform()'s command contains no shell-breaking characters for any key declared_action_keys() can produce" \
-    "$(sed -n 1p <<<"$out")" "True"
-  check "that clean universe CSV is embedded verbatim in the command (no extra escaping mangles it)" \
-    "$(sed -n 2p <<<"$out")" "True"
-  check "build_launch_binds() keys are plain KEY:action tokens (no stray characters before the colon)" \
-    "$(sed -n 3p <<<"$out")" "True"
-}
-test_build_focus_transform_no_shell_breaking_chars_for_any_declarable_key
-
-# ---------------------------------------------------------------------------
-echo
-echo "== dashboard.py: real fzf pty smoke test -- row-scoped hotkeys (task 5.3) =="
-
-PTY_TEST_PY="
-$LOAD_DASHBOARD
-import fcntl, json, os, pty, shutil, struct, tempfile, termios, threading, time
-
-UNIVERSE = ['alt-o', 'alt-s', 'O', 'S', '1', '2']
-ROWS_TEXT = 'row1' + chr(9) + 'blob1' + chr(9) + 'alt-o,O' + chr(9) + 'hint1' + chr(10) + 'row2' + chr(9) + 'blob2' + chr(9) + 'alt-s,1' + chr(9) + 'hint2'
-RELOADED_ROWS_TEXT = 'new-first' + chr(9) + 'blob3' + chr(9) + 'alt-o,O' + chr(9) + 'hint3' + chr(10) + 'row2' + chr(9) + 'blob2' + chr(9) + 'alt-s,1' + chr(9) + 'hint2'
-ROW1_LINE = ROWS_TEXT.split(chr(10))[0]
-ROW2_LINE = ROWS_TEXT.split(chr(10))[1]
-RELOADED_ROW1_LINE = RELOADED_ROWS_TEXT.split(chr(10))[0]
-
-
-def spawn_session():
-    tmpdir = tempfile.mkdtemp(prefix='attention-test-pty-')
-    sock_path = os.path.join(tmpdir, 'fzf.sock')
-    rows_path = os.path.join(tmpdir, 'rows.tsv')
-    with open(rows_path, 'w') as f:
-        f.write(ROWS_TEXT)
-    master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
-    out_r, out_w = os.pipe()
-    args = ['fzf', '--ansi', '--layout=reverse', '--height', '10', '-d', chr(9),
-            '--with-nth', '1', '--listen', sock_path, '--footer-border=line']
-    for b in d.build_launch_binds(UNIVERSE):
-        args += ['--bind', b]
-    args += ['--bind', 'start,focus:transform[' + d.build_focus_transform(UNIVERSE) + ']']
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.setsid()
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            os.close(master_fd)
-            os.close(out_r)
-            devnull = os.open(os.devnull, os.O_RDONLY)
-            os.dup2(devnull, 0)
-            os.dup2(out_w, 1)
-            os.dup2(slave_fd, 2)
-            for fd in (devnull, out_w, slave_fd):
-                if fd > 2:
-                    os.close(fd)
-            os.execvp('fzf', args)
-        finally:
-            os._exit(127)
-    os.close(slave_fd)
-    os.close(out_w)
-    stop = threading.Event()
-
-    def drain():
-        buf = b''
-        while not stop.is_set():
-            try:
-                chunk = os.read(master_fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            if b'\x1b[6n' in buf:
-                try:
-                    os.write(master_fd, b'\x1b[24;1R')
-                except OSError:
-                    break
-                buf = b''
-
-    thread = threading.Thread(target=drain, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 5
-    while not os.path.exists(sock_path) and time.monotonic() < deadline:
-        time.sleep(0.02)
-    reload_body = ('reload[cat ' + chr(34) + rows_path + chr(34) + ']+first').encode()
-    d.unix_request(sock_path, 'POST', '/', body=reload_body)
-    return {'pid': pid, 'master_fd': master_fd, 'out_r': out_r, 'sock_path': sock_path,
-            'tmpdir': tmpdir, 'stop': stop, 'thread': thread}
-
-
-def wait_for_state(session, predicate, timeout=5):
-    deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
-        status, body = d.unix_request(session['sock_path'], 'GET', '/')
-        if status == 200:
-            last = json.loads(body)
-            if predicate(last):
-                return last
-        time.sleep(0.1)
-    return last
-
-
-def still_running(session):
-    try:
-        return os.waitpid(session['pid'], os.WNOHANG) == (0, 0)
-    except ChildProcessError:
-        return False
-
-
-def wait_exit(session, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        pid_done, status = os.waitpid(session['pid'], os.WNOHANG)
-        if pid_done != 0:
-            return status
-        time.sleep(0.05)
-    return None
-
-
-def read_output(session):
-    session['stop'].set()
-    try:
-        os.close(session['master_fd'])
-    except OSError:
+class FakeScreen:
+    def __init__(self, keys):
+        self.keys = list(keys)
+    def keypad(self, value):
         pass
-    chunks = []
-    while True:
-        try:
-            chunk = os.read(session['out_r'], 65536)
-        except OSError:
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b''.join(chunks).decode()
-
-
-def cleanup(session):
-    session['stop'].set()
-    if still_running(session):
-        try:
-            os.kill(session['pid'], 9)
-            os.waitpid(session['pid'], 0)
-        except OSError:
-            pass
-    for key in ('master_fd', 'out_r'):
-        try:
-            os.close(session[key])
-        except OSError:
-            pass
-    shutil.rmtree(session['tmpdir'], ignore_errors=True)
-
-
-results = []
-
-session = spawn_session()
-state = wait_for_state(session, lambda s: s.get('totalCount') == 2)
-results.append(state is not None and state['current']['index'] == 0)
-
-os.write(session['master_fd'], b'S')
-state = wait_for_state(session, lambda s: s.get('query') == 'S')
-results.append(state is not None and state.get('query') == 'S')
-results.append(still_running(session))
-
-os.write(session['master_fd'], b'1')
-state = wait_for_state(session, lambda s: s.get('query') == 'S1')
-results.append(state is not None and state.get('query') == 'S1')
-results.append(still_running(session))
-
-os.write(session['master_fd'], b'\x7f\x7f')
-wait_for_state(session, lambda s: s.get('query') == '' and s.get('matchCount') == 2 and not s.get('reading'))
-
-os.write(session['master_fd'], b'O')
-results.append(wait_exit(session, timeout=5) is not None)
-results.append(read_output(session) == 'O' + chr(10) + ROW1_LINE + chr(10))
-cleanup(session)
-
-session2 = spawn_session()
-wait_for_state(session2, lambda s: s.get('totalCount') == 2)
-os.write(session2['master_fd'], b'\x0e')
-state = wait_for_state(session2, lambda s: s.get('current') and s['current']['index'] == 1)
-results.append(state is not None and state['current']['index'] == 1)
-
-os.write(session2['master_fd'], b'1')
-results.append(wait_exit(session2, timeout=5) is not None)
-results.append(read_output(session2) == '1' + chr(10) + ROW2_LINE + chr(10))
-cleanup(session2)
-
-session3 = spawn_session()
-wait_for_state(session3, lambda s: s.get('totalCount') == 2)
-os.write(session3['master_fd'], b'\x0e')
-wait_for_state(session3, lambda s: s.get('current') and s['current']['index'] == 1)
-reloaded_rows_path = os.path.join(session3['tmpdir'], 'reloaded-rows.tsv')
-with open(reloaded_rows_path, 'w') as f:
-    f.write(RELOADED_ROWS_TEXT)
-reload_body = ('reload[cat ' + chr(34) + reloaded_rows_path + chr(34) + ']+first').encode()
-d.unix_request(session3['sock_path'], 'POST', '/', body=reload_body)
-state = wait_for_state(
-    session3,
-    lambda s: s.get('current') and s['current']['index'] == 0 and
-    s['current']['text'] == RELOADED_ROW1_LINE,
-)
-results.append(state is not None and state['current']['index'] == 0 and state['current']['text'] == RELOADED_ROW1_LINE)
-cleanup(session3)
-
-for r in results:
-    print(r)
-"
-
-test_real_pty_row_scoped_hotkeys() {
-  local out
-  out="$(python3 -c "$PTY_TEST_PY")"
-  check "row 1 is focused immediately after the initial reload (index 0)" "$(sed -n 1p <<<"$out")" "True"
-  check "a universe key absent from the focused row's CSV (S) appends to the query instead of exiting" "$(sed -n 2p <<<"$out")" "True"
-  check "fzf is still running after typing the unbound key S" "$(sed -n 3p <<<"$out")" "True"
-  check "a second universe key absent from the focused row's CSV (1) also appends to the query instead of exiting" "$(sed -n 4p <<<"$out")" "True"
-  check "fzf is still running after typing the unbound key 1" "$(sed -n 5p <<<"$out")" "True"
-  check "a universe key present on the focused row's CSV (O) exits fzf" "$(sed -n 6p <<<"$out")" "True"
-  check "the exit output is exactly KEY\\n<row 1's line>" "$(sed -n 7p <<<"$out")" "True"
-  check "moving focus to row 2 updates the --listen state's current index" "$(sed -n 8p <<<"$out")" "True"
-  check "the key inert on row 1 (1) exits fzf once focus moves to row 2, where it is bound" "$(sed -n 9p <<<"$out")" "True"
-  check "the row-2 exit output is exactly KEY\\n<row 2's line>" "$(sed -n 10p <<<"$out")" "True"
-  check "a snapshot reload resets focus to its newly first row" "$(sed -n 11p <<<"$out")" "True"
-}
-
-if command -v fzf >/dev/null 2>&1; then
-  test_real_pty_row_scoped_hotkeys
-else
-  skip "test_real_pty_row_scoped_hotkeys (fzf not on PATH)"
-fi
-
-# ---------------------------------------------------------------------------
-echo
-echo "== dashboard.py: UnixHTTPConnection / unix_request() over a stdlib AF_UNIX server (task 6.1) =="
-
-test_unix_request_get_post_framing_against_stdlib_server() {
-  local out
-  out="$(python3 -c "
-$LOAD_DASHBOARD
-import http.server, os, shutil, socketserver, tempfile, threading
-
-received = []
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b'{' + chr(34).encode() + b'ok' + chr(34).encode() + b': true}'
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        received.append(self.rfile.read(length))
-        self.send_response(200)
-        self.send_header('Content-Length', '0')
-        self.end_headers()
-
-    def log_message(self, *a):
+    def timeout(self, value):
         pass
+    def getmaxyx(self):
+        return (24, 80)
+    def erase(self):
+        pass
+    def addnstr(self, *args):
+        pass
+    def refresh(self):
+        pass
+    def getch(self):
+        return self.keys.pop(0) if self.keys else -1
 
-
-tmpdir = tempfile.mkdtemp(prefix='attention-test-unixhttp-')
-sock_path = os.path.join(tmpdir, 'test.sock')
-server = socketserver.UnixStreamServer(sock_path, Handler)
-thread = threading.Thread(target=server.serve_forever, daemon=True)
-thread.start()
-
-status, body = d.unix_request(sock_path, 'GET', '/')
-print(status)
-print(body.decode())
-
-post_body = b'reload[cat ' + chr(34).encode() + b'/tmp/x' + chr(34).encode() + b']+change-header:hi'
-status2, body2 = d.unix_request(sock_path, 'POST', '/', body=post_body)
-print(status2)
-print(received[-1] == post_body)
-
-server.shutdown()
-server.server_close()
-thread.join(timeout=5)
-shutil.rmtree(tmpdir, ignore_errors=True)
+rows = [
+    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'alt-o' + chr(9) + '⌥o open',
+    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'O' + chr(9) + 'O merge',
+]
+filtered = d.CursesPresenter()
+filtered.launch()
+filtered.push_snapshot(rows, [])
+filtered_result = filtered._run(FakeScreen([*(ord(c) for c in 'review'), 10]), time.monotonic() + 1)
+alt = d.CursesPresenter()
+alt.launch()
+alt.push_snapshot(rows, [])
+alt_result = alt._run(FakeScreen([27, ord('o')]), time.monotonic() + 1)
+bare_results = []
+for key in ('q', 'j', 'k'):
+    row = 'Bare ' + key + chr(9) + 'blob' + chr(9) + key + chr(9) + key + ' action'
+    bare = d.CursesPresenter()
+    bare.launch()
+    bare.push_snapshot([row], [])
+    bare_results.append(bare._run(FakeScreen([ord(key)]), time.monotonic() + 1) == d.PresenterResult(key, row))
+print(filtered_result == d.PresenterResult('', rows[1]))
+print(alt_result == d.PresenterResult('alt-o', rows[0]))
+print(all(bare_results))
 ")"
-  check "GET / over a Unix domain socket returns the server's status" "$(sed -n 1p <<<"$out")" "200"
-  check "GET / over a Unix domain socket returns the server's body intact" "$(sed -n 2p <<<"$out")" "{\"ok\": true}"
-  check "POST / over a Unix domain socket returns the server's status" "$(sed -n 3p <<<"$out")" "200"
-  check "POST / over a Unix domain socket transmits the exact request body the server received" "$(sed -n 4p <<<"$out")" "True"
+  check "curses presenter filters before Enter selects the filtered row" "$(sed -n 1p <<<"$out")" "True"
+  check "curses presenter maps an Escape-prefixed letter to its alt action" "$(sed -n 2p <<<"$out")" "True"
+  check "curses presenter dispatches bare q, j, and k actions before controls" "$(sed -n 3p <<<"$out")" "True"
 }
-test_unix_request_get_post_framing_against_stdlib_server
-
-# ---------------------------------------------------------------------------
-echo
-echo "== dashboard.py: FzfPresenter -- real fzf lifecycle over --listen (tasks 6.2-6.4) =="
-
-FZF_PRESENTER_TEST_PY="
-$LOAD_DASHBOARD
-import fcntl, json, os, pty, struct, termios, threading, time
-
-
-def run_in_pty_session(child_main):
-    master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
-    result_r, result_w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.setsid()
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            os.close(master_fd)
-            os.close(result_r)
-            try:
-                payload = json.dumps(child_main()).encode()
-            except Exception as e:
-                payload = json.dumps({'error': repr(e)}).encode()
-            os.write(result_w, payload)
-        finally:
-            os.close(result_w)
-            os._exit(0)
-    os.close(slave_fd)
-    os.close(result_w)
-    stop = threading.Event()
-
-    def drain():
-        buf = b''
-        while not stop.is_set():
-            try:
-                chunk = os.read(master_fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            if b'\x1b[6n' in buf:
-                try:
-                    os.write(master_fd, b'\x1b[24;1R')
-                except OSError:
-                    break
-                buf = b''
-
-    thread = threading.Thread(target=drain, daemon=True)
-    thread.start()
-    chunks = []
-    while True:
-        chunk = os.read(result_r, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    os.close(result_r)
-    stop.set()
-    try:
-        os.close(master_fd)
-    except OSError:
-        pass
-    os.waitpid(pid, 0)
-    data = b''.join(chunks)
-    return json.loads(data) if data else {'error': 'no result'}
-
-
-def wait_for_state(presenter, predicate, timeout=5):
-    deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
-        status, body = d.unix_request(presenter._sock_path, 'GET', '/')
-        if status == 200:
-            last = json.loads(body)
-            if predicate(last):
-                return last
-        time.sleep(0.1)
-    return last
-
-
-def child_launch_push_stop():
-    presenter = d.FzfPresenter()
-    presenter.launch(['alt-o'], 'Loading: gh…')
-    sock_path, tmpdir, proc = presenter._sock_path, presenter._tmpdir, presenter._proc
-    sock_exists = os.path.exists(sock_path)
-    proc_running = proc.poll() is None
-    no_expect_flag = '--expect' not in proc.args
-    has_no_tracking_flags = '--track' not in proc.args and '--id-nth' not in proc.args
-
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], ['gh'])
-    state1 = wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
-    first_push_reflected = state1 is not None and [m['text'] for m in state1['matches']] == [
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
-    ]
-
-    presenter.push_snapshot([
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
-        'rowB' + chr(9) + 'blobB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
-    ], [])
-    state2 = wait_for_state(presenter, lambda s: s.get('totalCount') == 2)
-    second_push_replaces = state2 is not None and [m['text'] for m in state2['matches']] == [
-        'rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA',
-        'rowB' + chr(9) + 'blobB' + chr(9) + 'alt-o' + chr(9) + 'hintB',
-    ]
-
-    presenter.stop()
-    return {
-        'sock_exists_after_launch': sock_exists,
-        'proc_running_after_launch': proc_running,
-        'launch_has_no_expect_flag': no_expect_flag,
-        'launch_has_no_tracking_flags': has_no_tracking_flags,
-        'first_push_reflected': first_push_reflected,
-        'second_push_replaces_not_appends': second_push_replaces,
-        'proc_exited_after_stop': proc.poll() is not None,
-        'tmpdir_removed_after_stop': not os.path.exists(tmpdir),
-    }
-
-
-def child_wait_for_exit_timeout_escalates():
-    presenter = d.FzfPresenter()
-    presenter.launch(['alt-o'], 'header')
-    tmpdir, proc = presenter._tmpdir, presenter._proc
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
-    wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
-
-    start = time.monotonic()
-    result = presenter.wait_for_exit(0.5)
-    elapsed = time.monotonic() - start
-    return {
-        'timeout_returns_none_key': result.key is None,
-        'elapsed_bounded_by_the_requested_timeout': elapsed < 5,
-        'proc_terminated_after_timeout_escalation': proc.poll() is not None,
-        'tmpdir_removed_after_timeout': not os.path.exists(tmpdir),
-        'presenter_state_cleared_after_timeout': (
-            presenter._proc is None and presenter._tmpdir is None and
-            presenter._sock_path is None and presenter._snapshot_path is None
-        ),
-    }
-
-
-def child_stop_after_process_already_exited():
-    presenter = d.FzfPresenter()
-    presenter.launch(['alt-o'], 'header')
-    tmpdir, proc, sock_path = presenter._tmpdir, presenter._proc, presenter._sock_path
-    presenter.push_snapshot(['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [])
-    wait_for_state(presenter, lambda s: s.get('totalCount') == 1)
-    d.unix_request(sock_path, 'POST', '/', body=b'abort', timeout=2)
-    presenter.wait_for_exit(5)
-
-    stop_raised = False
-    try:
-        presenter.stop()
-    except Exception:
-        stop_raised = True
-    return {
-        'process_already_exited_before_stop': proc.poll() is not None,
-        'stop_after_already_exited_does_not_raise': not stop_raised,
-        'tmpdir_still_removed': not os.path.exists(tmpdir),
-    }
-
-
-def child_push_snapshot_survives_teardown_race():
-    presenter = d.FzfPresenter()
-    presenter.launch(['alt-o'], 'header')
-
-    reached = threading.Event()
-    release = threading.Event()
-    original_mkstemp = d.tempfile.mkstemp
-
-    def gated_mkstemp(*args, **kwargs):
-        reached.set()
-        release.wait(timeout=5)
-        return original_mkstemp(*args, **kwargs)
-
-    d.tempfile.mkstemp = gated_mkstemp
-    push_raised = []
-
-    def call_push():
-        try:
-            presenter.push_snapshot(
-                ['rowA' + chr(9) + 'blobA' + chr(9) + 'alt-o' + chr(9) + 'hintA'], [],
-            )
-        except Exception as e:
-            push_raised.append(repr(e))
-
-    # Deterministic barrier/event race, no wall-clock sleeps: push_snapshot
-    # reads the (still-live) tmpdir/sock_path under its own lock, then blocks
-    # right before its real mkstemp call via the gate below. Only once it's
-    # gated do we run wait_for_exit()'s timeout path on a second thread --
-    # the exact concurrent teardown FzfPresenter must survive -- and only
-    # after that full teardown completes do we release the gate, so the
-    # real mkstemp() runs against a directory wait_for_exit has already
-    # removed.
-    push_thread = threading.Thread(target=call_push)
-    push_thread.start()
-    reached.wait(timeout=5)
-
-    timeout_thread = threading.Thread(target=presenter.wait_for_exit, args=(0.1,))
-    timeout_thread.start()
-    timeout_thread.join(timeout=5)
-
-    release.set()
-    push_thread.join(timeout=5)
-    d.tempfile.mkstemp = original_mkstemp
-
-    return {
-        'push_snapshot_did_not_raise_into_removed_tmpdir': push_raised == [],
-        'push_thread_finished': not push_thread.is_alive(),
-        'presenter_state_cleared_after_race': (
-            presenter._proc is None and presenter._tmpdir is None and
-            presenter._sock_path is None and presenter._snapshot_path is None
-        ),
-    }
-
-
-r1 = run_in_pty_session(child_launch_push_stop)
-r2 = run_in_pty_session(child_wait_for_exit_timeout_escalates)
-r3 = run_in_pty_session(child_stop_after_process_already_exited)
-r4 = run_in_pty_session(child_push_snapshot_survives_teardown_race)
-for key in (
-    'sock_exists_after_launch', 'proc_running_after_launch', 'launch_has_no_expect_flag',
-    'launch_has_no_tracking_flags', 'first_push_reflected', 'second_push_replaces_not_appends',
-    'proc_exited_after_stop', 'tmpdir_removed_after_stop',
-):
-    print(r1.get(key))
-for key in (
-    'timeout_returns_none_key', 'elapsed_bounded_by_the_requested_timeout',
-    'proc_terminated_after_timeout_escalation', 'tmpdir_removed_after_timeout',
-    'presenter_state_cleared_after_timeout',
-):
-    print(r2.get(key))
-for key in (
-    'process_already_exited_before_stop', 'stop_after_already_exited_does_not_raise', 'tmpdir_still_removed',
-):
-    print(r3.get(key))
-for key in (
-    'push_snapshot_did_not_raise_into_removed_tmpdir', 'push_thread_finished',
-    'presenter_state_cleared_after_race',
-):
-    print(r4.get(key))
-"
-
-test_fzf_presenter_real_lifecycle() {
-  local out
-  out="$(python3 -c "$FZF_PRESENTER_TEST_PY")"
-  check "FzfPresenter.launch() waits for the --listen socket to exist before returning" "$(sed -n 1p <<<"$out")" "True"
-  check "FzfPresenter.launch() leaves a live fzf process running" "$(sed -n 2p <<<"$out")" "True"
-  check "FzfPresenter.launch() never passes --expect" "$(sed -n 3p <<<"$out")" "True"
-  check "FzfPresenter.launch() omits selection-tracking flags" "$(sed -n 4p <<<"$out")" "True"
-  check "FzfPresenter.push_snapshot() reload is reflected in the --listen state" "$(sed -n 5p <<<"$out")" "True"
-  check "a second push_snapshot() replaces the list rather than appending to it" "$(sed -n 6p <<<"$out")" "True"
-  check "FzfPresenter.stop() terminates the still-running fzf process" "$(sed -n 7p <<<"$out")" "True"
-  check "FzfPresenter.stop() removes the per-session temp directory" "$(sed -n 8p <<<"$out")" "True"
-  check "FzfPresenter.wait_for_exit(timeout) on an idle presenter returns key=None on timeout" "$(sed -n 9p <<<"$out")" "True"
-  check "wait_for_exit()'s timeout escalation returns within the requested bound, not the full session" "$(sed -n 10p <<<"$out")" "True"
-  check "wait_for_exit()'s timeout escalation (SIGTERM-then-kill) actually terminates the process" "$(sed -n 11p <<<"$out")" "True"
-  check "wait_for_exit()'s timeout escalation removes the per-session temp directory" "$(sed -n 12p <<<"$out")" "True"
-  check "wait_for_exit()'s timeout escalation clears _proc/_tmpdir/_sock_path/_snapshot_path (no stale presenter state)" "$(sed -n 13p <<<"$out")" "True"
-  check "the process has already exited (via abort) before stop() is called" "$(sed -n 14p <<<"$out")" "True"
-  check "stop() called after the process already exited is a safe no-op" "$(sed -n 15p <<<"$out")" "True"
-  check "stop() still removes the temp directory when the process had already exited" "$(sed -n 16p <<<"$out")" "True"
-  check "push_snapshot() racing wait_for_exit()'s timeout teardown never raises into a removed tmpdir (no plugin-thread traceback)" "$(sed -n 17p <<<"$out")" "True"
-  check "the racing push_snapshot() thread returns cleanly (never hangs)" "$(sed -n 18p <<<"$out")" "True"
-  check "presenter state stays fully cleared after the race, not left stale for a later push" "$(sed -n 19p <<<"$out")" "True"
-}
-
-if command -v fzf >/dev/null 2>&1; then
-  test_fzf_presenter_real_lifecycle
-else
-  skip "test_fzf_presenter_real_lifecycle (fzf not on PATH)"
-fi
-
-# ---------------------------------------------------------------------------
-echo
-echo "== dashboard.py: FzfPresenter.launch() readiness-timeout raise + cleanup (no fzf required) =="
-
-FAKE_FZF_BIN="$WORK/bin-fake-fzf"
-mkdir -p "$FAKE_FZF_BIN"
-FAKE_FZF_PIDFILE="$WORK/fake-fzf-nonlistening.pid"
-cat > "$FAKE_FZF_BIN/fzf" <<STUB
-#!/usr/bin/env python3
-import os, time
-with open("$FAKE_FZF_PIDFILE", "w") as f:
-    f.write(str(os.getpid()))
-    f.flush()
-time.sleep(60)
-STUB
-chmod +x "$FAKE_FZF_BIN/fzf"
-
-test_fzf_presenter_launch_readiness_timeout_raises_and_cleans_up() {
-  local out
-  rm -f "$FAKE_FZF_PIDFILE"
-  out="$(PATH="$FAKE_FZF_BIN:$PATH" python3 -c "
-$LOAD_DASHBOARD
-import os, time
-
-presenter = d.FzfPresenter()
-raised_type = None
-try:
-    presenter.launch(['alt-o'], 'header', timeout=0.2)
-except Exception as e:
-    raised_type = type(e).__name__
-
-deadline = time.monotonic() + 5
-pid = None
-while time.monotonic() < deadline and pid is None:
-    if os.path.exists('$FAKE_FZF_PIDFILE'):
-        pid = int(open('$FAKE_FZF_PIDFILE').read())
-    else:
-        time.sleep(0.02)
-
-reaped = False
-if pid is not None:
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            reaped = True
-            break
-        time.sleep(0.02)
-
-print(raised_type)
-print(presenter._proc is None)
-print(presenter._tmpdir is None)
-print(pid is not None)
-print(reaped)
-")"
-  check "launch() raises PresenterLaunchTimeout when fzf never creates its --listen socket within the readiness timeout" \
-    "$(sed -n 1p <<<"$out")" "PresenterLaunchTimeout"
-  check "launch() never adopts the process/tmpdir it's about to raise past (no live presenter state left behind)" \
-    "$(sed -n 2p <<<"$out")" "True"
-  check "launch() never adopts the process/tmpdir it's about to raise past (no live presenter state left behind) (tmpdir)" \
-    "$(sed -n 3p <<<"$out")" "True"
-  check "the never-ready fzf process actually started (proving the next check is a real reap, not a no-op)" \
-    "$(sed -n 4p <<<"$out")" "True"
-  check "launch() terminates and reaps the never-ready fzf process instead of leaving it running" \
-    "$(sed -n 5p <<<"$out")" "True"
-}
-test_fzf_presenter_launch_readiness_timeout_raises_and_cleans_up
-
-# ---------------------------------------------------------------------------
-echo
-echo "== dashboard.py: FzfPresenter.push_snapshot() keeps at most one live snapshot file =="
-
-test_fzf_presenter_push_snapshot_bounds_temp_files_to_one() {
-  local out
-  out="$(python3 -c "
-$LOAD_DASHBOARD
-import http.server, os, socketserver, tempfile, threading
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        self.rfile.read(length)
-        self.send_response(200)
-        self.send_header('Content-Length', '0')
-        self.end_headers()
-
-    def log_message(self, *a):
-        pass
-
-
-tmpdir = tempfile.mkdtemp(prefix='attention-test-snapshot-bound-')
-sock_path = os.path.join(tmpdir, 'test.sock')
-server = socketserver.UnixStreamServer(sock_path, Handler)
-thread = threading.Thread(target=server.serve_forever, daemon=True)
-thread.start()
-
-presenter = d.FzfPresenter()
-with presenter._lock:
-    presenter._tmpdir = tmpdir
-    presenter._sock_path = sock_path
-
-counts = []
-for i in range(5):
-    presenter.push_snapshot([f'row{i}'], [])
-    counts.append(len([p for p in os.listdir(tmpdir) if p.startswith('snapshot-')]))
-
-presenter.stop()
-snapshot_path_reset = presenter._snapshot_path is None
-tmpdir_removed = not os.path.exists(tmpdir)
-
-server.shutdown()
-server.server_close()
-thread.join(timeout=5)
-
-print(max(counts))
-print(counts[-1])
-print(snapshot_path_reset)
-print(tmpdir_removed)
-")"
-  check "at no point across 5 successive push_snapshot() calls do more than 1 snapshot-*.tsv files exist at once" \
-    "$(sed -n 1p <<<"$out")" "1"
-  check "exactly 1 snapshot file remains live after the 5th push (the one fzf is currently reading)" \
-    "$(sed -n 2p <<<"$out")" "1"
-  check "stop() resets the tracked current-snapshot path" "$(sed -n 3p <<<"$out")" "True"
-  check "stop() removes the per-session temp directory (and whatever snapshot file was still in it)" \
-    "$(sed -n 4p <<<"$out")" "True"
-}
-test_fzf_presenter_push_snapshot_bounds_temp_files_to_one
-
-SIMPLE_DASH_PLUGIN="$WORK/simple_dash_plugin.py"
-cat > "$SIMPLE_DASH_PLUGIN" <<'PY'
-def fetch(config):
-    return []
-def act(key, payload):
-    pass
-PY
-
-write_config <<JSON
-{"plugins": ["$SIMPLE_DASH_PLUGIN"]}
-JSON
-
-test_run_dashboard_handles_presenter_launch_timeout_and_oserror() {
-  local out
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" python3 -c "
-import contextlib, io
-$LOAD_CORE
-
-class RaisingController:
-    def __init__(self, *args, **kwargs):
-        pass
-    def run(self, refresh_interval=60):
-        raise RaisingController.exc
-
-for exc, label in (
-    (m.dashboard.PresenterLaunchTimeout('fzf never created its --listen socket at /tmp/x within 5s'), 'timeout'),
-    (PermissionError('Permission denied'), 'oserror'),
-):
-    RaisingController.exc = exc
-    m.dashboard.DashboardController = RaisingController
-    buf = io.StringIO()
-    exit_code = None
-    crashed = None
-    with contextlib.redirect_stderr(buf):
-        try:
-            m.run_dashboard()
-        except SystemExit as e:
-            exit_code = e.code
-        except Exception as e:
-            crashed = repr(e)
-    stderr_lines = buf.getvalue().strip().splitlines()
-    named = any('attention:' in line and str(exc) in line for line in stderr_lines)
-    print(label, exit_code, crashed, named)
-")"
-  check "PresenterLaunchTimeout from controller.run(): run_dashboard() exits 1 instead of crashing" \
-    "$(sed -n 1p <<<"$out" | awk '{print $2}')" "1"
-  check "PresenterLaunchTimeout: run_dashboard() never lets the exception propagate uncaught" \
-    "$(sed -n 1p <<<"$out" | awk '{print $3}')" "None"
-  check "PresenterLaunchTimeout: stderr carries one line naming the failure with the attention: prefix and the underlying message" \
-    "$(sed -n 1p <<<"$out" | awk '{print $4}')" "True"
-  check "a general OSError (e.g. PermissionError) from launch(): run_dashboard() also exits 1 instead of crashing" \
-    "$(sed -n 2p <<<"$out" | awk '{print $2}')" "1"
-  check "OSError: run_dashboard() never lets the exception propagate uncaught" \
-    "$(sed -n 2p <<<"$out" | awk '{print $3}')" "None"
-  check "OSError: stderr carries one line naming the failure with the attention: prefix and the underlying message" \
-    "$(sed -n 2p <<<"$out" | awk '{print $4}')" "True"
-}
-test_run_dashboard_handles_presenter_launch_timeout_and_oserror
-
-
-
-# ---------------------------------------------------------------------------
-echo
-echo "== run_dashboard(): the bare (no-args) interactive loop =="
-
-DASH_BIN="$WORK/bin-dashboard"
-mkdir -p "$DASH_BIN"
-DASH_FZF_LOG="$WORK/dashboard-fzf-calls.log"
-DASH_OPEN_LOG="$WORK/dashboard-open.log"
-: > "$DASH_FZF_LOG"; : > "$DASH_OPEN_LOG"
-DASH_FZF_ARGS_LOG="$WORK/dashboard-fzf-args.log"
-: > "$DASH_FZF_ARGS_LOG"
-
-cat > "$DASH_BIN/gh" <<'STUB'
-#!/bin/sh
-case "$*" in
-  "search prs --review-requested=@me"*)
-    echo '[{"number": 1, "title": "DASHTEST-pr", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/1"}]'
-    ;;
-  *) echo "[]" ;;
-esac
-STUB
-chmod +x "$DASH_BIN/gh"
-
-cat > "$DASH_BIN/open" <<STUB
-#!/bin/sh
-echo "\$*" >> "$DASH_OPEN_LOG"
-STUB
-chmod +x "$DASH_BIN/open"
-
-# fzf stub: a real (but scripted) --listen HTTP-over-AF_UNIX server, since
-# run_dashboard() now goes through FzfPresenter for real. First call
-# accepts pushes, ignores the initial empty/pending one, and on the first
-# push carrying actual row content presses alt-o and exits; later calls
-# just bind the socket (so launch()'s readiness wait succeeds) and exit
-# immediately with no output, simulating Esc.
-cat > "$DASH_BIN/fzf" <<STUB
-#!/usr/bin/env python3
-import os, socket, sys
-
-args = sys.argv[1:]
-sock_path = None
-for i, a in enumerate(args):
-    if a == '--listen':
-        sock_path = args[i + 1]
-        break
-
-log_path = "$DASH_FZF_LOG"
-with open(log_path, 'a') as f:
-    f.write('call\n')
-with open(log_path) as f:
-    calls = sum(1 for _ in f)
-
-with open("$DASH_FZF_ARGS_LOG", 'a') as f:
-    f.write(' '.join(args) + '\n')
-
-try:
-    os.unlink(sock_path)
-except FileNotFoundError:
-    pass
-srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(sock_path)
-srv.listen(5)
-
-if calls != 1:
-    sys.exit(0)
-
-
-def handle(conn):
-    data = b''
-    conn.settimeout(5)
-    while b'\r\n\r\n' not in data:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    header, _, rest = data.partition(b'\r\n\r\n')
-    length = 0
-    for line in header.split(b'\r\n')[1:]:
-        if line.lower().startswith(b'content-length:'):
-            length = int(line.split(b':', 1)[1])
-    while len(rest) < length:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        rest += chunk
-    body = rest[:length]
-    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
-    conn.close()
-    return body
-
-
-marker = b'reload[cat "'
-while True:
-    conn, _ = srv.accept()
-    body = handle(conn)
-    if marker in body:
-        path = body.split(marker, 1)[1].split(b'"', 1)[0].decode()
-        try:
-            content = open(path).read().strip()
-        except OSError:
-            content = ''
-        if content:
-            print('alt-o')
-            print(content.splitlines()[0])
-            sys.exit(0)
-STUB
-chmod +x "$DASH_BIN/fzf"
-
-write_config <<'JSON'
-{"plugins": ["github"], "codeDir": "/tmp/nonexistent-fakecode", "github": {}}
-JSON
-
-test_run_dashboard_loop() {
-  local rc
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$DASH_BIN:$PATH" \
-    python3 "$ATTENTION" >/dev/null 2>&1 && rc=0 || rc=$?
-  check "bare invocation (no args) exits 0" "$rc" "0"
-  check "fzf invoked exactly twice (render, act, re-render, Esc)" "$(wc -l < "$DASH_FZF_LOG" | tr -d ' ')" "2"
-  if grep -q 'https://github.com/myorg/kb/pull/1' "$DASH_OPEN_LOG"; then
-    ok "the hotkey pressed on the fzf-selected row actually dispatched (alt-o -> open)"
-  else
-    bad "the hotkey pressed on the fzf-selected row actually dispatched (got: $(cat "$DASH_OPEN_LOG"))"
-  fi
-  if grep -q -- '--height 10' "$DASH_FZF_ARGS_LOG"; then
-    ok "fzf invoked with a fixed --height (shows ~5 items regardless of terminal size, not a % of it)"
-  else
-    bad "fzf invoked with a fixed --height (shows ~5 items regardless of terminal size, not a % of it) (got: $(cat "$DASH_FZF_ARGS_LOG"))"
-  fi
-}
-test_run_dashboard_loop
-
-echo
-echo "-- empty list: prints a message, never invokes fzf at all --"
-
-write_config <<'JSON'
-{"plugins": []}
-JSON
-
-test_run_dashboard_empty() {
-  local out rc
-  : > "$DASH_FZF_LOG"
-  out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$DASH_BIN:$PATH" python3 "$ATTENTION" 2>&1)" && rc=0 || rc=$?
-  check "bare invocation with nothing to show exits 0" "$rc" "0"
-  check "no fzf process spawned for an empty list" "$(wc -l < "$DASH_FZF_LOG" | tr -d ' ')" "0"
-  case "$out" in
-    *"Nothing needs attention"*) ok "prints a friendly empty-list message" ;;
-    *) bad "prints a friendly empty-list message (got: $out)" ;;
-  esac
-}
-test_run_dashboard_empty
-
-echo
-echo "-- periodic refresh: a stuck fzf is interrupted and re-rendered, not waited out --"
-
-REFRESH_BIN="$WORK/bin-refresh"
-mkdir -p "$REFRESH_BIN"
-REFRESH_FZF_LOG="$WORK/refresh-fzf-calls.log"
-: > "$REFRESH_FZF_LOG"
-
-cat > "$REFRESH_BIN/gh" <<'STUB'
-#!/bin/sh
-case "$*" in
-  "search prs --review-requested=@me"*)
-    echo '[{"number": 1, "title": "REFRESHTEST-pr", "repository": {"name": "kb", "nameWithOwner": "myorg/kb"}, "url": "https://github.com/myorg/kb/pull/1"}]'
-    ;;
-  *) echo "[]" ;;
-esac
-STUB
-chmod +x "$REFRESH_BIN/gh"
-
-# First call: binds the --listen socket (so launch()'s readiness wait
-# succeeds) then accepts and acks pushes forever without ever printing to
-# stdout or exiting -- exactly what a genuinely stuck fzf looks like from
-# wait_for_exit()'s side, requiring its SIGTERM-then-kill escalation to
-# actually end it. Second call: binds the socket and exits immediately
-# with no output (simulates Esc), ending the loop.
-cat > "$REFRESH_BIN/fzf" <<STUB
-#!/usr/bin/env python3
-import os, socket, sys
-
-args = sys.argv[1:]
-sock_path = None
-for i, a in enumerate(args):
-    if a == '--listen':
-        sock_path = args[i + 1]
-        break
-
-log_path = "$REFRESH_FZF_LOG"
-with open(log_path, 'a') as f:
-    f.write('call\n')
-with open(log_path) as f:
-    calls = sum(1 for _ in f)
-
-try:
-    os.unlink(sock_path)
-except FileNotFoundError:
-    pass
-srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(sock_path)
-srv.listen(5)
-
-if calls != 1:
-    sys.exit(0)
-
-
-def handle(conn):
-    data = b''
-    conn.settimeout(5)
-    try:
-        while b'\r\n\r\n' not in data:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
-    except OSError:
-        pass
-    finally:
-        conn.close()
-
-
-while True:
-    conn, _ = srv.accept()
-    handle(conn)
-STUB
-chmod +x "$REFRESH_BIN/fzf"
-
-write_config <<'JSON'
-{"plugins": ["github"], "codeDir": "/tmp/nonexistent-fakecode", "github": {}}
-JSON
-
-test_periodic_refresh_interrupts_stuck_fzf() {
-  local start_ts elapsed
-  start_ts=$(date +%s)
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$REFRESH_BIN:$PATH" python3 -c "
-$LOAD_CORE
-m.run_dashboard(refresh_interval=1)
-" >/dev/null 2>&1
-  elapsed=$(( $(date +%s) - start_ts ))
-  check "fzf invoked exactly twice (stuck render interrupted, then a fresh one)" \
-    "$(wc -l < "$REFRESH_FZF_LOG" | tr -d ' ')" "2"
-  if [ "$elapsed" -le 3 ]; then
-    ok "the loop moved on after refresh_interval (1s) instead of waiting out the stuck fzf's 5s sleep (${elapsed}s)"
-  else
-    bad "the loop moved on after refresh_interval (1s) instead of waiting out the stuck fzf's 5s sleep (took ${elapsed}s)"
-  fi
-}
-test_periodic_refresh_interrupts_stuck_fzf
-
-echo
+test_curses_presenter_dispatches_filtered_and_alt_actions
 echo "== dashboard groups =="
 
 test_dashboard_group_rules_and_rows() {
@@ -4258,7 +3045,7 @@ print(typed_prefix_error)
 }
 test_dashboard_group_rules_and_rows
 
-test_curses_presenter_scopes_fzf_rows() {
+test_curses_group_presenter_scopes_rows() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
@@ -4271,17 +3058,17 @@ class Child:
 presenter = d.CursesGroupPresenter(['Needs Attention', 'Other'])
 child = Child()
 presenter._active_group = 'Needs Attention'
-presenter._active_fzf = child
+presenter._active_presenter = child
 presenter.push_snapshot([
     'needs' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'Needs Attention',
     'other' + chr(9) + 'blob' + chr(9) + 'alt-o' + chr(9) + 'hint' + chr(9) + 'Other',
 ], ['github'])
 print(child.calls)
 ")"
-  check "curses group presenter forwards only the selected group's rows to fzf" \
+  check "curses group presenter forwards only the selected group's rows to its terminal list" \
     "$(sed -n 1p <<<"$out")" "[(['needs\tblob\talt-o\thint'], ['github'])]"
 }
-test_curses_presenter_scopes_fzf_rows
+test_curses_group_presenter_scopes_rows
 
 test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview() {
   local out
