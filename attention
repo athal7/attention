@@ -15,6 +15,7 @@ contribute nothing until configured; github/linear still work out of
 the box, gated only by their own auth availability.
 """
 import base64
+import curses
 import fcntl
 import importlib.util
 import json
@@ -825,6 +826,12 @@ def act(key, line):
         print(f"Action failed: {e}")
 
 
+def acknowledge_action():
+    try:
+        input("Press Enter to return to the dashboard...")
+    except EOFError:
+        pass
+
 def run_dashboard(refresh_interval=60):
     """The interactive loop: fetch every configured plugin concurrently,
     then republish a fresh recomputed snapshot to one long-lived curses
@@ -883,10 +890,11 @@ def run_dashboard(refresh_interval=60):
         build_snapshot=build_snapshot,
         render_rows=render_rows,
         act=act,
+        acknowledge_action=acknowledge_action,
     )
     try:
         found_something = controller.run(refresh_interval)
-    except OSError as e:
+    except (OSError, curses.error) as e:
         print(f"attention: could not start the interactive dashboard: {e}", file=sys.stderr)
         sys.exit(1)
     if not found_something:

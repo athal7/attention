@@ -2742,12 +2742,14 @@ items_by_name = {
 }
 calls = CallLog()
 fetch_plugin = gated_fetch_plugin(items_by_name, {'b': gate_b}, calls)
-acted = []
+events = []
 presenter = FakePresenter()
 controller = d.DashboardController(
     ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
-    render_rows=blob_render_rows, act=lambda key, row: acted.append((key, row)),
+    render_rows=blob_render_rows,
+    act=lambda key, row: events.append('act'),
+    acknowledge_action=lambda: events.append('acknowledge'),
 )
 th = threading.Thread(target=controller.run, args=(3600,))
 th.start()
@@ -2764,10 +2766,11 @@ pending_after_b = presenter.push_calls()[-1][2]
 titles_after_b = [r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]]
 presenter.send_result('', '')
 th.join(timeout=5)
-print(len(acted))
+print(events.count('act'))
 print(calls_after_accept)
 print(pending_after_b)
 print(titles_after_b)
+print(events)
 ")"
   check "the accepted hotkey dispatched through the injected act() callable" "$(sed -n 1p <<<"$out")" "1"
   check "an accept mid-round relaunches the presenter but submits no second round's fetch_plugin calls" \
@@ -2775,6 +2778,8 @@ print(titles_after_b)
   check "the gated plugin's completion still reaches the presenter after the relaunch" "$(sed -n 3p <<<"$out")" "[]"
   check "the acted-on item is deprioritized below the newly-arrived item in the very next snapshot" \
     "$(sed -n 4p <<<"$out")" "['B', 'A']"
+  check "the controller acknowledges action output before it relaunches the dashboard" \
+    "$(sed -n 5p <<<"$out")" "['act', 'acknowledge']"
 }
 test_timeout_and_accept_relaunch_presenter_without_new_fetch_calls_mid_round
 
@@ -3145,6 +3150,39 @@ print((result3.key, result3.row))
     "$(sed -n 6p <<<"$out")" "('', '')"
 }
 test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview
+
+test_dashboard_startup_handles_curses_error() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+import contextlib
+import io
+
+
+class FailingController:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def run(self, refresh_interval):
+        raise m.curses.error('terminal unavailable')
+
+
+m.load_config = lambda: {'plugins': ['x']}
+m.load_plugin = lambda name: object()
+m.dashboard.DashboardController = FailingController
+stderr = io.StringIO()
+try:
+    with contextlib.redirect_stderr(stderr):
+        m.run_dashboard()
+except SystemExit as error:
+    print(error.code)
+print(stderr.getvalue().strip())
+")"
+  check "dashboard startup handles curses setup errors without a traceback" "$(sed -n 1p <<<"$out")" "1"
+  check "dashboard startup reports the curses setup error" \
+    "$(sed -n 2p <<<"$out")" "attention: could not start the interactive dashboard: terminal unavailable"
+}
+test_dashboard_startup_handles_curses_error
 
 # ---------------------------------------------------------------------------
 echo

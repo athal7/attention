@@ -20,7 +20,7 @@ optional, per plugin.
 
 ## Usage
 
-```
+```sh
 attention             # run the interactive terminal dashboard (default)
 attention list        # print the current prioritized list (tab-delimited)
 attention expect-keys # print the action keys in the current item list
@@ -29,7 +29,7 @@ attention act K LINE  # dispatch a single hotkey press against one dashboard row
 
 In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
-row without leaving the list. `Esc` quits.
+row. Press Enter after an action to return to the dashboard. `Esc` quits.
 
 Type text to filter visible rows. Use Backspace to edit the filter. A bare
 letter or digit action runs first when the selected row supports it. Otherwise,

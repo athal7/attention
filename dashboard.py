@@ -17,6 +17,8 @@ hands it every core operation it needs as a plain callable:
   strings) so this module never needs to know `render_dashboard_rows`
   exists, let alone import it.
 - `act(key, row) -> None` -- `attention.act`, unchanged.
+- `acknowledge_action() -> None` -- lets a user read an action's terminal
+  output before the presenter redraws.
 
 This keeps the dependency direction one-way (`attention` -> `dashboard`,
 never back) and lets tests build a `DashboardController` entirely from
@@ -95,6 +97,7 @@ class DashboardController:
         build_snapshot: Callable[[dict, dict], list],
         render_rows: Callable[[list], list],
         act: Callable[[str, str], None],
+        acknowledge_action: Callable[[], None] = lambda: None,
     ):
         self.plugin_names = list(plugin_names)
         self.presenter = presenter
@@ -102,6 +105,7 @@ class DashboardController:
         self._build_snapshot = build_snapshot
         self._render_rows = render_rows
         self._act = act
+        self._acknowledge_action = acknowledge_action
 
         self._state_lock = threading.Lock()
         self._presenter_lock = threading.Lock()
@@ -132,6 +136,7 @@ class DashboardController:
                     return not self._empty_final
                 item_id = self._item_id_for(result.key, result.row)
                 self._act(result.key, result.row)
+                self._acknowledge_action()
                 self._deprioritize(item_id)
                 self._advance_round()
         finally:
