@@ -409,7 +409,7 @@ def fetch(config):
             "weight": weight,
             "id": number,
             "created_at": g.get("createdAt", ""),
-            "absorb_note": f"{status}: {title}",
+            "absorb_note": f"{details}: {title}" if details else f"{status}: {title}",
             "identity_key": f"github:{repo_name.lower()}#{number}",
             "association_keys": [
                 f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
