@@ -140,7 +140,7 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,reviewRequests",
         ])
         if not isinstance(detail, dict):
             return None
@@ -175,6 +175,10 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
 
         if not reasons:
             return None
+        p["reviewRequested"] = any(
+            (rr.get("reviewer") or {}).get("login", "").casefold() == me.casefold()
+            for rr in (detail.get("reviewRequests") or [])
+        )
         p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
         p["attention_reasons"] = reasons
         return p
@@ -361,9 +365,13 @@ def fetch(config):
             weight, status = 90, "REVIEW REQUESTED"
         elif gtype == "authored_attention":
             weight, status = 88, "NEEDS ATTENTION"
+            if g.get("reviewRequested"):
+                status = "REVIEW REQUESTED"
             details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "tracked_attention":
             weight, status = 85, f"{g.get('tracked_author', '').upper()}: NEEDS ATTENTION"
+            if g.get("reviewRequested"):
+                status = f"{g.get('tracked_author', '').upper()}: REVIEW REQUESTED"
             details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
