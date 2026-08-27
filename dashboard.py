@@ -361,17 +361,7 @@ class CursesPresenter:
         return visible, selected
 
     def _read_key(self, screen):
-        key = screen.getch()
-        if key != 27:
-            return key
-        screen.timeout(25)
-        next_key = screen.getch()
-        screen.timeout(100)
-        if next_key == -1:
-            return 27
-        if 0 <= next_key <= 255:
-            return f"alt-{chr(next_key).lower()}"
-        return next_key
+        return screen.getch()
 
     def _run(self, screen, deadline):
         import curses
@@ -404,18 +394,11 @@ class CursesPresenter:
             if key in (curses.KEY_BACKSPACE, 127, 8):
                 query = query[:-1]
                 continue
-            if visible:
-                row = visible[selected]
-                if isinstance(key, str):
-                    if key in self._action_keys(row):
-                        self._last_selection = selected
-                        return PresenterResult(key, row)
-                    continue
-                if 0 <= key <= 255:
-                    char = chr(key)
-                    if char in self._action_keys(row):
-                        self._last_selection = selected
-                        return PresenterResult(char, row)
+            if visible and 0 <= key <= 255:
+                char = chr(key)
+                if char in self._action_keys(visible[selected]):
+                    self._last_selection = selected
+                    return PresenterResult(char, visible[selected])
             if key == ord("q"):
                 return PresenterResult("", "")
             if key in (curses.KEY_UP, ord("k")) and visible:
@@ -427,13 +410,9 @@ class CursesPresenter:
             if key in (curses.KEY_ENTER, 10, 13) and visible:
                 self._last_selection = selected
                 return PresenterResult("", visible[selected])
-            if not visible:
-                if isinstance(key, int) and 32 <= key <= 255:
-                    query += chr(key)
-                continue
             if 0 <= key <= 255:
                 char = chr(key)
-                if char.isprintable():
+                if char.isprintable() and not ("A" <= char <= "Z"):
                     query += char
 
 

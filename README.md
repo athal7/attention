@@ -31,19 +31,19 @@ In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
 row. Press Enter after an action to return to the dashboard. `Esc` quits.
 
-Type text to filter visible rows. Use Backspace to edit the filter. A bare
-letter or digit action runs first when the selected row supports it. Otherwise,
-use Up/Down or `j`/`k` to move, `q` to quit, and other printable characters to
-filter. Send `Alt` plus a letter for an `alt-<letter>` action.
+Type lowercase letters or digits to filter visible rows; use Backspace to edit
+the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter` to run a
+row's primary action. Press a capital letter to run an action on the highlighted
+row -- hold Shift and press the key shown in that row's footer hint.
 
 An item is marked work in progress by running a custom action configured with `"wip": true`, then unmarked by one configured with `"wip": "clear"` (see [Configuration](#configuration)). Either update lands only when the action completes successfully -- a canceled prompt or a failed command leaves the current state unchanged. Marked items show a `WORK IN PROGRESS` banner in their details. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
 
 | Row type | Hotkeys |
 |---|---|
-| Calendar event | `⌥y` yank to clipboard; `⌥x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
-| Reminder | `⌥x` complete |
-| GitHub PR/issue | `⌥o` open · `⌥a` approve · `⌥m` merge (squash + delete branch, confirms first) · `⌥c` comment · `⌥g` add label. If the item cross-links to a Linear issue (title contains its identifier): `O`/`C`/`T` open/comment/transition the *linked Linear issue* instead |
-| Linear issue | `⌥o` open · `⌥c` comment · `⌥t` transition (lists the issue's own team's workflow states) |
+| Calendar event | `Y` yank to clipboard; `X` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
+| Reminder | `X` complete |
+| GitHub PR/issue | `O` open · `A` approve · `M` merge (squash + delete branch, confirms first) · `C` comment · `G` add label. If the item cross-links to a Linear issue (title contains its identifier), that issue's open/comment/transition actions are folded in too, each labeled *(linked)*; any key that collides with an existing one is remapped to a digit, shown in the footer hint |
+| Linear issue | `O` open · `C` comment · `T` transition (lists the issue's own team's workflow states) |
 
 ## Configuration
 
@@ -59,14 +59,14 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "github":    {
     "actions": [
       {
-        "key": "alt-s",
+        "key": "S",
         "label": "session",
         "background": true,
         "command": ["my-session", "-d", "{repo_path}", "-n", "{slug}", "{input}"],
         "input": { "prompt": "Session message", "default": "Work on issue {id} in this repo" }
       },
       {
-        "key": "alt-l",
+        "key": "L",
         "label": "lumen",
         "command": ["lumen", "diff", "{url}"]
       }
