@@ -426,6 +426,46 @@ def get_repo_from_url(url):
     return m.group(1) if m else ""
 
 
+def _session_prompt(gtype, reasons):
+    """State-aware default message for a work session dispatched from an
+    item. The action depends on both whose work it is and why it needs
+    attention -- fixing my own PR is a different job from reviewing
+    someone else's or nudging a teammate's.
+
+    My PR (authored_attention), ordered by which action dominates when a
+    PR carries several reasons at once:
+    - Changes requested: address them (wins over everything, draft or
+      not -- a requested change is a requested change).
+    - Failing CI: fix the CI.
+    - Merge conflict: resolve it.
+    - Review comments only: respond to them.
+
+    Not my work:
+    - A PR someone asked me to review: review it.
+    - A teammate's PR I track: follow up with the author (their CI to
+      fix, their changes to make -- not mine).
+    - An issue assigned to me or open in my repo: work on it.
+
+    `reasons` is the attention_reasons list (empty for review requests
+    and issues).
+    """
+    if gtype == "authored_attention":
+        if "Changes Requested" in reasons:
+            return "Address the requested changes."
+        if "Checks Failing" in reasons:
+            return "Fix the failing CI checks."
+        if "Merge Conflict" in reasons:
+            return "Resolve the merge conflict."
+        if "Review Commented" in reasons:
+            return "Respond to the review comments."
+        return "Review it."
+    if gtype == "tracked_attention":
+        return "Follow up with the author."
+    if gtype in ("assigned_issue", "repo_issue"):
+        return "Work on it."
+    return "Review it."
+
+
 def fetch(config):
     raw = _fetch_raw(config)
     if not raw:
@@ -485,6 +525,7 @@ def fetch(config):
         repo_path = os.path.join(code_dir, dir_name)
         slug = slugify(title)
 
+        session_prompt = _session_prompt(gtype, g.get("attention_reasons", []))
         record = {
             "url": url,
             "number": number,
@@ -496,7 +537,8 @@ def fetch(config):
             "title": title,
             "status": status,
             "details": details,
-        }
+            "session_prompt": session_prompt,
+         }
 
         actions = [
             {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
