@@ -175,10 +175,7 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
 
         if not reasons:
             return None
-        p["reviewRequested"] = any(
-            (rr.get("reviewer") or {}).get("login", "").casefold() == me.casefold()
-            for rr in (detail.get("reviewRequests") or [])
-        )
+        p["reviewRequested"] = bool(detail.get("reviewRequests"))
         p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
         p["attention_reasons"] = reasons
         return p
