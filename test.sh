@@ -1616,6 +1616,45 @@ print([(r['number'], r['attention_reasons']) for r in allowlisted_result])
 }
 test_pr_attention_ignores_bot_review_comments_unless_allowlisted
 
+test_github_session_prompt_state_aware() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+f = p._session_prompt
+print(f('authored_attention', ['Checks Failing']))
+print(f('authored_attention', ['Changes Requested']))
+print(f('authored_attention', ['Changes Requested', 'Checks Failing']))
+print(f('authored_attention', ['Merge Conflict']))
+print(f('authored_attention', ['Review Commented']))
+print(f('review_request', []))
+print(f('tracked_attention', ['Checks Failing']))
+print(f('tracked_attention', ['Changes Requested']))
+print(f('assigned_issue', []))
+print(f('repo_issue', []))
+")"
+  check "my PR with failing CI tells me to fix CI" \
+    "$(sed -n 1p <<<"$out")" "Fix the failing CI checks."
+  check "my PR with changes requested tells me to address them" \
+    "$(sed -n 2p <<<"$out")" "Address the requested changes."
+  check "changes requested outranks failing CI on my own PR" \
+    "$(sed -n 3p <<<"$out")" "Address the requested changes."
+  check "my PR with a merge conflict tells me to resolve it" \
+    "$(sed -n 4p <<<"$out")" "Resolve the merge conflict."
+  check "my PR with only review comments tells me to respond" \
+    "$(sed -n 5p <<<"$out")" "Respond to the review comments."
+  check "a PR someone asked me to review tells me to review it" \
+    "$(sed -n 6p <<<"$out")" "Review it."
+  check "a teammate's failing PR tells me to follow up, not fix their CI" \
+    "$(sed -n 7p <<<"$out")" "Follow up with the author."
+  check "a teammate's changes-requested PR tells me to follow up, not address their changes" \
+    "$(sed -n 8p <<<"$out")" "Follow up with the author."
+  check "an assigned issue tells me to work on it" \
+    "$(sed -n 9p <<<"$out")" "Work on it."
+  check "an owned-repo issue tells me to work on it" \
+    "$(sed -n 10p <<<"$out")" "Work on it."
+}
+test_github_session_prompt_state_aware
+
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
