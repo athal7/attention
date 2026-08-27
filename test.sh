@@ -1012,47 +1012,17 @@ print(items[0]['actions'][0]['_item_id'])
 }
 test_recently_acted_deprioritized
 
-test_work_in_progress_marker() {
-  local row marked_row cleared_row
-  row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" act "alt-w" "$row" >/dev/null
-  marked_row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
-  case "$marked_row" in
-    *"WORK IN PROGRESS"*) ok "work-in-progress action persists and marks the item in the next dashboard snapshot" ;;
-    *) bad "work-in-progress action persists and marks the item in the next dashboard snapshot (got: $marked_row)" ;;
-  esac
-
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" act "alt-w" "$marked_row" >/dev/null
-  cleared_row="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$WORK/state" python3 "$ATTENTION" list | grep 'Deprio item')"
-  case "$cleared_row" in
-    *"WORK IN PROGRESS"*) bad "work-in-progress action clears the persisted mark (got: $cleared_row)" ;;
-    *) ok "work-in-progress action clears the persisted mark" ;;
-  esac
-}
-test_work_in_progress_marker
-
 test_work_in_progress_reliability() {
   local out
   out="$(python3 -c "
 $LOAD_CORE
-import multiprocessing
-import os
-import tempfile
+import contextlib, io, multiprocessing, os, tempfile
 
-state_dir = tempfile.mkdtemp()
-os.environ['XDG_STATE_HOME'] = state_dir
-m._wip_items = None
-item = {
-    'status': 'OPEN', 'context': 'generic', 'title': 'No ID', 'details': '', 'weight': 1,
-    'id': '', 'actions': [{'key': 'alt-w', 'label': 'custom action', 'payload': {}}],
-    '_plugin': 'generic',
-}
-snapshot = m.build_snapshot({'generic': [item]})
-print([(action['key'], action['label']) for action in snapshot[0]['actions']])
+os.environ['XDG_STATE_HOME'] = tempfile.mkdtemp()
 
 def mark(item_id):
     m._wip_items = None
-    m.toggle_wip_item(item_id)
+    m.mark_wip_item(item_id)
 
 context = multiprocessing.get_context('fork')
 first = context.Process(target=mark, args=('first',))
@@ -1064,21 +1034,91 @@ second.join()
 m._wip_items = None
 print(sorted(m.get_wip_items()))
 
-blocked_state_home = tempfile.NamedTemporaryFile(delete=False)
-blocked_state_home.close()
-os.environ['XDG_STATE_HOME'] = blocked_state_home.name
+item = {
+    'status': 'OPEN', 'context': 'generic', 'title': 'No ID', 'details': '', 'weight': 1,
+    'id': 'boom',
+    'actions': [{'key': 'alt-x', 'label': 'do', 'wip': True,
+                 'payload': {'command': ['true'], 'background': False},
+                 '_plugin': 'generic', '_item_id': 'boom'}],
+    '_plugin': 'generic',
+}
 m._wip_items = None
-m.act('alt-w', m.render_rows(snapshot)[0])
+row = m.render_rows(m.build_snapshot({'generic': [item]}))[0]
+blocked = tempfile.NamedTemporaryFile(delete=False)
+blocked.close()
+os.environ['XDG_STATE_HOME'] = blocked.name
+m._wip_items = None
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.act('alt-x', row)
+print(any(line.startswith('Action failed: ') for line in buf.getvalue().splitlines()))
 ")"
-  check "WIP supports items without an explicit id and remaps a colliding alt-w action" \
-    "$(sed -n 1p <<<"$out")" "[('alt-w', 'work in progress'), ('W', 'custom action (remapped)')]"
-  check "concurrent WIP updates preserve both item markers" "$(sed -n 2p <<<"$out")" "['first', 'second']"
-  case "$(sed -n 3p <<<"$out")" in
-    "Action failed: "*) ok "WIP persistence failure stays in the action error boundary" ;;
-    *) bad "WIP persistence failure stays in the action error boundary (got: $(sed -n 3p <<<"$out"))" ;;
-  esac
+  check "concurrent WIP updates preserve both item markers" "$(sed -n 1p <<<"$out")" "['first', 'second']"
+  check "WIP persistence failure stays in the action error boundary" "$(sed -n 2p <<<"$out")" "True"
 }
 test_work_in_progress_reliability
+
+test_wip_on_action() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+import contextlib, io, os, tempfile
+
+def build_row(item_id, wip, command=None):
+    # _plugin/_item_id are normally stamped onto each action by fetch_all;
+    # this test builds items directly (bypassing fetch_all), so set them here.
+    item = {
+        'status': 'OPEN', 'context': 'generic', 'title': 'WIP ' + item_id,
+        'details': '', 'weight': 1, 'id': item_id,
+        'actions': [{'key': 'alt-x', 'label': 'do', 'wip': wip,
+                     'payload': {'command': command or ['true'], 'background': False},
+                     '_plugin': 'generic', '_item_id': item_id}],
+        '_plugin': 'generic',
+    }
+    m._wip_items = None
+    return m.render_rows(m.build_snapshot({'generic': [item]}))[0]
+
+def act(row):
+    with contextlib.redirect_stdout(io.StringIO()):
+        m._wip_items = None
+        m.act('alt-x', row)
+    m._wip_items = None
+    print(sorted(m.get_wip_items()))
+
+os.environ['XDG_STATE_HOME'] = tempfile.mkdtemp()
+act(build_row('wipitem', True))
+act(build_row('wipitem', True))
+m._wip_items = None
+print('WORK IN PROGRESS' in build_row('wipitem', True))
+act(build_row('wipitem', 'clear'))
+act(build_row('wipitem', 'clear'))
+
+os.environ['XDG_STATE_HOME'] = tempfile.mkdtemp()
+act(build_row('plain', False))
+
+os.environ['XDG_STATE_HOME'] = tempfile.mkdtemp()
+act(build_row('failed-mark', True, command=['false']))
+act(build_row('failed-clear-target', True))
+act(build_row('failed-clear-target', 'clear', command=['false']))
+")"
+  check "an action with wip:true marks the acted item work in progress" \
+    "$(sed -n 1p <<<"$out")" "['generic:wipitem']"
+  check "wip auto-mark is idempotent -- running again never clears it" \
+    "$(sed -n 2p <<<"$out")" "['generic:wipitem']"
+  check "a marked item shows the WORK IN PROGRESS banner in the next snapshot" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "wip:clear removes the acted item's mark" \
+    "$(sed -n 4p <<<"$out")" "[]"
+  check "wip:clear is conditional and idempotent when already unmarked" \
+    "$(sed -n 5p <<<"$out")" "[]"
+  check "an action without wip leaves the item unmarked" \
+    "$(sed -n 6p <<<"$out")" "[]"
+  check "a wip:true action whose command fails leaves the item unmarked" \
+    "$(sed -n 7p <<<"$out")" "[]"
+  check "a wip:clear action whose command fails keeps the item marked" \
+    "$(sed -n 9p <<<"$out")" "['generic:failed-clear-target']"
+}
+test_wip_on_action
 
 test_build_snapshot_matches_build_prioritized_items_flattened_equivalent() {
   local out
@@ -1273,6 +1313,16 @@ except ValueError as e:
 
   err="$(python3 -c "
 $LOAD_CORE
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'alt-o', 'label': 'open', 'wip': 'toggle'}]}
+try:
+    m.validate_and_normalize_item(item, 'badplugin')
+except ValueError as e:
+    print('err:', e)
+" 2>/dev/null || true)"
+  check "rejects unsupported action wip modes" "$err" "err: plugin 'badplugin' returned a malformed item: action 'wip' must be true, false, or \"clear\", got 'toggle'"
+
+  err="$(python3 -c "
+$LOAD_CORE
 item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'created_at': 1700000000}
 try:
     m.validate_and_normalize_item(item, 'badplugin')
@@ -1292,9 +1342,9 @@ print(json.dumps(item))
   check "defaults optional item fields (id, absorb_note, created_at) to empty string" \
     "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(repr(item['id']), repr(item['absorb_note']), repr(item['created_at']))" "$defaults")" \
     "'' '' ''"
-  check "defaults optional action fields (primary=False, payload={})" \
-    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['actions'][0]['primary'], item['actions'][0]['payload'])" "$defaults")" \
-    "False {}"
+  check "defaults optional action fields (primary=False, wip=False, payload={})" \
+    "$(python3 -c "import json,sys; item=json.loads(sys.argv[1]); print(item['actions'][0]['primary'], item['actions'][0]['wip'], item['actions'][0]['payload'])" "$defaults")" \
+    "False False {}"
 
   local act_err
   act_err="$(python3 -c "

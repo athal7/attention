@@ -549,8 +549,7 @@ def _confirm_and_merge(item_id, url):
 
 def act(key, payload):
     if "command" in payload:
-        run_configured_action(payload)
-        return
+        return run_configured_action(payload)
     kind = payload.get("kind")
     if kind == "open":
         run_cmd(["open", payload["url"]]) if payload.get("url") else print("No URL.")

@@ -42,7 +42,6 @@ See PLUGINS.md for the source-plugin interface and config["plugins"].
 
 DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear", "generic"]
 
-WIP_ACTION_KEY = "alt-w"
 _WIP_STATE_FILENAME = "wip.json"
 _wip_items = None
 
@@ -70,22 +69,18 @@ def get_wip_items():
     return _wip_items
 
 
-def toggle_wip_item(item_id):
+def _write_wip_items(mutate):
+    """Locked read-modify-write of the persisted WIP set. `mutate(items)`
+    edits the set in place; whatever it returns is passed back to the caller.
+    """
     global _wip_items
-    if not item_id:
-        return False
     state_path = get_wip_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_path.with_suffix(".lock")
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         wip_items = _read_wip_items()
-        if item_id in wip_items:
-            wip_items.remove(item_id)
-            marked = False
-        else:
-            wip_items.add(item_id)
-            marked = True
+        result = mutate(wip_items)
         descriptor, temp_path = tempfile.mkstemp(
             dir=state_path.parent, prefix=f".{state_path.name}.", suffix=".tmp",
         )
@@ -97,7 +92,40 @@ def toggle_wip_item(item_id):
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
     _wip_items = wip_items
-    return marked
+    return result
+
+
+def mark_wip_item(item_id):
+    """Idempotently mark an item as work in progress (never clears it) --
+    used when an action configured with "wip": true runs, so acting on the
+    item flags it automatically.
+    """
+    if not item_id:
+        return False
+
+    def mutate(wip_items):
+        if item_id in wip_items:
+            return False
+        wip_items.add(item_id)
+        return True
+
+    return _write_wip_items(mutate)
+
+
+def unmark_wip_item(item_id):
+    """Idempotently clear an item's work-in-progress mark (no-op if it was
+    not marked) -- used when an action configured with "wip": "clear" runs.
+    """
+    if not item_id:
+        return False
+
+    def mutate(wip_items):
+        if item_id not in wip_items:
+            return False
+        wip_items.discard(item_id)
+        return True
+
+    return _write_wip_items(mutate)
 
 
 def get_wip_item_id(item):
@@ -112,29 +140,15 @@ def get_wip_item_id(item):
     ], separators=(",", ":"))
 
 
-def add_wip_action(item, wip_items):
-    action_keys = {action["key"] for action in item["actions"]}
+def apply_wip_state(item, wip_items):
+    """Stamp each of the item's actions with the item's WIP id (so act()
+    can mark the item after a "wip": true action completes) and, when the
+    item is already marked, prefix its details with a visible banner.
+    """
+    wip_id = get_wip_item_id(item)
     for action in item["actions"]:
-        if action["key"] != WIP_ACTION_KEY:
-            continue
-        replacement = next(
-            (key for key in ["W", *"123456789"] if key not in action_keys), None,
-        )
-        if replacement is None:
-            return
-        action_keys.add(replacement)
-        action["key"] = replacement
-        action["_original_key"] = WIP_ACTION_KEY
-        action["label"] = f"{action['label']} (remapped)"
-    item_id = get_wip_item_id(item)
-    marked = item_id in wip_items
-    item["actions"].insert(0, {
-        "key": WIP_ACTION_KEY,
-        "label": "clear work in progress" if marked else "work in progress",
-        "payload": {"id": item_id},
-        "_plugin": "__attention__",
-    })
-    if marked:
+        action["_wip_id"] = wip_id
+    if wip_id in wip_items:
         details = item.get("details", "")
         item["details"] = f"WORK IN PROGRESS | {details}" if details else "WORK IN PROGRESS"
 
@@ -201,6 +215,7 @@ class ActionRequired(TypedDict):
 
 class Action(ActionRequired, total=False):
     primary: bool
+    wip: bool | str
     payload: dict
 
 
@@ -304,6 +319,11 @@ def validate_and_normalize_item(item, name):
             action["primary"] = False
         elif not isinstance(action["primary"], bool):
             raise ValueError(f"plugin '{name}' returned a malformed item: action 'primary' must be of type bool, got {type(action['primary']).__name__}")
+
+        if "wip" not in action:
+            action["wip"] = False
+        elif action["wip"] is not True and action["wip"] is not False and action["wip"] != "clear":
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'wip' must be true, false, or \"clear\", got {action['wip']!r}")
 
         if "payload" not in action:
             action["payload"] = {}
@@ -715,8 +735,8 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     dashboard's DashboardController can run the same merge/sort
     pipeline once per completed provider, not just once per full fetch.
 
-    Pure over `items_by_plugin`: every item is shallow-copied (with its
-    own copy of "actions") before any transformation, so the caller's
+    Pure over `items_by_plugin`: every item is shallow-copied, and each of
+    its actions is copied too, before any transformation, so the caller's
     stored provider item objects are never mutated -- the dashboard
     calls this repeatedly over the same stored items every time a round
     relaunches or a new provider completes, and merge_cross_links()'s
@@ -725,7 +745,7 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     later call, compounding the note/weight/actions each time.
     """
     items = [
-        dict(it, actions=list(it.get("actions", [])))
+        dict(it, actions=[dict(a) for a in it.get("actions", [])])
         for plugin_items in items_by_plugin.values()
         for it in plugin_items
     ]
@@ -733,7 +753,7 @@ def build_snapshot(items_by_plugin, recently_acted=None):
 
     wip_items = get_wip_items()
     for it in items:
-        add_wip_action(it, wip_items)
+        apply_wip_state(it, wip_items)
 
     now = datetime.now(timezone.utc)
     for it in items:
@@ -811,15 +831,16 @@ def act(key, line):
 
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
-        if action.get("_plugin") == "__attention__":
-            marked = toggle_wip_item(action.get("payload", {}).get("id"))
-            print("Marked work in progress." if marked else "Cleared work in progress.")
-            return
         mod = load_plugin(action["_plugin"])
         payload = action.get("payload")
         if not isinstance(payload, dict):
             raise ValueError(f"plugin '{action['_plugin']}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
-        mod.act(action.get("_original_key", resolved_key), payload)
+        completed = mod.act(action.get("_original_key", resolved_key), payload)
+        if completed is not False:
+            if action.get("wip") == "clear":
+                unmark_wip_item(action.get("_wip_id"))
+            elif action.get("wip"):
+                mark_wip_item(action.get("_wip_id"))
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
     except Exception as e:

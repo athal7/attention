@@ -31,7 +31,10 @@ def act(key: str, payload) -> None:
     action's "payload" field in fetch() -- round-tripped unchanged
     (JSON-serialized in between), yours to shape however you like. Print
     whatever the user should see; raise to report failure (printed as
-    "Action failed: ...", not a crash).
+    "Action failed: ...", not a crash). Return `False` to signal the
+    action did not complete (e.g. the user canceled a prompt or the
+    command failed) -- core then skips the "wip": true auto-mark below;
+    any other return value (including None) counts as completed.
     """
 ```
 
@@ -67,6 +70,7 @@ omitted.
             "key": "alt-o",          # str, required -- alt-<lowercase letter> or bare letter/digit
             "label": "open",         # str, required -- short verb, shown in the footer hint
             "primary": True,         # bool, optional (default False) -- at most one per item, what plain Enter runs
+            "wip": True,             # true marks, "clear" unmarks after completion; optional (default False)
             "payload": {...},        # dict, optional (default {}) -- anything JSON-serializable; yours, passed back to act()
         },
         ...
@@ -177,6 +181,15 @@ answering with nothing runs the default. `{input}` and `{input.<name>}`
 are reserved -- they always mean prompted values, so a record field
 literally named `input` can't be referenced by name.
 
+An action may set `"wip": true` to mark the item work in progress, or
+`"wip": "clear"` to unmark it. A custom configured action like "start a
+session" can flag an item, while a "stop" or "done" action can clear it.
+The mark or unmark lands only when the action completes -- a canceled
+prompt or a failed command leaves the current state unchanged. Both
+operations are idempotent. There is no separate manual mark action; a
+marked item shows a `WORK IN PROGRESS` banner in its details while it
+remains in the feed.
+
 
 ## Config-only providers (no Python required)
 
@@ -218,6 +231,9 @@ default `run_cmd` (blocks, prints failures). Provider actions support
 the same optional `"input"` or `"inputs"` declarations as bundled
 plugins: text or pick-one prompts fill `{input}` or
 `{input.<name>}` placeholders in the command.
+
+An action may also set `"wip": true` to mark the item work in progress
+when it runs, exactly as bundled-plugin actions do.
 
 Each named provider is fetched and mapped independently -- one with a
 missing/failing `command` or non-JSON-array output contributes nothing,

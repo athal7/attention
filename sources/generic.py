@@ -132,4 +132,4 @@ def fetch(config):
 
 
 def act(key, payload):
-    run_configured_action(payload)
+    return run_configured_action(payload)
