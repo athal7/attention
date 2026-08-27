@@ -67,7 +67,7 @@ omitted.
     "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
     "actions": [                     # list, optional (default [])
         {
-            "key": "alt-o",          # str, required -- alt-<lowercase letter> or bare letter/digit
+            "key": "O",              # str, required -- one letter or digit; use a capital so lowercase stays free for filtering
             "label": "open",         # str, required -- short verb, shown in the footer hint
             "primary": True,         # bool, optional (default False) -- at most one per item, what plain Enter runs
             "wip": True,             # true marks, "clear" unmarks after completion; optional (default False)
@@ -78,10 +78,10 @@ omitted.
 }
 ```
 
-Use bare letters or digits when you want direct actions. They run first when
-the highlighted item supports that key. Otherwise, `j` and `k` move through
-the list, `q` quits, and other printable characters filter it. Use
-`alt-<letter>` actions when users must keep a letter available for filtering.
+Give each action a capital letter so lowercase letters and digits stay free for
+type-to-filter. Actions run first when the highlighted item supports that key.
+`j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
+and lowercase letters or digits filter it.
 
 ### Cross-link merging
 
@@ -103,8 +103,8 @@ regardless of which plugin produced it:
 `details` (B's `absorb_note`, if it lost, or a generic status/title
 fallback). A's `weight` becomes `max(A.weight, B.weight) + 5`; and B's
 `actions` get appended to A's, each renamed only if its key would
-otherwise collide with one A already has (tried in order: the same key
-stripped of `alt-` and uppercased, then the lowest unused bare digit)
+otherwise collide with one A already has (remapped to the lowest unused bare
+digit)
 and labeled `"<label> (linked)"`. B itself is dropped from the rendered
 list. `status_priority` defaults to 0 for every plugin, so unless a
 plugin opts in, the pre-existing behavior (the declaring/host item A
@@ -138,7 +138,7 @@ an `actions` array in their config section to attach non-inherent custom actions
   "github": {
     "actions": [
       {
-        "key": "alt-s",
+        "key": "S",
         "label": "session",
         "background": true,
         "command": ["my-session", "-d", "{repo_path}", "--agent", "{input.tool}", "{input.command}"],
@@ -148,12 +148,12 @@ an `actions` array in their config section to attach non-inherent custom actions
         ]
       },
       {
-        "key": "alt-l",
+        "key": "L",
         "label": "lumen",
         "command": ["lumen", "diff", "{url}"]
       },
       {
-        "key": "alt-p",
+        "key": "P",
         "label": "priority",
         "command": ["gh", "issue", "edit", "{id}", "-R", "{repo}", "--add-label", "priority:{input}"],
         "input": { "prompt": "Priority", "choices": ["p0", "p1", "p2"] }
@@ -212,7 +212,7 @@ under `config["generic"]`:
       "id": "{number}",
       "weight": 85,
       "actions": [
-        {"key": "alt-o", "label": "open", "primary": true, "command": ["open", "{url}"]}
+        {"key": "O", "label": "open", "primary": true, "command": ["open", "{url}"]}
       ]
     }
   }

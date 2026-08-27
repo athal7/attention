@@ -60,7 +60,7 @@ def fetch(config):
             "details": details,
         }
         actions = [
-            {"key": "alt-x", "label": "complete", "payload": {"id": reminder_id}},
+            {"key": "X", "label": "complete", "payload": {"id": reminder_id}},
         ]
         configured_actions = config.get("reminders", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))
@@ -82,5 +82,5 @@ def act(key, payload):
     if "command" in payload:
         run_configured_action(payload)
         return
-    if key == "alt-x":
+    if key == "X":
         run_cmd(["remindctl", "complete", payload["id"]])

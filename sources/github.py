@@ -541,11 +541,11 @@ def fetch(config):
          }
 
         actions = [
-            {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-            {"key": "alt-a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
-            {"key": "alt-m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
-            {"key": "alt-c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
-            {"key": "alt-g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
+            {"key": "O", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "A", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
+            {"key": "M", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
+            {"key": "C", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
+            {"key": "G", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
         ]
         configured_actions = config.get("github", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))

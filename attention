@@ -42,6 +42,7 @@ See PLUGINS.md for the source-plugin interface and config["plugins"].
 
 DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear", "generic"]
 
+
 _WIP_STATE_FILENAME = "wip.json"
 _wip_items = None
 
@@ -309,10 +310,10 @@ def validate_and_normalize_item(item, name):
             val = action[key]
             if not isinstance(val, expected_type):
                 raise ValueError(f"plugin '{name}' returned a malformed item: action '{key}' must be of type {expected_type.__name__}, got {type(val).__name__}")
-        if not re.fullmatch(r"alt-[a-z]|[A-Za-z0-9]", action["key"]):
+        if not re.fullmatch(r"[A-Za-z0-9]", action["key"]):
             raise ValueError(
                 f"plugin '{name}' returned a malformed item: action 'key' must be "
-                "alt-<lowercase letter> or one letter/digit"
+                "one letter or digit"
             )
 
         if "primary" not in action:
@@ -382,9 +383,9 @@ def fetch_all(config):
 def _absorb(host, guest):
     """Merge `guest` into `host`: fold one side's status into the other's
     details, boost host's weight, and splice guest's actions into host's
-    action list (renamed only on an actual key collision, tried in order:
-    the alt-stripped-and-uppercased variant, then the lowest unused bare
-    digit -- and always labeled "(linked)" so it's visually obvious which
+    action list (renamed only on an actual key collision, to the lowest
+    unused bare digit -- and always labeled "(linked)" so it's visually
+    obvious which
     actions reach a different, absorbed item).
 
     Whichever side has the higher `status_priority` (default 0) keeps its
@@ -411,10 +412,7 @@ def _absorb(host, guest):
         key = action["key"]
         new_key = key
         if new_key in host_keys:
-            candidates = []
-            if key.startswith("alt-"):
-                candidates.append(key[len("alt-"):].upper())
-            candidates.extend(list("123456789"))
+            candidates = list("123456789")
             new_key = next((c for c in candidates if c not in host_keys), key)
         merged_action = dict(action, key=new_key, label=f"{action['label']} (linked)", primary=False, _original_key=key)
         host_actions.append(merged_action)
@@ -494,14 +492,12 @@ def expect_keys_for(items):
 def _action_hint_parts(actions):
     parts = []
     for a in actions:
-        key = a["key"]
-        symbol = f"⌥{key[len('alt-'):]}" if key.startswith("alt-") else key
-        parts.append(f"{symbol} {a['label']}")
+        parts.append(f"{a['key']} {a['label']}")
     return parts
 
 
 def hint_for_actions(actions):
-    """Human-readable footer hint, e.g. '⌥o open  ⌥s session'."""
+    """Human-readable footer hint, e.g. 'O open  S session'."""
     return "  ".join(_action_hint_parts(actions))
 
 
