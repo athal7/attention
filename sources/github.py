@@ -245,7 +245,7 @@ def _fetch_notifications():
                 "number": number,
                 "title": title,
                 "repository": {"nameWithOwner": repo_name},
-                "url": subject_url or repo_info.get("html_url", ""),
+                "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
                 "type": "notification",
                 "notification_reason": reason,
                 "notification_id": notif.get("id", ""),
@@ -367,7 +367,11 @@ def _fetch_raw(config):
         return issues
 
     def _notifications():
-        notifs = _fetch_notifications()
+        """Wrap _fetch_notifications with type tagging for the shared pipeline."""
+        try:
+            notifs = _fetch_notifications()
+        except Exception:
+            return []
         for n in notifs:
             n["type"] = "notification"
         return notifs
@@ -457,7 +461,10 @@ def fetch(config):
         elif gtype == "notification":
             reason = g.get("notification_reason", "")
             if reason == "ci_activity":
-                weight, status = 80, "CI FAILURE"
+                # ci_activity fires on both success and failure for linked PRs/issues;
+                # only CheckSuite subjects (no PR/issue link) are reliably failures.
+                # Use neutral status so the user can click through to check.
+                weight, status = 80, "CI STATUS"
             elif reason == "mention":
                 weight, status = 82, "MENTIONED"
             elif reason == "author":
