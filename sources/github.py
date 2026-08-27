@@ -316,12 +316,11 @@ def _fetch_raw(config):
     # I authored could also be review-requested; an issue assigned to me in
     # my own repo matches both the assignee and owner queries). Issue and PR
     # numbers share one counter per repo, so (repo, number) alone uniquely
-    # identifies the item. Concatenation order decides which variant wins:
-    # review-request/authored-attention carry more specific detail than a
-    # plain assigned/repo listing, so they're listed first.
+    # identifies the item. A tracked-attention item has the extra tracked
+    # author context, so it wins over a duplicate review-request item.
     seen = set()
     combined = []
-    for item in review_prs + authored_prs + tracked_prs + assigned_issues + repo_issues:
+    for item in tracked_prs + review_prs + authored_prs + assigned_issues + repo_issues:
         key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
         if key in seen:
             continue

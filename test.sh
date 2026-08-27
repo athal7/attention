@@ -1678,6 +1678,33 @@ print(json.dumps({i['title']: i['status'] for i in items}))
 }
 test_fetch_shows_review_requested_status_on_authored_and_tracked_prs
 
+test_tracked_attention_wins_over_duplicate_review_request() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+
+pr = {'number': 7, 'title': 'Tracked PR', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/pull/7'}
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return [dict(pr)]
+    if args[:2] == ['pr', 'view']:
+        return {'closingIssuesReferences': []}
+    return []
+
+
+p._gh_json = fake_gh_json
+p._fetch_my_repo_issues = lambda: []
+p._fetch_pr_attention = lambda author, *_: [dict(pr)] if author == 'teammate' else []
+items = p._fetch_raw({'github': {'trackAuthors': ['teammate']}})
+print([(item['type'], item.get('tracked_author')) for item in items])
+")"
+  check "tracked attention keeps its author context when it duplicates a review request" \
+    "$out" "[('tracked_attention', 'teammate')]"
+}
+test_tracked_attention_wins_over_duplicate_review_request
+
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
