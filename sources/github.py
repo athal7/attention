@@ -2,6 +2,12 @@
 assigned to you or open in repos you own, via the `gh` CLI
 (https://cli.github.com, already authenticated).
 
+Also surfaces unread GitHub notifications (`mention`, `author`,
+`state_change`, `ci_activity`) via `gh api /notifications`, which
+catches items the search-based queries miss: direct mentions,
+comments on your PRs that aren't review comments, state changes
+on subscribed PRs, and CI failures on watched repos.
+
 Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
 checkout. botReviewAllowlist optionally re-admits specific bot logins
@@ -193,6 +199,79 @@ def _fetch_my_repo_issues():
     ])
 
 
+def _fetch_notifications():
+    """Unread notifications from `gh api /notifications`. Covers reasons
+    the search-based queries above miss: `mention` (direct mentions),
+    `author` (comments on PRs I authored that aren't review comments),
+    `state_change` (state changes on PRs I'm subscribed to), and
+    `ci_activity` (CI failures on repos I watch). `review_requested`
+    notifications overlap with the review-requested search; de-dup
+    handles that.
+
+    Each notification subject maps to the same (repo, number) item
+    shape the search queries produce, so the shared de-dup logic works.
+    CheckSuite subjects have no number; they surface as CI-failure
+    items keyed by the repo alone with a synthetic number derived from
+    the title so they don't collide with real PRs/issues.
+    """
+    notifications = _gh_json(["api", "/notifications", "--paginate"])
+    if not notifications:
+        return []
+
+    items = []
+    for notif in notifications:
+        if not notif.get("unread"):
+            continue
+        reason = notif.get("reason", "")
+        subject = notif.get("subject") or {}
+        repo_info = notif.get("repository") or {}
+        repo_name = repo_info.get("full_name", "")
+        subject_type = subject.get("type", "")
+        title = subject.get("title") or repo_name
+        subject_url = subject.get("url") or ""
+        latest_comment_url = subject.get("latest_comment_url") or ""
+
+        # Derive a PR/issue number from the subject URL when possible.
+        # URLs look like https://api.github.com/repos/owner/repo/pulls/42
+        # or https://api.github.com/repos/owner/repo/issues/17
+        number = None
+        if subject_url:
+            m = re.search(r"/(issues|pull)/(\d+)$", subject_url)
+            if m:
+                number = m.group(2)
+
+        if subject_type == "PullRequest" or subject_type == "Issue":
+            items.append({
+                "number": number,
+                "title": title,
+                "repository": {"nameWithOwner": repo_name},
+                "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
+                "type": "notification",
+                "notification_reason": reason,
+                "notification_id": notif.get("id", ""),
+                "latest_comment_url": latest_comment_url,
+                "createdAt": notif.get("updated_at", ""),
+            })
+        elif subject_type == "CheckSuite":
+            # CI failure with no PR link. Build a synthetic number from
+            # the title so it de-duplicates against itself but never collides
+            # with a real PR/issue number.
+            hash_val = int(hashlib.md5(title.encode()).hexdigest(), 16) % (10**6)
+            items.append({
+                "number": f"ci-{hash_val}",
+                "title": title,
+                "repository": {"nameWithOwner": repo_name},
+                "url": repo_info.get("html_url", ""),
+                "type": "notification",
+                "notification_reason": reason,
+                "notification_id": notif.get("id", ""),
+                "latest_comment_url": "",
+                "createdAt": notif.get("updated_at", ""),
+            })
+
+    return items
+
+
 def _build_repo_dir_index(code_dir):
     """Map "owner/repo" (lowercased) -> the actual local directory name
     under code_dir, derived from each subdirectory's own `git remote
@@ -287,6 +366,16 @@ def _fetch_raw(config):
             i["type"] = "repo_issue"
         return issues
 
+    def _notifications():
+        """Wrap _fetch_notifications with type tagging for the shared pipeline."""
+        try:
+            notifs = _fetch_notifications()
+        except Exception:
+            return []
+        for n in notifs:
+            n["type"] = "notification"
+        return notifs
+
     track_authors = config.get("github", {}).get("trackAuthors", [])
     bot_review_allowlist = frozenset(
         login.casefold() for login in config.get("github", {}).get("botReviewAllowlist", [])
@@ -304,12 +393,14 @@ def _fetch_raw(config):
         authored_fut = pool.submit(_authored_prs)
         tracked_futs = [pool.submit(_tracked_prs, author) for author in track_authors]
         repo_fut = pool.submit(_repo_issues)
+        notif_fut = pool.submit(_notifications)
 
         review_prs = review_fut.result()
         assigned_issues = assigned_fut.result()
         authored_prs = authored_fut.result()
         tracked_prs = [p for fut in tracked_futs for p in fut.result()]
         repo_issues = repo_fut.result()
+        notifications = notif_fut.result()
 
     # De-dupe: the same PR/issue can surface from more than one query (a PR
     # I authored could also be review-requested; an issue assigned to me in
@@ -320,7 +411,7 @@ def _fetch_raw(config):
     # plain assigned/repo listing, so they're listed first.
     seen = set()
     combined = []
-    for item in review_prs + authored_prs + tracked_prs + assigned_issues + repo_issues:
+    for item in review_prs + authored_prs + tracked_prs + assigned_issues + repo_issues + notifications:
         key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
         if key in seen:
             continue
@@ -367,6 +458,22 @@ def fetch(config):
             details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
+        elif gtype == "notification":
+            reason = g.get("notification_reason", "")
+            if reason == "ci_activity":
+                # ci_activity fires on both success and failure for linked PRs/issues;
+                # only CheckSuite subjects (no PR/issue link) are reliably failures.
+                # Use neutral status so the user can click through to check.
+                weight, status = 80, "CI STATUS"
+            elif reason == "mention":
+                weight, status = 82, "MENTIONED"
+            elif reason == "author":
+                weight, status = 82, "COMMENTED"
+            elif reason == "state_change":
+                weight, status = 78, "SUBSCRIBED"
+            else:
+                weight, status = 78, "NOTIFIED"
+            details = reason.replace("_", " ").title()
         else:
             # repo_issue: boost so they rank higher
             weight, status = 70, "OPEN"

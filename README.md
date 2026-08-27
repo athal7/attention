@@ -125,7 +125,11 @@ cannot hide attention items.
   back in); issues assigned to you; open issues in repos you own regardless
   of assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
   hidden. De-duplicated by repo+number if an item matches more than one of
-  these.
+  these. Also surfaces unread GitHub notifications (`mention`, `author`,
+  `state_change`, `ci_activity`) via `gh api /notifications`, which catches
+  items the search-based queries miss: direct mentions, comments on your PRs
+  that aren't review comments, state changes on subscribed PRs, and CI
+  failures on watched repos.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate
   state, in your current cycle. Its status always wins on a cross-linked
   dashboard row: a PR title/body mentioning the issue's identifier folds
