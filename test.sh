@@ -1422,6 +1422,8 @@ def fake_gh_json(args):
         return []
     if args[:2] == ['search', 'issues']:
         return []
+    if args[:2] == ['api', '/notifications']:
+        return []
     if args[:2] == ['pr', 'view']:
         try:
             overflow_barrier.wait(timeout=0.5)
@@ -1477,6 +1479,8 @@ def fake_gh_json(args):
             'statusCheckRollup': [],
             'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'}],
         }
+    if args[:2] == ['api', '/notifications']:
+        return []
     if args[:2] == ['api', 'graphql']:
         return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
             {'author': {'__typename': 'User', 'login': 'reviewer'}}
@@ -1537,6 +1541,8 @@ def fake_gh_json(args):
             'comments': [],
             'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
         }
+    if args[:2] == ['api', '/notifications']:
+        return []
     if args[:2] == ['api', 'graphql']:
         return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
             {'author': {'__typename': 'User', 'login': 'reviewer'}}
@@ -1591,6 +1597,8 @@ def fake_gh_json(args):
             'statusCheckRollup': [],
             'latestReviews': [{'author': {'login': reviewer}, 'state': 'COMMENTED'}],
         }
+    if args[:2] == ['api', '/notifications']:
+        return []
     if args[:2] == ['api', 'graphql']:
         number = next(a.split('=', 1)[1] for a in args if a.startswith('number='))
         if number == '4':
