@@ -378,6 +378,11 @@ def fetch(config):
         repo_path = os.path.join(code_dir, dir_name)
         slug = slugify(title)
 
+        # session_prompt gives the template a state-aware default:
+        # the specific attention reason when present, otherwise the generic status.
+        session_prompt = f"Review it ({details})" if details else f"Review it ({status})"
+        if is_draft:
+            session_prompt = f"Review draft ({status})"
         record = {
             "url": url,
             "number": number,
@@ -389,7 +394,8 @@ def fetch(config):
             "title": title,
             "status": status,
             "details": details,
-        }
+            "session_prompt": session_prompt,
+         }
 
         actions = [
             {"key": "alt-o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
