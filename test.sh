@@ -1314,7 +1314,7 @@ except ValueError as e:
 
   err="$(python3 -c "
 $LOAD_CORE
-item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'alt-o', 'label': 'open', 'wip': 'toggle'}]}
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'O', 'label': 'open', 'wip': 'toggle'}]}
 try:
     m.validate_and_normalize_item(item, 'badplugin')
 except ValueError as e:
@@ -1675,6 +1675,94 @@ print([(r['number'], r['attention_reasons']) for r in allowlisted_result])
 }
 test_pr_attention_ignores_bot_review_comments_unless_allowlisted
 
+test_pr_attention_flags_review_requested_from_pending_requests() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import concurrent.futures
+
+prs = [
+    {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
+]
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return prs
+    if args[:2] == ['pr', 'view']:
+        detail = {
+            'mergeable': 'CONFLICTING', 'reviewDecision': None,
+            'statusCheckRollup': [], 'latestReviews': [],
+        }
+        # gh flattens each reviewRequests entry to a top-level login, never
+        # a nested reviewer object -- PR 1 has a pending reviewer, PR 2 none.
+        detail['reviewRequests'] = (
+            [{'__typename': 'User', 'login': 'some-reviewer'}] if args[2] == '1' else []
+        )
+        return detail
+    raise AssertionError(args)
+
+
+p._gh_json = fake_gh_json
+p._get_gh_login = lambda: 'author'
+with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
+    result = p._fetch_pr_attention('@me', detail_pool)
+print([(r['number'], r['reviewRequested']) for r in sorted(result, key=lambda r: r['number'])])
+")"
+  check "a PR with a pending review request is flagged reviewRequested; one without is not" \
+    "$out" "[(1, True), (2, False)]"
+}
+test_pr_attention_flags_review_requested_from_pending_requests
+
+test_fetch_shows_review_requested_status_on_authored_and_tracked_prs() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import json
+p._fetch_raw = lambda cfg: [
+    {'number': 1, 'title': 'Authored waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/1', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
+    {'number': 2, 'title': 'Authored no reviewer yet', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/2', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': False},
+    {'number': 3, 'title': 'Tracked waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/3', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
+]
+items = p.fetch({'codeDir': '/tmp/nonexistent'})
+print(json.dumps({i['title']: i['status'] for i in items}))
+")"
+  check "authored PR with a pending review request shows REVIEW REQUESTED" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored waiting on review'])" <<<"$out")" "REVIEW REQUESTED"
+  check "authored PR with no pending review request keeps NEEDS ATTENTION" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored no reviewer yet'])" <<<"$out")" "NEEDS ATTENTION"
+  check "tracked PR with a pending review request keeps the author prefix" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Tracked waiting on review'])" <<<"$out")" "TEAMMATE: REVIEW REQUESTED"
+}
+test_fetch_shows_review_requested_status_on_authored_and_tracked_prs
+
+test_tracked_attention_wins_over_duplicate_review_request() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+
+pr = {'number': 7, 'title': 'Tracked PR', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/pull/7'}
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return [dict(pr)]
+    if args[:2] == ['pr', 'view']:
+        return {'closingIssuesReferences': []}
+    return []
+
+
+p._gh_json = fake_gh_json
+p._fetch_my_repo_issues = lambda: []
+p._fetch_pr_attention = lambda author, *_: [dict(pr)] if author == 'teammate' else []
+items = p._fetch_raw({'github': {'trackAuthors': ['teammate']}})
+print([(item['type'], item.get('tracked_author')) for item in items])
+")"
+  check "tracked attention keeps its author context when it duplicates a review request" \
+    "$out" "[('tracked_attention', 'teammate')]"
+}
+test_tracked_attention_wins_over_duplicate_review_request
 test_github_session_prompt_state_aware() {
   local out
   out="$(python3 -c "

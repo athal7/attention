@@ -146,7 +146,7 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,reviewRequests",
         ])
         if not isinstance(detail, dict):
             return None
@@ -181,6 +181,7 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
 
         if not reasons:
             return None
+        p["reviewRequested"] = bool(detail.get("reviewRequests"))
         p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
         p["attention_reasons"] = reasons
         return p
@@ -406,12 +407,11 @@ def _fetch_raw(config):
     # I authored could also be review-requested; an issue assigned to me in
     # my own repo matches both the assignee and owner queries). Issue and PR
     # numbers share one counter per repo, so (repo, number) alone uniquely
-    # identifies the item. Concatenation order decides which variant wins:
-    # review-request/authored-attention carry more specific detail than a
-    # plain assigned/repo listing, so they're listed first.
+    # identifies the item. A tracked-attention item has the extra tracked
+    # author context, so it wins over a duplicate review-request item.
     seen = set()
     combined = []
-    for item in review_prs + authored_prs + tracked_prs + assigned_issues + repo_issues + notifications:
+    for item in tracked_prs + review_prs + authored_prs + assigned_issues + repo_issues + notifications:
         key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
         if key in seen:
             continue
@@ -492,9 +492,13 @@ def fetch(config):
             weight, status = 90, "REVIEW REQUESTED"
         elif gtype == "authored_attention":
             weight, status = 88, "NEEDS ATTENTION"
+            if g.get("reviewRequested"):
+                status = "REVIEW REQUESTED"
             details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "tracked_attention":
             weight, status = 85, f"{g.get('tracked_author', '').upper()}: NEEDS ATTENTION"
+            if g.get("reviewRequested"):
+                status = f"{g.get('tracked_author', '').upper()}: REVIEW REQUESTED"
             details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
