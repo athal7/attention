@@ -25,8 +25,10 @@ def run_cmd(cmd):
     try:
         print(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
+        return True
     except Exception as e:
         print(f"Command failed: {e}")
+        return False
 
 
 def dispatch_background(cmd):
@@ -46,8 +48,10 @@ def dispatch_background(cmd):
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
             print(f"Dispatched in background (log: {log_path}): {' '.join(cmd)}")
+            return True
         except Exception as e:
             print(f"Failed to dispatch: {e}")
+            return False
 
 
 def copy_to_clipboard(text):
@@ -165,6 +169,7 @@ def resolve_configured_actions(configured_actions, record):
             "key": key,
             "label": a.get("label", ""),
             "primary": a.get("primary", False),
+            "wip": a.get("wip", False),
             "payload": payload,
         })
     return actions
@@ -214,10 +219,15 @@ def prompt_for_input(spec):
 
 
 def run_configured_action(payload):
+    """Run a configured action's command. Returns True when the command
+    actually ran (or was dispatched in the background), and False when it
+    could not run -- no command, a canceled input prompt, or a failed
+    command -- so callers can tell a completed action from a canceled one.
+    """
     command = payload.get("command")
     if not command:
         print("No command configured.")
-        return
+        return False
     specs = payload.get("inputs")
     if specs:
         values = {}
@@ -225,7 +235,7 @@ def run_configured_action(payload):
             name = spec.get("name", "")
             value = prompt_for_input(spec)
             if value is None:
-                return
+                return False
             values[name] = value
 
         def _fill(tok):
@@ -238,6 +248,5 @@ def run_configured_action(payload):
 
         command = [_fill(tok) for tok in command]
     if payload.get("background"):
-        dispatch_background(command)
-    else:
-        run_cmd(command)
+        return dispatch_background(command)
+    return run_cmd(command)

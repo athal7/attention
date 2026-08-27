@@ -18,7 +18,7 @@ Config (config["generic"]): a dict of named providers, e.g.
           "id": "{number}",
           "weight": 85,
           "actions": [
-            {"key": "alt-o", "label": "open", "primary": true, "command": ["open", "{url}"]}
+            {"key": "O", "label": "open", "primary": true, "command": ["open", "{url}"]}
           ]
         }
       }
@@ -132,4 +132,4 @@ def fetch(config):
 
 
 def act(key, payload):
-    run_configured_action(payload)
+    return run_configured_action(payload)

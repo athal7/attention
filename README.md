@@ -31,19 +31,19 @@ In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
 row. Press Enter after an action to return to the dashboard. `Esc` quits.
 
-Type text to filter visible rows. Use Backspace to edit the filter. A bare
-letter or digit action runs first when the selected row supports it. Otherwise,
-use Up/Down or `j`/`k` to move, `q` to quit, and other printable characters to
-filter. Send `Alt` plus a letter for an `alt-<letter>` action.
+Type lowercase letters or digits to filter visible rows; use Backspace to edit
+the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter` to run a
+row's primary action. Press a capital letter to run an action on the highlighted
+row -- hold Shift and press the key shown in that row's footer hint.
 
-Press `⌥w` to mark an item as work in progress. Press it again to clear the mark. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
+An item is marked work in progress by running a custom action configured with `"wip": true`, then unmarked by one configured with `"wip": "clear"` (see [Configuration](#configuration)). Either update lands only when the action completes successfully -- a canceled prompt or a failed command leaves the current state unchanged. Marked items show a `WORK IN PROGRESS` banner in their details. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
 
 | Row type | Hotkeys |
 |---|---|
-| Calendar event | `⌥y` yank to clipboard; `⌥x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
-| Reminder | `⌥x` complete |
-| GitHub PR/issue | `⌥o` open · `⌥a` approve · `⌥m` merge (squash + delete branch, confirms first) · `⌥c` comment · `⌥g` add label. If the item cross-links to a Linear issue (title contains its identifier): `O`/`C`/`T` open/comment/transition the *linked Linear issue* instead |
-| Linear issue | `⌥o` open · `⌥c` comment · `⌥t` transition (lists the issue's own team's workflow states) |
+| Calendar event | `Y` yank to clipboard; `X` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
+| Reminder | `X` complete |
+| GitHub PR/issue | `O` open · `A` approve · `M` merge (squash + delete branch, confirms first) · `C` comment · `G` add label. If the item cross-links to a Linear issue (title contains its identifier), that issue's open/comment/transition actions are folded in too, each labeled *(linked)*; any key that collides with an existing one is remapped to a digit, shown in the footer hint |
+| Linear issue | `O` open · `C` comment · `T` transition (lists the issue's own team's workflow states) |
 
 ## Configuration
 
@@ -59,14 +59,14 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "github":    {
     "actions": [
       {
-        "key": "alt-s",
+        "key": "S",
         "label": "session",
         "background": true,
         "command": ["my-session", "-d", "{repo_path}", "-n", "{slug}", "{input}"],
         "input": { "prompt": "Session message", "default": "Work on issue {id} in this repo" }
       },
       {
-        "key": "alt-l",
+        "key": "L",
         "label": "lumen",
         "command": ["lumen", "diff", "{url}"]
       }
@@ -92,7 +92,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new review comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.botReviewAllowlist` | GitHub bot logins (e.g. `"coderabbitai[bot]"`, with or without the suffix) whose review comments still count toward "needs attention". Every other reviewer GitHub's API reports as a bot actor is ignored by default -- automated review noise doesn't inflate a PR's attention score. Missing/empty = no bot reviews count. |
-| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
+| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, optional `"wip": true` to mark or `"wip": "clear"` to unmark the item when it runs successfully, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. `contextPrefixes` matches item contexts that start with one of its values. Exactly one fallback is required when groups are configured. |
 
@@ -125,7 +125,11 @@ cannot hide attention items.
   back in); issues assigned to you; open issues in repos you own regardless
   of assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
   hidden. De-duplicated by repo+number if an item matches more than one of
-  these.
+  these. Also surfaces unread GitHub notifications (`mention`, `author`,
+  `state_change`, `ci_activity`) via `gh api /notifications`, which catches
+  items the search-based queries miss: direct mentions, comments on your PRs
+  that aren't review comments, state changes on subscribed PRs, and CI
+  failures on watched repos.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate
   state, in your current cycle. Its status always wins on a cross-linked
   dashboard row: a PR title/body mentioning the issue's identifier folds
