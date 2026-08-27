@@ -278,6 +278,8 @@ class CursesPresenter:
         self._rows = []
         self._pending = []
         self._stopped = False
+        self._snapshot_version = 0
+        self._last_selection = 0
 
     def launch(self):
         with self._lock:
@@ -287,6 +289,7 @@ class CursesPresenter:
         with self._lock:
             self._rows = list(rows)
             self._pending = list(pending)
+            self._snapshot_version += 1
 
     def wait_for_exit(self, timeout):
         import curses
@@ -299,7 +302,7 @@ class CursesPresenter:
 
     def _snapshot(self):
         with self._lock:
-            return list(self._rows), list(self._pending), self._stopped
+            return list(self._rows), list(self._pending), self._stopped, self._snapshot_version
 
     @staticmethod
     def _matching_rows(rows, query):
@@ -379,10 +382,10 @@ class CursesPresenter:
             curses.curs_set(0)
         except curses.error:
             pass
-        selected = 0
+        selected = self._last_selection
         query = ""
         while True:
-            rows, pending, stopped = self._snapshot()
+            rows, pending, stopped, version = self._snapshot()
             if stopped:
                 return PresenterResult("", "")
             visible, selected = self._draw(screen, rows, pending, selected, query)
@@ -390,6 +393,11 @@ class CursesPresenter:
                 return PresenterResult(None, "")
             key = self._read_key(screen)
             if key == -1:
+                # Check for a new snapshot pushed by the controller
+                # (e.g. after an action) without exiting the loop.
+                _, _, stopped2, version2 = self._snapshot()
+                if stopped2 or version2 != version:
+                    continue
                 continue
             if key == 27:
                 return PresenterResult("", "")
@@ -400,11 +408,13 @@ class CursesPresenter:
                 row = visible[selected]
                 if isinstance(key, str):
                     if key in self._action_keys(row):
+                        self._last_selection = selected
                         return PresenterResult(key, row)
                     continue
                 if 0 <= key <= 255:
                     char = chr(key)
                     if char in self._action_keys(row):
+                        self._last_selection = selected
                         return PresenterResult(char, row)
             if key == ord("q"):
                 return PresenterResult("", "")
@@ -415,6 +425,7 @@ class CursesPresenter:
                 selected = (selected + 1) % len(visible)
                 continue
             if key in (curses.KEY_ENTER, 10, 13) and visible:
+                self._last_selection = selected
                 return PresenterResult("", visible[selected])
             if not visible:
                 if isinstance(key, int) and 32 <= key <= 255:

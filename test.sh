@@ -2988,7 +2988,90 @@ print(all(bare_results))
   check "curses presenter maps an Escape-prefixed letter to its alt action" "$(sed -n 2p <<<"$out")" "True"
   check "curses presenter dispatches bare q, j, and k actions before controls" "$(sed -n 3p <<<"$out")" "True"
 }
+test_curses_presenter_preserves_selection_after_action() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import time
+
+class FakeScreen:
+    def __init__(self, keys):
+        self._keys = list(keys)
+    def keypad(self, v):
+        pass
+    def timeout(self, v):
+        pass
+    def getmaxyx(self):
+        return (24, 80)
+    def erase(self):
+        pass
+    def addnstr(self, *a, **k):
+        pass
+    def refresh(self):
+        pass
+    def getch(self):
+        return self._keys.pop(0) if self._keys else -1
+
+rows = [
+    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'alt-o' + chr(9) + 'hint',
+    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'O' + chr(9) + 'hint',
+    'Deploy hotfix' + chr(9) + 'blob3' + chr(9) + 'D' + chr(9) + 'hint',
+]
+presenter = d.CursesPresenter()
+presenter.launch()
+presenter.push_snapshot(rows, [])
+# Navigate to the third row (index 2), then press its action key 'D'.
+result = presenter._run(FakeScreen([ord('j'), ord('j'), ord('D')]), time.monotonic() + 1)
+# Selection should be preserved at index 2 after the action.
+print(presenter._last_selection)
+print(result == d.PresenterResult('D', rows[2]))
+")"
+  check "flat presenter preserves selection index after action key" "$(sed -n 1p <<<"$out")" "2"
+  check "flat presenter dispatches the action on the selected row" "$(sed -n 2p <<<"$out")" "True"
+}
+test_curses_presenter_detects_inflight_snapshot_update() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import time
+
+class FakeScreen:
+    def __init__(self, keys):
+        self._keys = list(keys)
+    def keypad(self, v):
+        pass
+    def timeout(self, v):
+        pass
+    def getmaxyx(self):
+        return (24, 80)
+    def erase(self):
+        pass
+    def addnstr(self, *a, **k):
+        pass
+    def refresh(self):
+        pass
+    def getch(self):
+        return self._keys.pop(0) if self._keys else -1
+
+presenter = d.CursesPresenter()
+presenter.launch()
+rows1 = ['Item A' + chr(9) + 'blob1' + chr(9) + 'a' + chr(9) + 'hint']
+presenter.push_snapshot(rows1, [])
+# Simulate a snapshot update arriving while the presenter is waiting.
+rows2 = ['Item A' + chr(9) + 'blob1' + chr(9) + 'a' + chr(9) + 'hint', 'Item B' + chr(9) + 'blob2' + chr(9) + 'b' + chr(9) + 'hint']
+presenter.push_snapshot(rows2, [])
+# No keys to press; presenter should detect the version change and loop.
+# After deadline, it returns None.
+result = presenter._run(FakeScreen([]), time.monotonic() + 0.5)
+print(result.key is None)
+print(presenter._snapshot_version >= 2)
+")"
+  check "presenter detects in-flight snapshot version change" "$(sed -n 1p <<<"$out")" "True"
+  check "presenter snapshot version incremented after push" "$(sed -n 2p <<<"$out")" "True"
+}
 test_curses_presenter_dispatches_filtered_and_alt_actions
+test_curses_presenter_preserves_selection_after_action
+test_curses_presenter_detects_inflight_snapshot_update
 echo "== dashboard groups =="
 
 test_dashboard_group_rules_and_rows() {
