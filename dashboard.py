@@ -134,6 +134,11 @@ class DashboardController:
                     continue
                 if result.row == "":
                     return not self._empty_final
+                if result.key == "":
+                    # Enter pressed on a row — relaunch presenter without
+                    # advancing the round so the list stays on screen.
+                    self._relaunch_presenter()
+                    continue
                 item_id = self._item_id_for(result.key, result.row)
                 self._act(result.key, result.row)
                 self._acknowledge_action()
@@ -497,31 +502,36 @@ class CursesGroupPresenter:
         screen.refresh()
         return visible_groups
 
-    def _open_group(self, screen, group, deadline):
-        presenter = CursesPresenter(group)
-        with self._lock:
-            self._active_group = group
-            self._active_presenter = presenter
-            rows = self._rows_for_group(group, self._rows)
-            pending = list(self._pending)
-        try:
-            presenter.launch()
-            presenter.push_snapshot(rows, pending)
-            return presenter._run(screen, deadline)
-        finally:
-            presenter.stop()
-            with self._lock:
-                if self._active_presenter is presenter:
-                    self._active_presenter = None
-                    self._active_group = None
 
     def _open_group_and_track(self, screen, group, deadline):
-        result = self._open_group(screen, group, deadline)
-        should_return = result.key is None or bool(result.key) or bool(result.row)
-        if should_return:
+        last_selection = 0
+        while True:
+            presenter = CursesPresenter(group)
+            presenter._last_selection = last_selection
             with self._lock:
-                self._reopen_group = group
-        return result, should_return
+                self._active_group = group
+                self._active_presenter = presenter
+                rows = self._rows_for_group(group, self._rows)
+                pending = list(self._pending)
+            try:
+                presenter.launch()
+                presenter.push_snapshot(rows, pending)
+                result = presenter._run(screen, deadline)
+            finally:
+                presenter.stop()
+                with self._lock:
+                    if self._active_presenter is presenter:
+                        self._active_presenter = None
+                        self._active_group = None
+            if result.key == "" and result.row != "":
+                # Enter was pressed on a row — stay in the group.
+                last_selection = presenter._last_selection
+                continue
+            should_return = result.key is None or bool(result.key)
+            if should_return:
+                with self._lock:
+                    self._reopen_group = group
+            return result, should_return
 
     def _run(self, screen, deadline):
         import curses

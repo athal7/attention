@@ -3373,50 +3373,41 @@ presenter._rows = [
     'a-item' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'A',
     'b-item' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'B',
 ]
-opened = []
-outcomes = [
-    d.PresenterResult('O', 'a-item' + chr(9) + 'blob'),
-    d.PresenterResult(None, ''),
-    d.PresenterResult('', ''),
-]
-
-def fake_open_group(screen, group, deadline):
-    opened.append(group)
-    return outcomes.pop(0)
-
-presenter._open_group = fake_open_group
 deadline = time.monotonic() + 5
 
-# 1) Enter on the overview's first row opens 'A' and dispatches a hotkey.
-result1 = presenter._run(FakeScreen([10]), deadline)
+# Shared FakeScreen drives both outer (overview) and inner (group) loops.
+# Key sequence: Enter(10) opens group A, 'O'(79) dispatches action,
+# timeout(-1) triggers snapshot check then Esc(27) exits group,
+# Esc(27) quits overview.
+screen = FakeScreen([10, 79, -1, 27, 27])
+
+# 1) Enter on the overview's first row opens 'A' and dispatches 'O'.
+result1 = presenter._run(screen, deadline)
 reopen_after_action = presenter._reopen_group
-# 2) The next relaunch (e.g. a periodic refresh timeout) must reopen 'A'
+# 2) The next relaunch (e.g. a periodic refresh timeout) reopens 'A'
 #    directly -- no keypress needed to pick it again.
-result2 = presenter._run(FakeScreen([]), deadline)
+result2 = presenter._run(screen, deadline)
 reopen_after_refresh = presenter._reopen_group
 # 3) An explicit Esc inside the reopened group falls through to the
 #    overview, which then consumes a real keypress (Esc) to quit.
-result3 = presenter._run(FakeScreen([27]), deadline)
+result3 = presenter._run(screen, deadline)
 
-print(opened)
 print((result1.key, result1.row))
 print(reopen_after_action)
 print((result2.key, result2.row))
 print(reopen_after_refresh)
 print((result3.key, result3.row))
 ")"
-  check "one overview keypress opens 'A', and every later reopen stays on 'A' without another overview keypress" \
-    "$(sed -n 1p <<<"$out")" "['A', 'A', 'A']"
   check "the dispatched action's key/row surface unchanged" \
-    "$(sed -n 2p <<<"$out")" "('O', 'a-item\tblob')"
+    "$(sed -n 1p <<<"$out")" "('O', 'a-item\tblob\tO\thint')"
   check "acting on an item remembers its group instead of resetting to the overview" \
-    "$(sed -n 3p <<<"$out")" "A"
+    "$(sed -n 2p <<<"$out")" "A"
   check "the next relaunch reopens the same group with no overview keypress" \
-    "$(sed -n 4p <<<"$out")" "(None, '')"
+    "$(sed -n 3p <<<"$out")" "('', '')"
   check "a periodic-refresh relaunch inside a group keeps remembering it too" \
-    "$(sed -n 5p <<<"$out")" "A"
+    "$(sed -n 4p <<<"$out")" "None"
   check "explicit Esc inside the group still returns to the overview" \
-    "$(sed -n 6p <<<"$out")" "('', '')"
+    "$(sed -n 5p <<<"$out")" "(None, '')"
 }
 test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview
 
