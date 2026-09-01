@@ -117,6 +117,7 @@ def _fetch_provider(name, spec):
             "weight": _resolve_weight(spec.get("weight"), record),
             "id": _resolve(spec.get("id", ""), record),
             "indicators": _resolve_indicators(spec.get("indicators"), record),
+            "kind": _resolve(spec.get("kind", name), record),
             "actions": resolve_configured_actions(spec.get("actions", []), record),
         })
     return items

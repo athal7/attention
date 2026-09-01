@@ -608,6 +608,14 @@ def fetch(config):
                 "review": "…" if gtype == "review_request" else "—",
                 "stacked": "—",
             }
+        if gtype in {"assigned_issue", "repo_issue"} and not indicators:
+            indicators = {"state": status}
+        kind = (
+            "pull_request" if is_pull_request
+            else "issue" if gtype in {"assigned_issue", "repo_issue"}
+            else "notification" if gtype == "notification"
+            else "other"
+        )
 
         dir_name = repo_dir_index.get(repo_name.lower(), repo_name.split("/")[-1])
         repo_path = os.path.join(code_dir, dir_name)
@@ -646,6 +654,7 @@ def fetch(config):
             "indicators": indicators or {},
             "weight": weight,
             "id": number,
+            "kind": kind,
             "created_at": g.get("createdAt", ""),
             "absorb_note": f"{details}: {title}" if details else f"{status}: {title}",
             "identity_key": f"github:{repo_name.lower()}#{number}",

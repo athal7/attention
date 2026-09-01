@@ -113,6 +113,7 @@ def fetch(config):
             "details": time_tag,
             "weight": weight,
             "id": event_id,
+            "kind": "event",
             "actions": actions,
         })
     return items

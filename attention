@@ -237,6 +237,7 @@ class Item(ItemRequired, total=False):
     association_keys: list
     status_priority: int
     indicators: dict[str, str]
+    kind: str
 
 
 def validate_and_normalize_item(item, name):
@@ -305,6 +306,11 @@ def validate_and_normalize_item(item, name):
         )
     ):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'indicators' must be a mapping of non-empty strings to strings")
+
+    if "kind" not in item:
+        item["kind"] = ""
+    elif not isinstance(item["kind"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'kind' must be of type str, got {type(item['kind']).__name__}")
 
     if "actions" not in item:
         item["actions"] = []
@@ -556,6 +562,8 @@ _INDICATOR_LABELS = {
     "ready": "READY",
     "review": "REVIEW",
     "stacked": "STACKED",
+    "state": "STATE",
+    "due": "DUE",
 }
 _INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
 
@@ -672,7 +680,7 @@ def render_dashboard_rows(items, columns=None):
                 f"{indicators.get(key, '—'):<{width}}"
                 for key, _, width in indicator_specs
             )
-            visible = f"{indicator_cells}  {visible}"
+            visible = f"{visible}  {indicator_cells}"
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
         keys_csv = ",".join(a["key"] for a in actions)
@@ -683,15 +691,35 @@ def render_dashboard_rows(items, columns=None):
         rows.append(row)
     return rows
 
+_DEFAULT_DASHBOARD_GROUPS = (
+    {
+        "name": "Pull Requests",
+        "match": {"kinds": ["pull_request"]},
+        "columns": ["ci", "ready", "review", "stacked"],
+    },
+    {"name": "Issues", "match": {"kinds": ["issue"]}, "columns": ["state"]},
+    {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["due"]},
+    {"name": "Events", "match": {"kinds": ["event"]}, "columns": None},
+    {"name": "Other", "fallback": True, "columns": None},
+)
+
+
+def _default_dashboard_groups():
+    return [
+        {key: dict(value) if isinstance(value, dict) else value for key, value in group.items()}
+        for group in _DEFAULT_DASHBOARD_GROUPS
+    ]
+
+
 def dashboard_groups(config):
     dashboard_config = config.get("dashboard")
     if dashboard_config is None:
-        return None, None
+        return _default_dashboard_groups(), None
     if not isinstance(dashboard_config, dict):
         return None, "dashboard configuration must be an object"
     raw_groups = dashboard_config.get("groups")
     if raw_groups is None:
-        return None, None
+        return _default_dashboard_groups(), None
     if not isinstance(raw_groups, list) or not raw_groups:
         return None, "dashboard.groups must be a non-empty list"
 
@@ -730,10 +758,10 @@ def dashboard_groups(config):
             continue
 
         match = raw_group["match"]
-        if not isinstance(match, dict) or set(match) - {"plugins", "contexts", "contextPrefixes", "statuses"}:
-            return None, f"dashboard.groups[{index}].match must contain only plugins, contexts, contextPrefixes, or statuses"
+        if not isinstance(match, dict) or set(match) - {"plugins", "kinds", "contexts", "contextPrefixes", "statuses"}:
+            return None, f"dashboard.groups[{index}].match must contain only plugins, kinds, contexts, contextPrefixes, or statuses"
         normalized_match = {}
-        for key in ("plugins", "contexts", "contextPrefixes", "statuses"):
+        for key in ("plugins", "kinds", "contexts", "contextPrefixes", "statuses"):
             values = match.get(key)
             if values is None:
                 continue
@@ -755,6 +783,7 @@ def _group_matches(item, match):
         return False
     fields = {
         "plugins": item.get("_plugin", ""),
+        "kinds": item.get("kind", ""),
         "contexts": context,
         "statuses": item.get("status", ""),
     }
@@ -763,8 +792,6 @@ def _group_matches(item, match):
         for key, values in match.items()
         if key != "contextPrefixes"
     )
-
-
 def render_grouped_dashboard_rows(items, groups):
     grouped_items = {group["name"]: [] for group in groups}
     fallback = next(group["name"] for group in groups if group.get("fallback"))

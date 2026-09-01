@@ -121,8 +121,10 @@ query {
             "context": project,
             "title": title,
             "details": "",
+            "indicators": {"state": state.upper()},
             "weight": weight,
             "id": identifier,
+            "kind": "issue",
             "absorb_note": f"Linear {identifier}: {state.upper()}",
             "identity_key": f"linear:{identifier}",
             # Linear's workflow state is the authoritative signal for

@@ -74,7 +74,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "linear":    { "apiToken": "lin_api_..." },
   "dashboard": {
     "groups": [
-      { "name": "Pull Requests", "match": { "plugins": ["github"] }, "columns": ["ci", "ready", "review", "stacked"] },
+      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["ci", "ready", "review", "stacked"] },
       { "name": "Needs Attention", "match": { "statuses": ["OVERDUE"] }, "columns": ["due"] },
       { "name": "My Repositories", "match": { "contextPrefixes": ["athal7/"] } },
       { "name": "Ready for Something New", "fallback": true }
@@ -93,31 +93,32 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.botReviewAllowlist` | GitHub bot logins (e.g. `"coderabbitai[bot]"`, with or without the suffix) whose review comments still count toward "needs attention". Every other reviewer GitHub's API reports as a bot actor is ignored by default -- automated review noise doesn't inflate a PR's attention score. Missing/empty = no bot reviews count. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, optional `"wip": true` to mark or `"wip": "clear"` to unmark the item when it runs successfully, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
-| `dashboard.groups` | Optional ordered terminal-dashboard groups. Each entry has a unique `name` and either a `match` object (`plugins`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. `contextPrefixes` matches item contexts that start with one of its values. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
+| `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
 ### Dashboard groups
 
-When `dashboard.groups` is configured, `attention` opens a curses overview.
-It shows the non-empty groups and their current item counts. Use Up/Down or
-`j`/`k` to select a group. Press Enter to open its scoped terminal list. Esc
-in a scoped list returns to the overview. An action or background refresh
-reopens the same group list. This lets you act on an item or section
-repeatedly without returning to the overview.
+The dashboard opens a curses overview with type groups by default. It shows
+pull requests, issues, reminders, events, and other item types separately.
+Use `dashboard.groups` to replace these defaults. Use Up/Down or `j`/`k` to
+select a group. Press Enter to open its scoped terminal list. Esc in a scoped
+list returns to the overview. An action or background refresh reopens the same
+group list.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
-`plugins` and `statuses` matches only items satisfying both. The first matching
+`kinds` and `statuses` matches only items satisfying both. The first matching
 group wins; the fallback receives every remaining item. Invalid grouping
 configuration emits a warning and uses the existing flat dashboard, so it
 cannot hide attention items.
 
-Each group can select a different table with `columns`. The GitHub source
-supplies `ci`, `ready`, `review`, and `stacked` for pull requests. `ready` is
-`×` for a draft and `✓` otherwise. `stacked` is `✓` when the PR targets a
-non-default branch, and `×` when it targets the default branch. A combined
-group can use only keys that all of its sources share. Missing values render as
-`—`. Without explicit `columns`, the dashboard derives the columns from the
-items in the current list.
+Each group can select a different table with `columns`. Columns display after
+the title, context, and details. The GitHub source supplies `ci`, `ready`,
+`review`, and `stacked` for pull requests. Linear and GitHub issues supply
+`state`. `ready` is `×` for a draft and `✓` otherwise. `stacked` is `✓` when
+the PR targets a non-default branch, and `×` when it targets the default
+branch. A combined group can use only keys that all of its sources share.
+Missing values render as `—`. Without explicit `columns`, the dashboard derives
+the columns from the items in the current list.
 
 ## What each bundled plugin surfaces
 

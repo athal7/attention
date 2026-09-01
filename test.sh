@@ -1917,6 +1917,11 @@ print(json.dumps({'query': captured['query'], 'result': result}))
       ok "Linear issues outrank a cross-linked host's status on merge" ;;
     *) bad "Linear issues outrank a cross-linked host's status on merge (got: $out)" ;;
   esac
+  case "$out" in
+    *'"indicators": {"state": "IN PROGRESS"}'*'"kind": "issue"'*)
+      ok "Linear issues expose an issue type and state indicator" ;;
+    *) bad "Linear issues expose an issue type and state indicator (got: $out)" ;;
+  esac
 }
 test_fetch_linear_functional
 
@@ -2334,7 +2339,7 @@ fields = rows[0].split(chr(9))
 print(len(fields))
 print(m.json.loads(fields[4]))
 print(d.CursesPresenter()._indicator_header(rows))
-print(fields[0].startswith('✓') and 'Fix the login bug' in fields[0])
+print(fields[0].index('Fix the login bug') < fields[0].rfind('✓'))
 ")"
   check "dashboard indicator rows add one metadata field for their shared table columns" \
     "$(sed -n 1p <<<"$out")" "5"
@@ -2342,7 +2347,7 @@ print(fields[0].startswith('✓') and 'Fix the login bug' in fields[0])
     "$(sed -n 2p <<<"$out")" "[['CI', 2], ['READY', 5], ['REVIEW', 6], ['STACKED', 7]]"
   check "curses dashboard renders the shared indicator table header" \
     "$(sed -n 3p <<<"$out")" "CI  READY  REVIEW  STACKED"
-  check "dashboard indicator values prefix the unchanged item text" \
+  check "dashboard indicator values follow the item content" \
     "$(sed -n 4p <<<"$out")" "True"
 }
 test_dashboard_indicator_columns_are_shared_per_row_set
@@ -3444,6 +3449,31 @@ print(typed_prefix_error)
   check "non-string context prefix is rejected" "$(sed -n 8p <<<"$out")" "dashboard.groups[1].match.contextPrefixes must be a non-empty list of strings"
 }
 test_dashboard_group_rules_and_rows
+
+test_default_dashboard_groups_items_by_type() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, error = m.dashboard_groups({})
+items = [
+    {'status': 'S', 'context': 'c', 'title': 'PR', 'details': '', 'weight': 1, 'kind': 'pull_request', 'indicators': {'ci': '✓'}, 'actions': []},
+    {'status': 'S', 'context': 'c', 'title': 'Issue', 'details': '', 'weight': 1, 'kind': 'issue', 'indicators': {'state': 'OPEN'}, 'actions': []},
+    {'status': 'S', 'context': 'c', 'title': 'Reminder', 'details': '', 'weight': 1, 'kind': 'reminder', 'indicators': {'due': '×'}, 'actions': []},
+    {'status': 'S', 'context': 'c', 'title': 'Event', 'details': '', 'weight': 1, 'kind': 'event', 'actions': []},
+]
+rows = m.render_grouped_dashboard_rows(items, groups)
+print(error)
+print([group['name'] for group in groups])
+print([row.rpartition(chr(9))[2] for row in rows])
+")"
+  check "dashboard uses typed groups when no groups configuration exists" \
+    "$(sed -n 1p <<<"$out")" "None"
+  check "default dashboard groups define pull request, issue, reminder, event, and fallback sections" \
+    "$(sed -n 2p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events', 'Other']"
+  check "default dashboard groups route each built-in item type to its own section" \
+    "$(sed -n 3p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events']"
+}
+test_default_dashboard_groups_items_by_type
 
 test_curses_group_presenter_scopes_rows() {
   local out

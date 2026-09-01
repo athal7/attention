@@ -78,6 +78,7 @@ def fetch(config):
             "indicators": {"due": due_indicator},
             "weight": weight,
             "id": reminder_id,
+            "kind": "reminder",
             "absorb_note": f"Reminder: {title}",
             "actions": actions,
         })

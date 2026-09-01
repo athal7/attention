@@ -66,6 +66,7 @@ omitted.
     "association_keys": [],                 # list[str], optional (default []) -- identity keys this item absorbs
     "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
     "indicators": {"ci": "✓"},       # dict[str, str], optional (default {}) -- shared dashboard table cells
+    "kind": "issue",                 # str, optional (default "") -- dashboard type-group selector
     "actions": [                     # list, optional (default [])
         {
             "key": "o",              # str, required -- one ASCII letter or digit; dashboard reserves lowercase q, j, and k
@@ -118,6 +119,11 @@ Configure a group table with the indicator keys that it should display:
 
 The dashboard displays an upper-case label for each key. A combined group
 should select only shared keys. Missing keys display `—`.
+
+Every bundled source assigns a `kind`. The default dashboard groups pull
+requests, issues, reminders, and events by this value. Custom sources should
+set a stable kind such as `incident` or `deployment`. Group rules can match
+`kinds` in addition to `plugins`, `contexts`, `contextPrefixes`, and `statuses`.
 
 Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
@@ -251,6 +257,7 @@ under `config["generic"]`:
       "title": "{title}",
       "id": "{number}",
       "indicators": {"ready": "{ready_symbol}", "owner": "{owner}"},
+      "kind": "pull_request",
       "weight": 85,
       "actions": [
         {"key": "o", "label": "open", "primary": true, "command": ["open", "{url}"]}
