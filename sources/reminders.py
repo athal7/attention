@@ -38,6 +38,7 @@ def fetch(config):
         weight = 50
         status = "PENDING"
         details = ""
+        due_indicator = "—"
         if due:
             details = f"Due: {due[:10]}"
             status = "DUE"
@@ -45,8 +46,12 @@ def fetch(config):
                 due_date = date.fromisoformat(due[:10])
                 if due_date < date.today():
                     weight, status = 95, "OVERDUE"
+                    due_indicator = "×"
                 elif due_date == date.today():
                     weight, status = 85, "DUE TODAY"
+                    due_indicator = "!"
+                else:
+                    due_indicator = "✓"
             except Exception:
                 pass
         else:
@@ -70,6 +75,7 @@ def fetch(config):
             "context": list_name,
             "title": title,
             "details": details,
+            "indicators": {"due": due_indicator},
             "weight": weight,
             "id": reminder_id,
             "absorb_note": f"Reminder: {title}",

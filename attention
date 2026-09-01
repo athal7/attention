@@ -236,6 +236,7 @@ class Item(ItemRequired, total=False):
     identity_key: str
     association_keys: list
     status_priority: int
+    indicators: dict[str, str]
 
 
 def validate_and_normalize_item(item, name):
@@ -293,6 +294,17 @@ def validate_and_normalize_item(item, name):
         item["status_priority"] = 0
     elif isinstance(item["status_priority"], bool) or not isinstance(item["status_priority"], int):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'status_priority' must be of type int, got {type(item['status_priority']).__name__}")
+
+    if "indicators" not in item:
+        item["indicators"] = {}
+    elif (
+        not isinstance(item["indicators"], dict)
+        or not all(
+            isinstance(key, str) and key and isinstance(value, str)
+            for key, value in item["indicators"].items()
+        )
+    ):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'indicators' must be a mapping of non-empty strings to strings")
 
     if "actions" not in item:
         item["actions"] = []
@@ -539,6 +551,42 @@ def _normalize_row_text(items):
         item["title"] = item.get("title", "").replace("\t", " ")
         item["details"] = item.get("details", "").replace("\t", " ")
 
+_INDICATOR_LABELS = {
+    "ci": "CI",
+    "ready": "READY",
+    "review": "REVIEW",
+    "stacked": "STACKED",
+}
+_INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
+
+
+def _indicator_columns(items, columns):
+    if columns is not None:
+        return columns
+    found = {
+        key
+        for item in items
+        for key in item.get("indicators", {})
+    }
+    return [
+        *[key for key in _INDICATOR_ORDER if key in found],
+        *sorted(found - set(_INDICATOR_ORDER)),
+    ]
+
+
+def _indicator_specs(items, columns):
+    return [
+        (
+            key,
+            _INDICATOR_LABELS.get(key, key.replace("_", " ").upper()),
+            max(
+                len(_INDICATOR_LABELS.get(key, key.replace("_", " ").upper())),
+                *(len(item.get("indicators", {}).get(key, "—")) for item in items),
+            ),
+        )
+        for key in _indicator_columns(items, columns)
+    ]
+
 
 def _row_columns(items, include_status=True):
     import shutil
@@ -604,27 +652,35 @@ def render_rows(items):
     return rows
 
 
-def render_dashboard_rows(items):
-    """Interactive-dashboard-only row renderer: title, context, and details
-    are visible; a status column is omitted. The three hidden fields are the
-    opaque action list, this item's action-key CSV for focus-scoped rebinding,
-    and the footer hint.
-
-    Row shape: TITLE  CONTEXT  DETAILS \t<base64 actions>\t<row keys csv>\tHINT
-    """
+def render_dashboard_rows(items, columns=None):
+    """Render interactive rows with optional shared indicator columns."""
     _normalize_row_text(items)
     status_col, context_col, title_col = _row_columns(items, include_status=False)
+    indicator_specs = _indicator_specs(items, columns)
+    indicator_metadata = json.dumps([
+        (label, width) for _, label, width in indicator_specs
+    ])
 
     rows = []
     for item in items:
         visible = _visible_row_text(
             item, status_col, context_col, title_col, include_status=False,
         )
+        if indicator_specs:
+            indicators = item.get("indicators", {})
+            indicator_cells = "  ".join(
+                f"{indicators.get(key, '—'):<{width}}"
+                for key, _, width in indicator_specs
+            )
+            visible = f"{indicator_cells}  {visible}"
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
         keys_csv = ",".join(a["key"] for a in actions)
         hint = _dashboard_hint_for_actions(actions)
-        rows.append(f"{visible}\t{blob}\t{keys_csv}\t{hint}")
+        row = f"{visible}\t{blob}\t{keys_csv}\t{hint}"
+        if indicator_specs:
+            row = f"{row}\t{indicator_metadata}"
+        rows.append(row)
     return rows
 
 def dashboard_groups(config):
@@ -645,7 +701,7 @@ def dashboard_groups(config):
     for index, raw_group in enumerate(raw_groups, 1):
         if not isinstance(raw_group, dict):
             return None, f"dashboard.groups[{index}] must be an object"
-        if set(raw_group) - {"name", "match", "fallback"}:
+        if set(raw_group) - {"name", "match", "fallback", "columns"}:
             return None, f"dashboard.groups[{index}] has an unsupported field"
         name = raw_group.get("name")
         if not isinstance(name, str) or not name.strip() or "\t" in name or "\n" in name:
@@ -655,13 +711,22 @@ def dashboard_groups(config):
             return None, f"dashboard.groups contains duplicate name {name!r}"
         names.add(name)
 
+        columns = raw_group.get("columns")
+        if columns is not None and (
+            not isinstance(columns, list)
+            or not columns
+            or not all(isinstance(column, str) and column for column in columns)
+            or len(set(columns)) != len(columns)
+        ):
+            return None, f"dashboard.groups[{index}].columns must be a non-empty list of unique strings"
+
         is_fallback = raw_group.get("fallback") is True
         has_match = "match" in raw_group
         if is_fallback == has_match:
             return None, f"dashboard.groups[{index}] must declare exactly one of match or fallback"
         if is_fallback:
             fallback_count += 1
-            groups.append({"name": name, "fallback": True})
+            groups.append({"name": name, "fallback": True, "columns": columns})
             continue
 
         match = raw_group["match"]
@@ -675,7 +740,7 @@ def dashboard_groups(config):
             if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
                 return None, f"dashboard.groups[{index}].match.{key} must be a non-empty list of strings"
             normalized_match[key] = list(values)
-        groups.append({"name": name, "match": normalized_match})
+        groups.append({"name": name, "match": normalized_match, "columns": columns})
 
     if fallback_count != 1:
         return None, "dashboard.groups must declare exactly one fallback group"
@@ -701,9 +766,9 @@ def _group_matches(item, match):
 
 
 def render_grouped_dashboard_rows(items, groups):
-    grouped_rows = {group["name"]: [] for group in groups}
+    grouped_items = {group["name"]: [] for group in groups}
     fallback = next(group["name"] for group in groups if group.get("fallback"))
-    for item, row in zip(items, render_dashboard_rows(items)):
+    for item in items:
         group_name = next(
             (
                 group["name"]
@@ -712,11 +777,13 @@ def render_grouped_dashboard_rows(items, groups):
             ),
             fallback,
         )
-        grouped_rows[group_name].append(f"{row}\t{group_name}")
+        grouped_items[group_name].append(item)
     return [
-        row
+        f"{row}\t{group['name']}"
         for group in groups
-        for row in grouped_rows[group["name"]]
+        for row in render_dashboard_rows(
+            grouped_items[group["name"]], group.get("columns"),
+        )
     ]
 
 

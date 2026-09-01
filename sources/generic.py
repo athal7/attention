@@ -76,6 +76,17 @@ def _resolve_weight(spec, record, default=50):
     except (TypeError, ValueError):
         return default
 
+def _resolve_indicators(spec, record):
+    if not isinstance(spec, dict):
+        return {}
+    return {
+        key: _resolve(value, record)
+        for key, value in spec.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+
+
+
 
 def _fetch_provider(name, spec):
     command = spec.get("command")
@@ -105,6 +116,7 @@ def _fetch_provider(name, spec):
             "details": _resolve(spec.get("details", ""), record),
             "weight": _resolve_weight(spec.get("weight"), record),
             "id": _resolve(spec.get("id", ""), record),
+            "indicators": _resolve_indicators(spec.get("indicators"), record),
             "actions": resolve_configured_actions(spec.get("actions", []), record),
         })
     return items

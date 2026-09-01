@@ -65,6 +65,7 @@ omitted.
     "identity_key": "github:myorg/myrepo#42", # str, optional (default "") -- provider-qualified association target
     "association_keys": [],                 # list[str], optional (default []) -- identity keys this item absorbs
     "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
+    "indicators": {"ci": "✓"},       # dict[str, str], optional (default {}) -- shared dashboard table cells
     "actions": [                     # list, optional (default [])
         {
             "key": "o",              # str, required -- one ASCII letter or digit; dashboard reserves lowercase q, j, and k
@@ -77,6 +78,46 @@ omitted.
     ],
 }
 ```
+
+`indicators` holds compact values for table columns. Keys are shared column
+identifiers such as `ci`, `ready`, `review`, and `stacked`. Values are visible
+strings, usually `✓`, `×`, `…`, or `—`. A dashboard group selects its columns
+by key. An item without a selected key shows `—`.
+
+### Indicator tables
+
+Use the same indicator key only when it has the same meaning in every source.
+For example, `ready` means that the item is ready for the next user action.
+Do not use `ready` only to show that a source returned data.
+
+```python
+{
+    "status": "BLOCKED",
+    "context": "Payments",
+    "title": "Investigate checkout timeout",
+    "details": "Customer impact",
+    "weight": 90,
+    "id": "INC-42",
+    "indicators": {
+        "severity": "P1",
+        "owner": "ME",
+        "ready": "×",
+    },
+}
+```
+
+Configure a group table with the indicator keys that it should display:
+
+```json
+{
+  "name": "Incidents",
+  "match": { "plugins": ["incidents"] },
+  "columns": ["severity", "owner", "ready"]
+}
+```
+
+The dashboard displays an upper-case label for each key. A combined group
+should select only shared keys. Missing keys display `—`.
 
 Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
@@ -209,6 +250,7 @@ under `config["generic"]`:
       "context": "{repository.nameWithOwner}",
       "title": "{title}",
       "id": "{number}",
+      "indicators": {"ready": "{ready_symbol}", "owner": "{owner}"},
       "weight": 85,
       "actions": [
         {"key": "o", "label": "open", "primary": true, "command": ["open", "{url}"]}
@@ -218,10 +260,9 @@ under `config["generic"]`:
 }
 ```
 
-`command` must print a JSON array to stdout; each element is one
-record. Every text field (`status`/`context`/`title`/`details`/`id`,
-and each action's `command` tokens) is a template: plain text is used
-as-is, and `{dotted.path}` substitutes that field from the record
+Every text field (`status`/`context`/`title`/`details`/`id`, each
+`indicators` value, and each action's `command` token) is a template: plain
+text is used as-is, and `{dotted.path}` substitutes that field from the record
 (missing paths become `""`). `weight` is a plain int, or a `{path}`
 template parsed as one (falling back to `50` if that fails). An action
 may set `"background": true` to dispatch via `dispatch_background`

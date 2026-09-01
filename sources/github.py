@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
@@ -101,8 +102,58 @@ def _fetch_review_bot_flags(repo, number):
             flags[login] = author.get("__typename") == "Bot"
     return flags
 
+def _default_branch(repo, branches, lock):
+    with lock:
+        if repo in branches:
+            return branches[repo]
+        data = _gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])
+        branch = ((data or {}).get("defaultBranchRef") or {}).get("name", "")
+        branches[repo] = branch
+        return branch
 
-def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
+
+def _pr_indicators(detail, is_draft, default_branch):
+    checks = detail.get("statusCheckRollup") or []
+    failing_checks = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+    complete_checks = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    conclusions = {check.get("conclusion") for check in checks}
+    if conclusions & failing_checks:
+        ci = "×"
+    elif checks and conclusions <= complete_checks:
+        ci = "✓"
+    elif checks:
+        ci = "…"
+    else:
+        ci = "—"
+
+    review_states = {review.get("state") for review in detail.get("latestReviews") or []}
+    if "CHANGES_REQUESTED" in review_states:
+        review = "×"
+    elif detail.get("reviewDecision") == "APPROVED":
+        review = "✓"
+    elif detail.get("reviewRequests") or detail.get("reviewDecision") == "REVIEW_REQUIRED":
+        review = "…"
+    else:
+        review = "—"
+
+    base_branch = detail.get("baseRefName", "")
+    if not base_branch or not default_branch:
+        stacked = "—"
+    else:
+        stacked = "×" if base_branch == default_branch else "✓"
+
+    return {
+        "ci": ci,
+        "ready": "×" if is_draft else "✓",
+        "review": review,
+        "stacked": stacked,
+    }
+
+
+def _fetch_pr_attention(
+    author, detail_pool, bot_review_allowlist=frozenset(),
+    default_branches=None, default_branch_lock=None,
+):
     """Open PRs `author` authored that need attention right now: failing
     checks, changes requested, a merge conflict, or a comment from
     someone else. `author` is a `gh search prs --author=` value ("@me"
@@ -136,6 +187,9 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
     if not prs:
         return []
 
+    default_branches = {} if default_branches is None else default_branches
+    default_branch_lock = threading.Lock() if default_branch_lock is None else default_branch_lock
+
     me = _get_gh_login()
     expected_author = me if author == "@me" else author
 
@@ -146,7 +200,7 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
             return None
         detail = _gh_json([
             "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,reviewRequests",
+            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,reviewRequests,baseRefName",
         ])
         if not isinstance(detail, dict):
             return None
@@ -183,7 +237,12 @@ def _fetch_pr_attention(author, detail_pool, bot_review_allowlist=frozenset()):
             return None
         p["reviewRequested"] = bool(detail.get("reviewRequests"))
         p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+        p["isDraft"] = detail.get("isDraft", p.get("isDraft", False))
         p["attention_reasons"] = reasons
+        default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
+        p["indicators"] = _pr_indicators(
+            detail, detail.get("isDraft", p.get("isDraft", False)), default_branch,
+        )
         return p
 
     futures = [detail_pool.submit(_flag_if_attention, p) for p in prs]
@@ -321,6 +380,9 @@ def _fetch_raw(config):
     # filter *within* that repo, so --search never made them search across
     # all of @me's repos. `gh search prs`/`gh search issues` are the actual
     # global cross-repo search subcommands.
+    default_branches = {}
+    default_branch_lock = threading.Lock()
+
     def _review_prs():
         prs = _gh_json([
             "search", "prs", "--review-requested=@me", "--state=open", "--archived=false", "--limit", "50",
@@ -330,9 +392,17 @@ def _fetch_raw(config):
             repo = pr.get("repository", {}).get("nameWithOwner", "")
             number = pr.get("number")
             if repo and number is not None:
-                detail = _gh_json(["pr", "view", str(number), "-R", repo, "--json", "closingIssuesReferences"])
+                detail = _gh_json([
+                    "pr", "view", str(number), "-R", repo,
+                    "--json", "closingIssuesReferences,isDraft,baseRefName,statusCheckRollup,latestReviews,reviewDecision,reviewRequests",
+                ])
                 if isinstance(detail, dict):
                     pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+                    pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
+                    default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
+                    pr["indicators"] = _pr_indicators(
+                        detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
+                    )
             return pr
         prs = [future.result() for future in [detail_pool.submit(_with_closing_references, pr) for pr in prs]]
         for p in prs:
@@ -349,13 +419,17 @@ def _fetch_raw(config):
         return issues
 
     def _authored_prs():
-        prs = _fetch_pr_attention("@me", detail_pool, bot_review_allowlist)
+        prs = _fetch_pr_attention(
+            "@me", detail_pool, bot_review_allowlist, default_branches, default_branch_lock,
+        )
         for p in prs:
             p["type"] = "authored_attention"
         return prs
 
     def _tracked_prs(author):
-        prs = _fetch_pr_attention(author, detail_pool, bot_review_allowlist)
+        prs = _fetch_pr_attention(
+            author, detail_pool, bot_review_allowlist, default_branches, default_branch_lock,
+        )
         for p in prs:
             p["type"] = "tracked_attention"
             p["tracked_author"] = author
@@ -525,6 +599,16 @@ def fetch(config):
         if is_draft:
             status = f"DRAFT: {status}"
 
+        is_pull_request = gtype in {"review_request", "authored_attention", "tracked_attention"}
+        indicators = g.get("indicators")
+        if is_pull_request and not indicators:
+            indicators = {
+                "ci": "—",
+                "ready": "×" if is_draft else "✓",
+                "review": "…" if gtype == "review_request" else "—",
+                "stacked": "—",
+            }
+
         dir_name = repo_dir_index.get(repo_name.lower(), repo_name.split("/")[-1])
         repo_path = os.path.join(code_dir, dir_name)
         slug = slugify(title)
@@ -559,6 +643,7 @@ def fetch(config):
             "context": repo_name,
             "title": title,
             "details": details,
+            "indicators": indicators or {},
             "weight": weight,
             "id": number,
             "created_at": g.get("createdAt", ""),

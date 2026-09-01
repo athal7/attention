@@ -143,7 +143,7 @@ class DashboardController:
                 self._act(result.key, result.row)
                 self._acknowledge_action()
                 self._deprioritize(item_id)
-                self._advance_round()
+                self._relaunch_presenter()
         finally:
             with self._presenter_lock:
                 with self._state_lock:
@@ -329,6 +329,28 @@ class CursesPresenter:
         fields = row.split("\t")
         return fields[3].split("\x0b") if len(fields) > 3 and fields[3] else []
 
+    @staticmethod
+    def _indicator_header(rows):
+        if not rows:
+            return ""
+        fields = rows[0].split("\t")
+        if len(fields) < 5:
+            return ""
+        try:
+            columns = json.loads(fields[4])
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(columns, list):
+            return ""
+        try:
+            return "  ".join(
+                f"{label:<{width}}"
+                for label, width in columns
+                if isinstance(label, str) and isinstance(width, int) and width > 0
+            )
+        except (TypeError, ValueError):
+            return ""
+
     def _draw(self, screen, rows, pending, selected, query):
         import curses
 
@@ -354,7 +376,9 @@ class CursesPresenter:
 
         write(0, self._title, curses.A_BOLD)
         write(1, _pending_header(pending))
-        write(2, f"Filter: {query}" if query is not None else "")
+        header = self._indicator_header(rows)
+        filter_text = f"Filter: {query}" if query is not None else ""
+        write(2, f"{header}  {filter_text}".rstrip() if header else filter_text)
         if not visible:
             write(3, "No matching items.")
         for index, row in enumerate(visible[start:start + capacity], start):

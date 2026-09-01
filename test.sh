@@ -688,6 +688,7 @@ write_config <<JSON
       "details": "prio {prio}",
       "id": "{num}",
       "weight": "{prio}",
+      "indicators": {"ci": "{prio}"},
       "actions": [
         {"key": "o", "label": "open", "primary": true, "command": ["open", "{link}"]},
         {"key": "s", "label": "session", "background": true, "command": ["my-session-cli", "-n", "{num}"]}
@@ -728,6 +729,16 @@ for it in items:
     "$(grep 'GENERICTEST-first' <<<"$weights" | awk '{print $NF}')" "12"
   check "weight template with no matching field falls back to the default" \
     "$(grep 'GENERICTEST-second' <<<"$weights" | awk '{print $NF}')" "50"
+
+  local indicators
+  indicators="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 -c "
+$LOAD_CORE
+import json
+item = next(item for item in m.build_prioritized_items(m.load_config()) if item['title'] == 'GENERICTEST-first')
+print(json.dumps(item['indicators']))
+")"
+  check "generic provider resolves indicator templates against the record" \
+    "$indicators" '{"ci": "12"}'
 
   : > "$GENERIC_OPEN_LOG"
   HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "o" "$first_line" >/dev/null 2>&1
@@ -1814,6 +1825,32 @@ print(f('repo_issue', []))
 }
 test_github_session_prompt_state_aware
 
+test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import json
+detail = {
+    'statusCheckRollup': [{'conclusion': 'SUCCESS'}],
+    'latestReviews': [{'state': 'APPROVED'}],
+    'reviewDecision': 'APPROVED',
+    'reviewRequests': [],
+    'baseRefName': 'feature/base',
+}
+print(json.dumps(p._pr_indicators(detail, True, 'main'), sort_keys=True))
+detail['statusCheckRollup'] = [{'conclusion': 'FAILURE'}]
+detail['latestReviews'] = [{'state': 'CHANGES_REQUESTED'}]
+detail['reviewDecision'] = 'CHANGES_REQUESTED'
+detail['baseRefName'] = 'main'
+print(json.dumps(p._pr_indicators(detail, False, 'main'), sort_keys=True))
+")"
+  check "draft stacked PR shows ready false, passed CI, approved review, and stacked true" \
+    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "ready": "\u00d7", "review": "\u2713", "stacked": "\u2713"}'
+  check "base-branch PR shows failing CI, changes requested, and stacked false" \
+    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "ready": "\u2713", "review": "\u00d7", "stacked": "\u00d7"}'
+}
+test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state
+
 # ---------------------------------------------------------------------------
 echo
 echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
@@ -2280,6 +2317,35 @@ print(fields[1] == list_fields[1])
   check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 6p <<<"$out")" "True"
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
+
+test_dashboard_indicator_columns_are_shared_per_row_set() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+$LOAD_DASHBOARD
+items = [{
+    'status': 'NEEDS ATTENTION', 'context': 'myorg/kb', 'title': 'Fix the login bug',
+    'details': '', 'weight': 90, 'id': '42',
+    'indicators': {'ci': '✓', 'ready': '✓', 'review': '×', 'stacked': '✓'},
+    'actions': [{'key': 'o', 'label': 'open', 'primary': True, 'payload': {}}],
+}]
+rows = m.render_dashboard_rows(items, ['ci', 'ready', 'review', 'stacked'])
+fields = rows[0].split(chr(9))
+print(len(fields))
+print(m.json.loads(fields[4]))
+print(d.CursesPresenter()._indicator_header(rows))
+print(fields[0].startswith('✓') and 'Fix the login bug' in fields[0])
+")"
+  check "dashboard indicator rows add one metadata field for their shared table columns" \
+    "$(sed -n 1p <<<"$out")" "5"
+  check "dashboard indicator metadata keeps the CI, ready, review, and stacked table definition" \
+    "$(sed -n 2p <<<"$out")" "[['CI', 2], ['READY', 5], ['REVIEW', 6], ['STACKED', 7]]"
+  check "curses dashboard renders the shared indicator table header" \
+    "$(sed -n 3p <<<"$out")" "CI  READY  REVIEW  STACKED"
+  check "dashboard indicator values prefix the unchanged item text" \
+    "$(sed -n 4p <<<"$out")" "True"
+}
+test_dashboard_indicator_columns_are_shared_per_row_set
 
 test_dashboard_action_hints_wrap_at_footer_width() {
   local out
@@ -2980,6 +3046,43 @@ print(events)
     "$(sed -n 5p <<<"$out")" "['act', 'acknowledge']"
 }
 test_timeout_and_accept_relaunch_presenter_without_new_fetch_calls_mid_round
+
+test_terminal_action_relaunches_existing_list_before_refresh() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [{'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 1, 'id': 'a',
+              'actions': [{'key': 's', 'label': 'session', 'primary': False, '_item_id': 'a'}]}],
+}
+calls = CallLog()
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, calls),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=lambda key, row: None,
+)
+th = threading.Thread(target=controller.run, args=(3600,))
+th.start()
+calls.wait_for_count(1, timeout=5)
+presenter.wait_for_push_count(2, timeout=5)
+row = presenter.push_calls()[-1][1][0]
+presenter.send_result('s', row)
+presenter.wait_for_launch_count(2, timeout=5)
+print(calls.snapshot())
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a terminal session action does not start a fresh fetch before the refresh interval" \
+    "$(sed -n 1p <<<"$out")" "['solo']"
+  check "a terminal session action relaunches the same item list" \
+    "$(sed -n 2p <<<"$out")" "['A']"
+}
+test_terminal_action_relaunches_existing_list_before_refresh
 
 test_invariant_has_no_override_across_many_cycles() {
   local out
