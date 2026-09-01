@@ -342,7 +342,7 @@ class CursesPresenter:
                 except curses.error:
                     pass
 
-        visible = self._matching_rows(rows, query)
+        visible = self._matching_rows(rows, query or "")
         if visible:
             selected %= len(visible)
         else:
@@ -354,7 +354,7 @@ class CursesPresenter:
 
         write(0, self._title, curses.A_BOLD)
         write(1, _pending_header(pending))
-        write(2, f"Filter: {query}")
+        write(2, f"Filter: {query}" if query is not None else "")
         if not visible:
             write(3, "No matching items.")
         for index, row in enumerate(visible[start:start + capacity], start):
@@ -378,7 +378,7 @@ class CursesPresenter:
         except curses.error:
             pass
         selected = self._last_selection
-        query = ""
+        query = None
         while True:
             rows, pending, stopped, version = self._snapshot()
             if stopped:
@@ -397,13 +397,11 @@ class CursesPresenter:
             if key == 27:
                 return PresenterResult("", "")
             if key in (curses.KEY_BACKSPACE, 127, 8):
-                query = query[:-1]
+                if query:
+                    query = query[:-1]
+                elif query is not None:
+                    query = None
                 continue
-            if visible and 0 <= key <= 255:
-                char = chr(key)
-                if char in self._action_keys(visible[selected]):
-                    self._last_selection = selected
-                    return PresenterResult(char, visible[selected])
             if key == ord("q"):
                 return PresenterResult("", "")
             if key in (curses.KEY_UP, ord("k")) and visible:
@@ -412,12 +410,20 @@ class CursesPresenter:
             if key in (curses.KEY_DOWN, ord("j")) and visible:
                 selected = (selected + 1) % len(visible)
                 continue
+            if query is None and visible and 0 <= key <= 255:
+                char = chr(key)
+                if char not in "qjk" and char in self._action_keys(visible[selected]):
+                    self._last_selection = selected
+                    return PresenterResult(char, visible[selected])
             if key in (curses.KEY_ENTER, 10, 13) and visible:
                 self._last_selection = selected
                 return PresenterResult("", visible[selected])
-            if 0 <= key <= 255:
+            if key == ord("/"):
+                query = ""
+                continue
+            if query is not None and 0 <= key <= 255:
                 char = chr(key)
-                if char.isprintable() and not ("A" <= char <= "Z"):
+                if char.isprintable() and not ("A" <= char <= "Z") and char not in "jk":
                     query += char
 
 

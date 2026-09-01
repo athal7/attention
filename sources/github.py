@@ -545,11 +545,11 @@ def fetch(config):
          }
 
         actions = [
-            {"key": "O", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-            {"key": "A", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
-            {"key": "M", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
-            {"key": "C", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
-            {"key": "G", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
+            {"key": "o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
+            {"key": "m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
+            {"key": "c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
+            {"key": "g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
         ]
         configured_actions = config.get("github", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))

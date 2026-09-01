@@ -109,9 +109,9 @@ query {
         }
 
         actions = [
-            {"key": "O", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
-            {"key": "C", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
-            {"key": "T", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
+            {"key": "o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
+            {"key": "t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
         ]
         configured_actions = config.get("linear", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))

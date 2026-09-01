@@ -67,7 +67,7 @@ omitted.
     "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
     "actions": [                     # list, optional (default [])
         {
-            "key": "O",              # str, required -- one letter or digit; use a capital so lowercase stays free for filtering
+            "key": "o",              # str, required -- one ASCII letter or digit; dashboard reserves lowercase q, j, and k
             "label": "open",         # str, required -- short verb, shown in the footer hint
             "primary": True,         # bool, optional (default False) -- at most one per item, what plain Enter runs
             "wip": True,             # true marks, "clear" unmarks after completion; optional (default False)
@@ -78,10 +78,9 @@ omitted.
 }
 ```
 
-Give each action a capital letter so lowercase letters and digits stay free for
-type-to-filter. Actions run first when the highlighted item supports that key.
+Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
-and lowercase letters or digits filter it.
+and any other printable character is added to the filter query.
 
 ### Cross-link merging
 
@@ -138,7 +137,7 @@ an `actions` array in their config section to attach non-inherent custom actions
   "github": {
     "actions": [
       {
-        "key": "S",
+        "key": "s",
         "label": "session",
         "background": true,
         "command": ["my-session", "-d", "{repo_path}", "--agent", "{input.tool}", "{input.command}"],
@@ -148,12 +147,12 @@ an `actions` array in their config section to attach non-inherent custom actions
         ]
       },
       {
-        "key": "L",
+        "key": "l",
         "label": "lumen",
         "command": ["lumen", "diff", "{url}"]
       },
       {
-        "key": "P",
+        "key": "p",
         "label": "priority",
         "command": ["gh", "issue", "edit", "{id}", "-R", "{repo}", "--add-label", "priority:{input}"],
         "input": { "prompt": "Priority", "choices": ["p0", "p1", "p2"] }
@@ -212,7 +211,7 @@ under `config["generic"]`:
       "id": "{number}",
       "weight": 85,
       "actions": [
-        {"key": "O", "label": "open", "primary": true, "command": ["open", "{url}"]}
+        {"key": "o", "label": "open", "primary": true, "command": ["open", "{url}"]}
       ]
     }
   }
