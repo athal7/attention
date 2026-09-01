@@ -34,7 +34,7 @@ write_config() {
   cat > "$XDG_CONFIG/attention/config.json"
 }
 
-# blob_for <<<'[{"key": "O", ...}, ...]' -> base64(JSON) of that exact
+# blob_for <<<'[{"key": "o", ...}, ...]' -> base64(JSON) of that exact
 # actions array, matching render_rows()'s hidden second field. Lets tests
 # build realistic dashboard rows without hand-typing base64.
 blob_for() {
@@ -472,7 +472,7 @@ STUB
 chmod +x "$REPODIR_BIN/gh"
 
 write_config <<JSON
-{"plugins": ["github"], "codeDir": "$FAKE_CODE_DIR", "github": {"actions": [{"key": "S", "label": "session", "background": true, "command": ["aoe-cmd", "-d", "{repo_path}"]}]}}
+{"plugins": ["github"], "codeDir": "$FAKE_CODE_DIR", "github": {"actions": [{"key": "s", "label": "session", "background": true, "command": ["aoe-cmd", "-d", "{repo_path}"]}]}}
 JSON
 
 test_repo_path_git_remote_autodetect() {
@@ -487,7 +487,7 @@ import sys, base64, json
 line = sys.argv[1]
 blob = line.split(chr(9), 2)[1]
 actions = json.loads(base64.b64decode(blob))
-session = next(a for a in actions if a.get('key') == 'S')
+session = next(a for a in actions if a.get('key') == 's')
 print(session['payload']['command'][2])
 " "$repo_line" 2>/dev/null || true)"
   check "repo_path matches the shorthand-named local clone via its git remote" "$decoded" "$FAKE_CODE_DIR/bigproj"
@@ -689,8 +689,8 @@ write_config <<JSON
       "id": "{num}",
       "weight": "{prio}",
       "actions": [
-        {"key": "O", "label": "open", "primary": true, "command": ["open", "{link}"]},
-        {"key": "S", "label": "session", "background": true, "command": ["my-session-cli", "-n", "{num}"]}
+        {"key": "o", "label": "open", "primary": true, "command": ["open", "{link}"]},
+        {"key": "s", "label": "session", "background": true, "command": ["my-session-cli", "-n", "{num}"]}
       ]
     },
     "broken-source": {
@@ -730,12 +730,12 @@ for it in items:
     "$(grep 'GENERICTEST-second' <<<"$weights" | awk '{print $NF}')" "50"
 
   : > "$GENERIC_OPEN_LOG"
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "O" "$first_line" >/dev/null 2>&1
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "o" "$first_line" >/dev/null 2>&1
   check "action command template substitutes the record's field before dispatch" \
     "$(cat "$GENERIC_OPEN_LOG")" "https://example.com/7"
 
   : > "$GENERIC_SESSION_LOG"
-  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "S" "$first_line" >/dev/null 2>&1
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$PATH" python3 "$ATTENTION" act "s" "$first_line" >/dev/null 2>&1
   sleep 0.3
   check "an action marked background dispatches via dispatch_background, not run_cmd" \
     "$(cat "$GENERIC_SESSION_LOG")" "-n 7"
@@ -760,8 +760,9 @@ config = {
     'codeDir': '/tmp/repo',
     'github': {
         'actions': [
-            {'key': 'S', 'label': 'session', 'background': True, 'command': ['my-session', '-d', '{repo_path}', '-n', '{slug}']},
-            {'key': 'L', 'label': 'lumen', 'command': ['my-lumen', '{url}']}
+            {'key': 's', 'label': 'session', 'background': True, 'command': ['my-session', '-d', '{repo_path}', '-n', '{slug}']},
+            {'key': 'l', 'label': 'lumen', 'command': ['my-lumen', '{url}']},
+            {'key': 'Z', 'label': 'custom', 'command': ['my-custom', '{url}']}
         ]
     }
 }
@@ -770,8 +771,8 @@ items = p.fetch(config)
 print(json.dumps([a['key'] for a in items[0]['actions']]))
 print(json.dumps(items[0]['actions'][5]['payload']['command']))
 ")"
-  check "github fetch attaches configured actions" \
-    "$(sed -n 1p <<<"$gh_out")" '["O", "A", "M", "C", "G", "S", "L"]'
+  check "github fetch attaches lowercase defaults and preserves configured key casing" \
+    "$(sed -n 1p <<<"$gh_out")" '["o", "a", "m", "c", "g", "s", "l", "Z"]'
   check "github fetch resolves template in configured action command" \
     "$(sed -n 2p <<<"$gh_out")" '["my-session", "-d", "/tmp/repo/repo", "-n", "fix-bug"]'
 }
@@ -796,8 +797,8 @@ test_util_input_resolve() {
 $(load_plugin_py _util)
 record = {'id': '42', 'url': 'https://x/42'}
 actions = p.resolve_configured_actions([
-    {'key': 'S', 'label': 'session', 'command': ['run', '-m', '{input}'], 'input': {'prompt': 'Msg', 'default': 'Work on issue {id}'}},
-    {'key': 'P', 'label': 'prio', 'command': ['run', '--prio', '{input}'], 'input': {'prompt': 'Priority', 'choices': ['p0', 'p1']}},
+    {'key': 's', 'label': 'session', 'command': ['run', '-m', '{input}'], 'input': {'prompt': 'Msg', 'default': 'Work on issue {id}'}},
+    {'key': 'p', 'label': 'prio', 'command': ['run', '--prio', '{input}'], 'input': {'prompt': 'Priority', 'choices': ['p0', 'p1']}},
     {'key': 'S2', 'label': 'multi', 'command': ['run', '--agent', '{input.tool}', '--msg', '{input.command}'], 'inputs': [
         {'name': 'tool', 'prompt': 'Agent', 'choices': ['opencode', 'omp']},
         {'name': 'command', 'prompt': 'Command', 'default': 'Work on issue {id}'},
@@ -942,8 +943,8 @@ test_generic_provider_input() {
       "id": "{num}",
       "weight": 50,
       "actions": [
-        {"key": "T", "label": "text", "command": ["record-args", "--msg", "{input}"], "input": {"prompt": "Message", "default": "default-msg-{num}"}},
-        {"key": "C", "label": "choice", "command": ["record-args", "--prio", "{input}"], "input": {"prompt": "Priority", "choices": ["low", "high"]}}
+        {"key": "t", "label": "text", "command": ["record-args", "--msg", "{input}"], "input": {"prompt": "Message", "default": "default-msg-{num}"}},
+        {"key": "c", "label": "choice", "command": ["record-args", "--prio", "{input}"], "input": {"prompt": "Priority", "choices": ["low", "high"]}}
       ]
     }
   }
@@ -953,15 +954,15 @@ JSON
   line="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" list | grep 'GENERICTEST-first')"
 
   : > "$INPUT_LOG"
-  printf 'typed message\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "T" "$line" >/dev/null 2>&1
+  printf 'typed message\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "t" "$line" >/dev/null 2>&1
   check "generic provider text input reaches the command" "$(cat "$INPUT_LOG")" '--msg typed message'
 
   : > "$INPUT_LOG"
-  printf '\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "T" "$line" >/dev/null 2>&1
+  printf '\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "t" "$line" >/dev/null 2>&1
   check "generic provider empty input uses the record-resolved default" "$(cat "$INPUT_LOG")" '--msg default-msg-7'
 
   : > "$INPUT_LOG"
-  printf '2\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "C" "$line" >/dev/null 2>&1
+  printf '2\n' | HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GENERIC_BIN:$INPUT_BIN:$PATH" python3 "$ATTENTION" act "c" "$line" >/dev/null 2>&1
   check "generic provider choice input reaches the command" "$(cat "$INPUT_LOG")" '--prio high'
 }
 test_generic_provider_input
@@ -976,7 +977,7 @@ def fetch(config):
     return [{
         "status": "PENDING", "context": "test-source", "title": "Deprio item", "details": "",
         "weight": 70, "id": "dp1",
-        "actions": [{"key": "Z", "label": "zap", "payload": {}}],
+        "actions": [{"key": "z", "label": "zap", "payload": {}}],
     }]
 
 def act(key, payload):
@@ -1159,8 +1160,8 @@ $LOAD_CORE
 import copy
 
 items_by_plugin = {
-    'p1': [{'status': 'S1', 'context': 'c1', 'title': 'Fix ABC-123 today', 'details': '', 'weight': 5, 'id': '', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 'O', 'label': 'open', 'primary': False, 'payload': {}}], '_plugin': 'p1'}],
-    'p2': [{'status': 'S2', 'context': 'c2', 'title': 'Ticket', 'details': '', 'weight': 10, 'id': 'ABC-123', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 'S', 'label': 'session', 'primary': False, 'payload': {}}], '_plugin': 'p2'}],
+    'p1': [{'status': 'S1', 'context': 'c1', 'title': 'Fix ABC-123 today', 'details': '', 'weight': 5, 'id': '', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 'o', 'label': 'open', 'primary': False, 'payload': {}}], '_plugin': 'p1'}],
+    'p2': [{'status': 'S2', 'context': 'c2', 'title': 'Ticket', 'details': '', 'weight': 10, 'id': 'ABC-123', 'absorb_note': '', 'created_at': '', 'actions': [{'key': 's', 'label': 'session', 'primary': False, 'payload': {}}], '_plugin': 'p2'}],
 }
 baseline = copy.deepcopy(items_by_plugin)
 
@@ -1294,7 +1295,7 @@ except ValueError as e:
 
   err="$(python3 -c "
 $LOAD_CORE
-item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'O', 'label': 123}]}
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'o', 'label': 123}]}
 try:
     m.validate_and_normalize_item(item, 'badplugin')
 except ValueError as e:
@@ -1312,9 +1313,20 @@ except ValueError as e:
 " 2>/dev/null || true)"
   check "rejects action keys that the terminal UI cannot receive" "$err" "err: plugin 'badplugin' returned a malformed item: action 'key' must be one letter or digit"
 
+  local accepted_keys
+  accepted_keys="$(python3 -c "
+$LOAD_CORE
+import string
+for key in string.ascii_lowercase + string.ascii_uppercase + string.digits:
+    item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': key, 'label': 'open'}]}
+    m.validate_and_normalize_item(item, 'goodplugin')
+print('ok')
+")"
+  check "accepts lowercase, uppercase, and digit action keys" "$accepted_keys" "ok"
+
   err="$(python3 -c "
 $LOAD_CORE
-item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'O', 'label': 'open', 'wip': 'toggle'}]}
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'o', 'label': 'open', 'wip': 'toggle'}]}
 try:
     m.validate_and_normalize_item(item, 'badplugin')
 except ValueError as e:
@@ -1336,7 +1348,7 @@ except ValueError as e:
   defaults="$(python3 -c "
 $LOAD_CORE
 import json
-item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'O', 'label': 'o'}]}
+item = {'status': 'S', 'context': 'ctx', 'title': 't', 'details': 'd', 'weight': 10, 'actions': [{'key': 'o', 'label': 'o'}]}
 m.validate_and_normalize_item(item, 'goodplugin')
 print(json.dumps(item))
 ")"
@@ -1350,8 +1362,8 @@ print(json.dumps(item))
   local act_err
   act_err="$(python3 -c "
 $LOAD_CORE
-line = 'STATUS\t' + m.base64.b64encode(m.json.dumps([{'key': 'O', 'label': 'o', 'payload': 'not-a-dict', '_plugin': 'github'}]).encode()).decode()
-m.act('O', line)
+line = 'STATUS\t' + m.base64.b64encode(m.json.dumps([{'key': 'o', 'label': 'o', 'payload': 'not-a-dict', '_plugin': 'github'}]).encode()).decode()
+m.act('o', line)
 " 2>/dev/null || true)"
   check "act() rejects a non-dict payload before dispatching to the plugin" "$act_err" "Action failed: plugin 'github' act() received a malformed payload: expected a dictionary, got str"
 }
@@ -1941,17 +1953,17 @@ gh_item = {
     'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the thing ABC-1', 'details': '',
     'weight': 90, 'id': '1',
     'actions': [
-        {'key': 'O', 'label': 'open', 'primary': True, 'payload': {}, '_plugin': 'github'},
-        {'key': 'C', 'label': 'comment', 'payload': {}, '_plugin': 'github'},
+        {'key': 'o', 'label': 'open', 'primary': True, 'payload': {}, '_plugin': 'github'},
+        {'key': 'c', 'label': 'comment', 'payload': {}, '_plugin': 'github'},
     ],
 }
 lin_item = {
     'status': 'IN PROGRESS', 'context': 'Backend', 'title': 'Fix it', 'details': '',
     'weight': 80, 'id': 'ABC-1', 'absorb_note': 'Linear ABC-1: IN PROGRESS',
     'actions': [
-        {'key': 'O', 'label': 'open', 'primary': True, 'payload': {}, '_plugin': 'linear'},
-        {'key': 'C', 'label': 'comment', 'payload': {}, '_plugin': 'linear'},
-        {'key': 'T', 'label': 'transition', 'payload': {}, '_plugin': 'linear'},
+        {'key': 'o', 'label': 'open', 'primary': True, 'payload': {}, '_plugin': 'linear'},
+        {'key': 'c', 'label': 'comment', 'payload': {}, '_plugin': 'linear'},
+        {'key': 't', 'label': 'transition', 'payload': {}, '_plugin': 'linear'},
     ],
 }
 merged = m.merge_cross_links([gh_item, lin_item])
@@ -1979,9 +1991,9 @@ print(json.dumps(merged))
     *) bad "colliding comment key remaps to a digit (got: $out)" ;;
   esac
   case "$out" in
-    *'"key": "T"'*'"label": "transition (linked)"'*)
-      ok "non-colliding T key is kept as-is, still labeled (linked)" ;;
-    *) bad "non-colliding T key is kept as-is (got: $out)" ;;
+    *'"key": "t"'*'"label": "transition (linked)"'*)
+      ok "non-colliding t key is kept as-is, still labeled (linked)" ;;
+    *) bad "non-colliding t key is kept as-is (got: $out)" ;;
   esac
 
   local primary_count
@@ -2051,12 +2063,12 @@ $LOAD_CORE
 cal_item = {
     'status': 'ALL DAY', 'context': 'Work', 'title': 'Team Dinner', 'details': '',
     'weight': 50, 'id': 'e1',
-    'actions': [{'key': 'Y', 'label': 'yank', 'payload': {}, '_plugin': 'calendar'}],
+    'actions': [{'key': 'y', 'label': 'yank', 'payload': {}, '_plugin': 'calendar'}],
 }
 rem_item = {
     'status': 'PENDING', 'context': 'Personal', 'title': 'Book babysitter for Team Dinner', 'details': '',
     'weight': 15, 'id': 'r1', 'absorb_note': 'Reminder: Book babysitter for Team Dinner',
-    'actions': [{'key': 'X', 'label': 'complete', 'payload': {'id': 'r1'}, '_plugin': 'reminders'}],
+    'actions': [{'key': 'x', 'label': 'complete', 'payload': {'id': 'r1'}, '_plugin': 'reminders'}],
 }
 merged = m.merge_cross_links([cal_item, rem_item])
 import json
@@ -2065,7 +2077,7 @@ print(json.dumps(merged))
   check "a title-substring match (reminder title contains event title) merges to one item" \
     "$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$out")" "1"
   case "$out" in
-    *'"key": "X"'*'"label": "complete (linked)"'*)
+    *'"key": "x"'*'"label": "complete (linked)"'*)
       ok "reminder's complete action carries over unchanged (no collision with CAL's Y)" ;;
     *) bad "reminder's complete action carries over unchanged (got: $out)" ;;
   esac
@@ -2096,12 +2108,12 @@ test_expect_keys_for_is_union_of_present_items() {
   out="$(python3 -c "
 $LOAD_CORE
 items = [
-    {'actions': [{'key': 'O', 'label': 'x'}, {'key': 'S', 'label': 'x'}]},
-    {'actions': [{'key': 'O', 'label': 'x'}, {'key': 'X', 'label': 'x'}]},
+    {'actions': [{'key': 'o', 'label': 'x'}, {'key': 's', 'label': 'x'}]},
+    {'actions': [{'key': 'o', 'label': 'x'}, {'key': 'x', 'label': 'x'}]},
 ]
 print(','.join(m.expect_keys_for(items)))
 ")"
-  check "expect_keys_for() is the de-duped union of every action key actually present" "$out" "O,S,X"
+  check "expect_keys_for() is the de-duped union of every action key actually present" "$out" "o,s,x"
 }
 test_expect_keys_for_is_union_of_present_items
 
@@ -2118,8 +2130,8 @@ test_expect_keys_for_empty_items_is_empty
 check "hint_for_actions() renders 'key label' pairs joined by two spaces" \
   "$(python3 -c "
 $LOAD_CORE
-print(m.hint_for_actions([{'key': 'O', 'label': 'open'}, {'key': 'O', 'label': 'open linear'}]))")" \
-  "O open  O open linear"
+print(m.hint_for_actions([{'key': 'o', 'label': 'open'}, {'key': 'o', 'label': 'open linear'}]))")" \
+  "o open  o open linear"
 
 # ---------------------------------------------------------------------------
 echo
@@ -2219,7 +2231,7 @@ test_render_rows_byte_for_byte_unchanged() {
   local out
   out="$(python3 -c "
 $LOAD_CORE
-items = [{'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the login bug', 'details': '', 'weight': 90, '_plugin': 'github', 'actions': [{'key': 'O', 'label': 'open', 'primary': True, 'payload': {}}]}]
+items = [{'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the login bug', 'details': '', 'weight': 90, '_plugin': 'github', 'actions': [{'key': 'o', 'label': 'open', 'primary': True, 'payload': {}}]}]
 rows = m.render_rows(items)
 print(len(rows))
 fields = rows[0].split(chr(9))
@@ -2233,8 +2245,8 @@ print(fields[2])
   check "render_rows() output is still exactly 3 tab-delimited fields (unchanged by the dashboard renderer's addition)" \
     "$(sed -n 2p <<<"$out")" "3"
   check "render_rows() field 1 (visible columns) is unchanged" "$(sed -n 3p <<<"$out")" "REVIEW REQUESTED  Fix the login bug  myorg/kb"
-  check "render_rows() field 2 (actions blob) is unchanged" "$(sed -n 4p <<<"$out")" "O"
-  check "render_rows() field 3 (hint) is unchanged" "$(sed -n 5p <<<"$out")" "O open"
+  check "render_rows() field 2 (actions blob) is unchanged" "$(sed -n 4p <<<"$out")" "o"
+  check "render_rows() field 3 (hint) is unchanged" "$(sed -n 5p <<<"$out")" "o open"
 }
 test_render_rows_byte_for_byte_unchanged
 
@@ -2246,8 +2258,8 @@ items = [{
     'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the login bug',
     'details': '', 'weight': 90, 'id': '42', '_plugin': 'github',
     'actions': [
-        {'key': 'O', 'label': 'open', 'primary': True, 'payload': {}},
-        {'key': 'S', 'label': 'session', 'payload': {}},
+        {'key': 'o', 'label': 'open', 'primary': True, 'payload': {}},
+        {'key': 's', 'label': 'session', 'payload': {}},
     ],
 }]
 rows = m.render_dashboard_rows(items)
@@ -2263,8 +2275,8 @@ print(fields[1] == list_fields[1])
   check "render_dashboard_rows() emits exactly one row per item" "$(sed -n 1p <<<"$out")" "1"
   check "render_dashboard_rows() emits exactly 4 tab-delimited fields" "$(sed -n 2p <<<"$out")" "4"
   check "render_dashboard_rows() field 1 omits status and begins with title" "$(sed -n 3p <<<"$out")" "Fix the login bug  myorg/kb"
-  check "render_dashboard_rows() field 3 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "O,S"
-  check "render_dashboard_rows() field 4 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "O open  S session"
+  check "render_dashboard_rows() field 3 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "o,s"
+  check "render_dashboard_rows() field 4 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "o open  s session"
   check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 6p <<<"$out")" "True"
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
@@ -2280,20 +2292,20 @@ class DummySize:
 
 shutil.get_terminal_size = lambda: DummySize()
 actions = [
-    {'key': 'O', 'label': 'open'},
-    {'key': 'A', 'label': 'approve'},
-    {'key': 'M', 'label': 'merge'},
-    {'key': 'C', 'label': 'comment'},
-    {'key': 'G', 'label': 'label'},
+    {'key': 'o', 'label': 'open'},
+    {'key': 'a', 'label': 'approve'},
+    {'key': 'm', 'label': 'merge'},
+    {'key': 'c', 'label': 'comment'},
+    {'key': 'l', 'label': 'label'},
 ]
 hint = m._dashboard_hint_for_actions(actions)
 print(repr(hint))
 print(hint.split(chr(11)))
 ")"
   check "dashboard action hints use explicit footer lines that fit a 40-column terminal" \
-    "$(sed -n 1p <<<"$out")" "'O open  A approve  M merge  C comment\\x0bG label'"
+    "$(sed -n 1p <<<"$out")" "'o open  a approve  m merge  c comment\\x0bl label'"
   check "the curses presenter receives one footer line per wrapped action-hint line" \
-    "$(sed -n 2p <<<"$out")" "['O open  A approve  M merge  C comment', 'G label']"
+    "$(sed -n 2p <<<"$out")" "['o open  a approve  m merge  c comment', 'l label']"
 }
 test_dashboard_action_hints_wrap_at_footer_width
 
@@ -2302,7 +2314,7 @@ test_plugins_md_documents_terminal_key_constraints() {
   local body
   body="$(python3 -c "
 src = open('$REPO_ROOT/PLUGINS.md').read()
-print('one letter or digit' in src and 'capital letter' in src)
+print('ASCII letter or digit' in src and 'lowercase' in src)
 ")"
   check "PLUGINS.md documents terminal action key syntax" "$body" "True"
 }
@@ -2370,27 +2382,27 @@ exit 0
 STUB
 chmod +x "$INTERACT_BIN/aoe-cmd"
 
-GH_OPEN_ACTIONS='[{"key": "O", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"}]'
+GH_OPEN_ACTIONS='[{"key": "o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"}]'
 GH_FULL_ACTIONS='[
-  {"key": "O", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "S", "label": "session", "payload": {"command": ["aoe-cmd", "-d", "/tmp/repo", "-n", "test-pr", "-b", "-w", "test-pr", "Work on issue 42 in this repo"], "background": true}, "_plugin": "github"},
-  {"key": "L", "label": "lumen", "payload": {"command": ["lumen", "diff", "--pr", "https://github.com/myorg/kb/pull/42"]}, "_plugin": "github"},
-  {"key": "A", "label": "approve", "payload": {"kind": "approve", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "M", "label": "merge", "payload": {"kind": "merge", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "C", "label": "comment", "payload": {"kind": "comment", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "G", "label": "label", "payload": {"kind": "label", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
-  {"key": "1", "label": "open (linked)", "primary": false, "payload": {"kind": "open", "url": "https://linear.app/abc/issue/ABC-1"}, "_plugin": "linear", "_original_key": "O"}
+  {"key": "o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "s", "label": "session", "payload": {"command": ["aoe-cmd", "-d", "/tmp/repo", "-n", "test-pr", "-b", "-w", "test-pr", "Work on issue 42 in this repo"], "background": true}, "_plugin": "github"},
+  {"key": "l", "label": "lumen", "payload": {"command": ["lumen", "diff", "--pr", "https://github.com/myorg/kb/pull/42"]}, "_plugin": "github"},
+  {"key": "a", "label": "approve", "payload": {"kind": "approve", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "m", "label": "merge", "payload": {"kind": "merge", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "c", "label": "comment", "payload": {"kind": "comment", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "g", "label": "label", "payload": {"kind": "label", "id": "42", "url": "https://github.com/myorg/kb/pull/42"}, "_plugin": "github"},
+  {"key": "1", "label": "open (linked)", "primary": false, "payload": {"kind": "open", "url": "https://linear.app/abc/issue/ABC-1"}, "_plugin": "linear", "_original_key": "o"}
 ]'
-REM_ACTIONS='[{"key": "X", "label": "complete", "payload": {"id": "r1"}, "_plugin": "reminders"}]'
-CAL_ACTIONS='[{"key": "Y", "label": "yank", "payload": {"text": "Team Sync - 10:00 AM"}, "_plugin": "calendar"}]'
+REM_ACTIONS='[{"key": "x", "label": "complete", "payload": {"id": "r1"}, "_plugin": "reminders"}]'
+CAL_ACTIONS='[{"key": "y", "label": "yank", "payload": {"text": "Team Sync - 10:00 AM"}, "_plugin": "calendar"}]'
 CAL_MULTI_ACTIONS='[
-  {"key": "Y", "label": "yank", "payload": {"text": "Team Sync"}, "_plugin": "calendar"},
-  {"key": "X", "label": "complete (linked)", "payload": {"id": "r1"}, "_plugin": "reminders", "_original_key": "X"},
-  {"key": "1", "label": "complete (linked)", "payload": {"id": "r2"}, "_plugin": "reminders", "_original_key": "X"}
+  {"key": "y", "label": "yank", "payload": {"text": "Team Sync"}, "_plugin": "calendar"},
+  {"key": "x", "label": "complete (linked)", "payload": {"id": "r1"}, "_plugin": "reminders", "_original_key": "x"},
+  {"key": "1", "label": "complete (linked)", "payload": {"id": "r2"}, "_plugin": "reminders", "_original_key": "x"}
 ]'
 LIN_ACTIONS='[
-  {"key": "O", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://linear.app/abc/issue/ABC-1"}, "_plugin": "linear"},
-  {"key": "S", "label": "session", "payload": {"command": ["aoe-cmd", "-d", ".", "-n", "abc-1", "Work on Linear issue ABC-1"], "background": true}, "_plugin": "linear"}
+  {"key": "o", "label": "open", "primary": true, "payload": {"kind": "open", "url": "https://linear.app/abc/issue/ABC-1"}, "_plugin": "linear"},
+  {"key": "s", "label": "session", "payload": {"command": ["aoe-cmd", "-d", ".", "-n", "abc-1", "Work on Linear issue ABC-1"], "background": true}, "_plugin": "linear"}
 ]'
 
 FIX_GH_LINE="REVIEW REQUESTED  myorg/kb  Test PR   ${TAB}$(echo "$GH_OPEN_ACTIONS" | blob_for)${TAB}hint"
@@ -2413,80 +2425,80 @@ echo
 echo "-- action hotkey dispatch invokes the correct downstream command --"
 
 : > "$OPEN_LOG"
-run_act "O" "$FIX_GH_LINE"
-check "GH O exits 0" "$ACT_RC" "0"
+run_act "o" "$FIX_GH_LINE"
+check "GH o exits 0" "$ACT_RC" "0"
 if grep -q 'https://github.com/myorg/kb/pull/42' "$OPEN_LOG"; then
-  ok "GH O invokes open with the item URL"
+  ok "GH o invokes open with the item URL"
 else
-  bad "GH O invokes open with the item URL (got: $(cat "$OPEN_LOG"))"
+  bad "GH o invokes open with the item URL (got: $(cat "$OPEN_LOG"))"
 fi
 
 : > "$REMINDCTL_ACT_LOG"
-run_act "X" "$FIX_REM_LINE"
-check "REM X exits 0" "$ACT_RC" "0"
+run_act "x" "$FIX_REM_LINE"
+check "REM x exits 0" "$ACT_RC" "0"
 if grep -q 'complete r1' "$REMINDCTL_ACT_LOG"; then
-  ok "REM X invokes remindctl complete on the item's own ID"
+  ok "REM x invokes remindctl complete on the item's own ID"
 else
-  bad "REM X invokes remindctl complete on the item's own ID (got: $(cat "$REMINDCTL_ACT_LOG"))"
+  bad "REM x invokes remindctl complete on the item's own ID (got: $(cat "$REMINDCTL_ACT_LOG"))"
 fi
 
 : > "$PBCOPY_LOG"
-run_act "Y" "$FIX_CAL_LINE"
-check "CAL Y exits 0" "$ACT_RC" "0"
+run_act "y" "$FIX_CAL_LINE"
+check "CAL y exits 0" "$ACT_RC" "0"
 if grep -q 'Team Sync' "$PBCOPY_LOG"; then
-  ok "CAL Y copies the payload's precomputed text to the clipboard"
+  ok "CAL y copies the payload's precomputed text to the clipboard"
 else
-  bad "CAL Y copies the payload's precomputed text to the clipboard (got: $(cat "$PBCOPY_LOG"))"
+  bad "CAL y copies the payload's precomputed text to the clipboard (got: $(cat "$PBCOPY_LOG"))"
 fi
 
 : > "$LUMEN_LOG"
-run_act "L" "$FIX_GH_FULL_LINE"
-check "GH L exits 0" "$ACT_RC" "0"
+run_act "l" "$FIX_GH_FULL_LINE"
+check "GH l exits 0" "$ACT_RC" "0"
 if grep -q 'diff --pr https://github.com/myorg/kb/pull/42' "$LUMEN_LOG"; then
-  ok "GH L invokes lumen diff --pr with the item URL"
+  ok "GH l invokes lumen diff --pr with the item URL"
 else
-  bad "GH L invokes lumen diff --pr with the item URL (got: $(cat "$LUMEN_LOG"))"
+  bad "GH l invokes lumen diff --pr with the item URL (got: $(cat "$LUMEN_LOG"))"
 fi
 
 : > "$GH_ACT_LOG"
-run_act "A" "$FIX_GH_FULL_LINE"
-check "GH A exits 0" "$ACT_RC" "0"
+run_act "a" "$FIX_GH_FULL_LINE"
+check "GH a exits 0" "$ACT_RC" "0"
 if grep -q 'pr review --approve 42 --repo myorg/kb' "$GH_ACT_LOG"; then
-  ok "GH A invokes gh pr review --approve"
+  ok "GH a invokes gh pr review --approve"
 else
-  bad "GH A invokes gh pr review --approve (got: $(cat "$GH_ACT_LOG"))"
+  bad "GH a invokes gh pr review --approve (got: $(cat "$GH_ACT_LOG"))"
 fi
 
 : > "$GH_ACT_LOG"
-run_act "C" "$FIX_GH_FULL_LINE" "a nice comment
+run_act "c" "$FIX_GH_FULL_LINE" "a nice comment
 "
-check "GH C exits 0" "$ACT_RC" "0"
+check "GH c exits 0" "$ACT_RC" "0"
 if grep -q 'issue comment 42 -R myorg/kb -b a nice comment' "$GH_ACT_LOG"; then
-  ok "GH C invokes gh issue comment with the entered body"
+  ok "GH c invokes gh issue comment with the entered body"
 else
-  bad "GH C invokes gh issue comment with the entered body (got: $(cat "$GH_ACT_LOG"))"
+  bad "GH c invokes gh issue comment with the entered body (got: $(cat "$GH_ACT_LOG"))"
 fi
 
 : > "$GH_ACT_LOG"
-run_act "G" "$FIX_GH_FULL_LINE" "bug
+run_act "g" "$FIX_GH_FULL_LINE" "bug
 "
-check "GH G exits 0" "$ACT_RC" "0"
+check "GH g exits 0" "$ACT_RC" "0"
 if grep -q 'issue edit 42 -R myorg/kb --add-label bug' "$GH_ACT_LOG"; then
-  ok "GH G invokes gh issue edit --add-label with the entered label"
+  ok "GH g invokes gh issue edit --add-label with the entered label"
 else
-  bad "GH G invokes gh issue edit --add-label with the entered label (got: $(cat "$GH_ACT_LOG"))"
+  bad "GH g invokes gh issue edit --add-label with the entered label (got: $(cat "$GH_ACT_LOG"))"
 fi
 
 echo
 echo "-- CAL multi-reminder overflow: linked reminders keep their own routed key --"
 
 : > "$REMINDCTL_ACT_LOG"
-run_act "X" "$FIX_CAL_MULTI_LINE"
-check "CAL X (first linked reminder) exits 0" "$ACT_RC" "0"
+run_act "x" "$FIX_CAL_MULTI_LINE"
+check "CAL x (first linked reminder) exits 0" "$ACT_RC" "0"
 if grep -q 'complete r1' "$REMINDCTL_ACT_LOG"; then
-  ok "CAL X completes the first linked reminder (r1)"
+  ok "CAL x completes the first linked reminder (r1)"
 else
-  bad "CAL X completes the first linked reminder (r1) (got: $(cat "$REMINDCTL_ACT_LOG"))"
+  bad "CAL x completes the first linked reminder (r1) (got: $(cat "$REMINDCTL_ACT_LOG"))"
 fi
 
 : > "$REMINDCTL_ACT_LOG"
@@ -2511,8 +2523,8 @@ else
 fi
 
 : > "$OPEN_LOG"
-run_act "O" "$FIX_GH_FULL_LINE"
-check "GH linked item, key 'O' exits 0" "$ACT_RC" "0"
+run_act "o" "$FIX_GH_FULL_LINE"
+check "GH linked item, key 'o' exits 0" "$ACT_RC" "0"
 if grep -q 'https://github.com/myorg/kb/pull/42' "$OPEN_LOG"; then
   ok "key 'O' opens the GH item's own open action"
 else
@@ -2562,7 +2574,7 @@ echo
 echo "-- unmapped key for a row: brief note, exit 0, no traceback --"
 
 : > "$OPEN_LOG"
-run_act "Z" "$FIX_GH_LINE"
+run_act "z" "$FIX_GH_LINE"
 check "unmapped key exits 0 (not an error)" "$ACT_RC" "0"
 case "$ACT_OUTPUT" in
   *Traceback*) bad "unmapped key must not print a traceback (got: $ACT_OUTPUT)" ;;
@@ -2587,10 +2599,10 @@ else
 fi
 
 echo
-echo "-- merge gate (M): confirm_and_merge runs as a plain input() prompt --"
+echo "-- merge gate (m): confirm_and_merge runs as a plain input() prompt --"
 
 : > "$GH_ACT_LOG"
-run_act "M" "$FIX_GH_FULL_LINE" "y
+run_act "m" "$FIX_GH_FULL_LINE" "y
 "
 check "merge confirm 'y' exits 0" "$ACT_RC" "0"
 if grep -q 'pr merge --squash --delete-branch 42 --repo myorg/kb' "$GH_ACT_LOG"; then
@@ -2600,7 +2612,7 @@ else
 fi
 
 : > "$GH_ACT_LOG"
-run_act "M" "$FIX_GH_FULL_LINE" "n
+run_act "m" "$FIX_GH_FULL_LINE" "n
 "
 check "merge confirm 'n' exits 0" "$ACT_RC" "0"
 if [ -s "$GH_ACT_LOG" ]; then
@@ -2610,7 +2622,7 @@ else
 fi
 
 : > "$GH_ACT_LOG"
-run_act "M" "$FIX_GH_FULL_LINE" ""
+run_act "m" "$FIX_GH_FULL_LINE" ""
 check "merge confirm EOF (no stdin) exits 0, canceled gracefully" "$ACT_RC" "0"
 if [ -s "$GH_ACT_LOG" ]; then
   bad "merge confirm EOF must not invoke gh pr merge (got: $(cat "$GH_ACT_LOG"))"
@@ -2619,7 +2631,7 @@ else
 fi
 
 echo
-echo "-- session dispatch (S): backgrounded (doesn't block the caller) --"
+echo "-- session dispatch (s): backgrounded (doesn't block the caller) --"
 
 wait_for_aoe_cmd_log() {
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -2631,24 +2643,24 @@ wait_for_aoe_cmd_log() {
 
 : > "$AOE_CMD_LOG"
 start_ts=$(date +%s)
-run_act "S" "$FIX_GH_FULL_LINE"
+run_act "s" "$FIX_GH_FULL_LINE"
 elapsed=$(( $(date +%s) - start_ts ))
-check "GH S exits 0" "$ACT_RC" "0"
+check "GH s exits 0" "$ACT_RC" "0"
 if [ "$elapsed" -le 1 ]; then
-  ok "GH S returns without waiting for the dispatched process (${elapsed}s; stub sleeps 1s)"
+  ok "GH s returns without waiting for the dispatched process (${elapsed}s; stub sleeps 1s)"
 else
-  bad "GH S returns without waiting for the dispatched process (took ${elapsed}s; stub sleeps 1s)"
+  bad "GH s returns without waiting for the dispatched process (took ${elapsed}s; stub sleeps 1s)"
 fi
 wait_for_aoe_cmd_log
 if grep -q -- '-n test-pr -b -w test-pr ' "$AOE_CMD_LOG"; then
-  ok "GH S names session/worktree branch from the title slug 'test-pr' (got: $(cat "$AOE_CMD_LOG"))"
+  ok "GH s names session/worktree branch from the title slug 'test-pr' (got: $(cat "$AOE_CMD_LOG"))"
 else
-  bad "GH S names session/worktree branch from the title slug 'test-pr' (got: $(cat "$AOE_CMD_LOG"))"
+  bad "GH s names session/worktree branch from the title slug 'test-pr' (got: $(cat "$AOE_CMD_LOG"))"
 fi
 
 : > "$AOE_CMD_LOG"
-run_act "S" "$FIX_LIN_LINE"
-check "LIN S exits 0" "$ACT_RC" "0"
+run_act "s" "$FIX_LIN_LINE"
+check "LIN s exits 0" "$ACT_RC" "0"
 wait_for_aoe_cmd_log
 if grep -q -- '-n abc-1 ' "$AOE_CMD_LOG"; then
   ok "LIN S names the session from the issue identifier"
@@ -2736,7 +2748,7 @@ th = threading.Thread(target=waiter)
 th.start()
 started_blocked = not th.join(timeout=0.2) and th.is_alive()
 print(started_blocked)
-presenter.send_result('O', 'row1')
+presenter.send_result('o', 'row1')
 th.join(timeout=5)
 print(result_holder[0].key, repr(result_holder[0].row))
 ")"
@@ -2745,7 +2757,7 @@ print(result_holder[0].key, repr(result_holder[0].row))
   check "FakePresenter.wait_for_exit() blocks until the test supplies a result (no wall-clock sleep)" \
     "$(sed -n 2p <<<"$out")" "True"
   check "FakePresenter.wait_for_exit() returns exactly the result the test sent" \
-    "$(sed -n 3p <<<"$out")" "O 'row1'"
+    "$(sed -n 3p <<<"$out")" "o 'row1'"
 }
 test_fake_presenter_records_ordered_pushes_and_blocks_wait_for_exit
 
@@ -2923,7 +2935,7 @@ $DASHBOARD_FIXTURES
 gate_b = threading.Event()
 items_by_name = {
     'a': [{'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 1, 'id': 'a',
-           'actions': [{'key': 'O', 'label': 'x', 'primary': True, '_item_id': 'a'}]}],
+           'actions': [{'key': 'o', 'label': 'x', 'primary': True, '_item_id': 'a'}]}],
     'b': [{'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'}],
 }
 calls = CallLog()
@@ -2942,7 +2954,7 @@ th.start()
 calls.wait_for_count(2, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
 row_for_a = presenter.push_calls()[-1][1][0]
-presenter.send_result('O', row_for_a)
+presenter.send_result('o', row_for_a)
 presenter.wait_for_launch_count(2, timeout=5)
 calls_after_accept = sorted(calls.snapshot())
 pushes_before_release = len(presenter.push_calls())
@@ -3102,26 +3114,22 @@ test_quit_returns_promptly_and_discards_a_later_gated_completion
 echo
 echo "== dashboard.py: curses presenter row handling =="
 
-test_curses_presenter_filters_rows_and_reads_row_actions() {
+test_curses_presenter_reads_row_actions() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
 rows = [
-    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'O,O' + chr(9) + 'O open' + chr(11) + 'O merge',
-    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'S' + chr(9) + 'S session',
+    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'o,o' + chr(9) + 'o open' + chr(11) + 'o merge',
+    'Review release notes' + chr(9) + 'blob2' + chr(9) + 's' + chr(9) + 's session',
 ]
-print(d.CursesPresenter._matching_rows(rows, 'fix bug') == [rows[0]])
-print(d.CursesPresenter._matching_rows(rows, 'release') == [rows[1]])
 print(d.CursesPresenter._action_keys(rows[0]))
 print(d.CursesPresenter._hint_lines(rows[0]))
 ")"
-  check "curses presenter filters each visible row by every filter term" "$(sed -n 1p <<<"$out")" "True"
-  check "curses presenter matches another row by its visible text" "$(sed -n 2p <<<"$out")" "True"
-  check "curses presenter reads only the selected row's action keys" "$(sed -n 3p <<<"$out")" "['O', 'O']"
+  check "curses presenter reads only the selected row's action keys" "$(sed -n 1p <<<"$out")" "['o', 'o']"
   check "curses presenter splits wrapped action hints into footer lines" \
-    "$(sed -n 4p <<<"$out")" "['O open', 'O merge']"
+    "$(sed -n 2p <<<"$out")" "['o open', 'o merge']"
 }
-test_curses_presenter_filters_rows_and_reads_row_actions
+test_curses_presenter_reads_row_actions
 
 test_curses_presenter_dispatches_filtered_and_alt_actions() {
   local out
@@ -3147,32 +3155,47 @@ class FakeScreen:
     def getch(self):
         return self.keys.pop(0) if self.keys else -1
 
+class RecordingScreen(FakeScreen):
+    def __init__(self, keys):
+        super().__init__(keys)
+        self.drawn = []
+    def addnstr(self, *args):
+        self.drawn.append(args[2])
+
 rows = [
-    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'O' + chr(9) + 'O open',
-    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'O' + chr(9) + 'O merge',
+    'Fix login bug' + chr(9) + 'blob1' + chr(9) + 'o' + chr(9) + 'o open',
+    'Review release notes' + chr(9) + 'blob2' + chr(9) + 'o' + chr(9) + 'o merge',
 ]
 filtered = d.CursesPresenter()
 filtered.launch()
 filtered.push_snapshot(rows, [])
-filtered_result = filtered._run(FakeScreen([*(ord(c) for c in 'review'), 10]), time.monotonic() + 1)
+filtered_result = filtered._run(FakeScreen([ord('/'), *(ord(c) for c in 'review'), 10]), time.monotonic() + 1)
 alt = d.CursesPresenter()
 alt.launch()
 alt.push_snapshot(rows, [])
-alt_result = alt._run(FakeScreen([ord('O')]), time.monotonic() + 1)
-bare_results = []
+alt_result = alt._run(FakeScreen([ord('o')]), time.monotonic() + 1)
+reserved_results = []
 for key in ('q', 'j', 'k'):
-    row = 'Bare ' + key + chr(9) + 'blob' + chr(9) + key + chr(9) + key + ' action'
-    bare = d.CursesPresenter()
-    bare.launch()
-    bare.push_snapshot([row], [])
-    bare_results.append(bare._run(FakeScreen([ord(key)]), time.monotonic() + 1) == d.PresenterResult(key, row))
+    row = 'Reserved ' + key + chr(9) + 'blob' + chr(9) + key + chr(9) + key + ' action'
+    reserved = d.CursesPresenter()
+    reserved.launch()
+    reserved.push_snapshot([row], [])
+    result = reserved._run(FakeScreen([ord(key), 27]), time.monotonic() + 1)
+    reserved_results.append(result == d.PresenterResult('', ''))
+unbound_lowercase = d.CursesPresenter()
+unbound_lowercase.launch()
+unbound_lowercase.push_snapshot(rows, [])
+lowercase_screen = RecordingScreen([ord('z'), 27])
+unbound_lowercase._run(lowercase_screen, time.monotonic() + 1)
 print(filtered_result == d.PresenterResult('', rows[1]))
-print(alt_result == d.PresenterResult('O', rows[0]))
-print(all(bare_results))
+print(alt_result == d.PresenterResult('o', rows[0]))
+print(all(reserved_results))
+print('Filter: z' not in lowercase_screen.drawn)
 ")"
-  check "curses presenter filters before Enter selects the filtered row" "$(sed -n 1p <<<"$out")" "True"
-  check "curses presenter dispatches a capital-letter action on the selected row" "$(sed -n 2p <<<"$out")" "True"
-  check "curses presenter dispatches bare q, j, and k actions before controls" "$(sed -n 3p <<<"$out")" "True"
+  check "curses presenter filters after slash before Enter selects the filtered row" "$(sed -n 1p <<<"$out")" "True"
+  check "curses presenter dispatches a lowercase action on the selected row" "$(sed -n 2p <<<"$out")" "True"
+  check "curses presenter reserves q, j, and k before action dispatch" "$(sed -n 3p <<<"$out")" "True"
+  check "curses presenter does not filter on an unbound lowercase key without slash" "$(sed -n 4p <<<"$out")" "True"
 }
 test_curses_presenter_preserves_selection_after_action() {
   local out
@@ -3334,13 +3357,13 @@ child = Child()
 presenter._active_group = 'Needs Attention'
 presenter._active_presenter = child
 presenter.push_snapshot([
-    'needs' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'Needs Attention',
-    'other' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'Other',
+    'needs' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'Needs Attention',
+    'other' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'Other',
 ], ['github'])
 print(child.calls)
 ")"
   check "curses group presenter forwards only the selected group's rows to its terminal list" \
-    "$(sed -n 1p <<<"$out")" "[(['needs\tblob\tO\thint'], ['github'])]"
+    "$(sed -n 1p <<<"$out")" "[(['needs\tblob\to\thint'], ['github'])]"
 }
 test_curses_group_presenter_scopes_rows
 
@@ -3370,18 +3393,18 @@ class FakeScreen:
 
 presenter = d.CursesGroupPresenter(['A', 'B'])
 presenter._rows = [
-    'a-item' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'A',
-    'b-item' + chr(9) + 'blob' + chr(9) + 'O' + chr(9) + 'hint' + chr(9) + 'B',
+    'a-item' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'A',
+    'b-item' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'B',
 ]
 deadline = time.monotonic() + 5
 
 # Shared FakeScreen drives both outer (overview) and inner (group) loops.
-# Key sequence: Enter(10) opens group A, 'O'(79) dispatches action,
+# Key sequence: Enter(10) opens group A, 'o'(111) dispatches action,
 # timeout(-1) triggers snapshot check then Esc(27) exits group,
 # Esc(27) quits overview.
-screen = FakeScreen([10, 79, -1, 27, 27])
+screen = FakeScreen([10, 111, -1, 27, 27])
 
-# 1) Enter on the overview's first row opens 'A' and dispatches 'O'.
+# 1) Enter on the overview's first row opens 'A' and dispatches 'o'.
 result1 = presenter._run(screen, deadline)
 reopen_after_action = presenter._reopen_group
 # 2) The next relaunch (e.g. a periodic refresh timeout) reopens 'A'
@@ -3399,7 +3422,7 @@ print(reopen_after_refresh)
 print((result3.key, result3.row))
 ")"
   check "the dispatched action's key/row surface unchanged" \
-    "$(sed -n 1p <<<"$out")" "('O', 'a-item\tblob\tO\thint')"
+    "$(sed -n 1p <<<"$out")" "('o', 'a-item\tblob\to\thint')"
   check "acting on an item remembers its group instead of resetting to the overview" \
     "$(sed -n 2p <<<"$out")" "A"
   check "the next relaunch reopens the same group with no overview keypress" \

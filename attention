@@ -497,7 +497,7 @@ def _action_hint_parts(actions):
 
 
 def hint_for_actions(actions):
-    """Human-readable footer hint, e.g. 'O open  S session'."""
+    """Human-readable footer hint, e.g. 'o open  s session'."""
     return "  ".join(_action_hint_parts(actions))
 
 

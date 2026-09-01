@@ -101,7 +101,7 @@ def fetch(config):
             "status": status,
         }
         actions = [
-            {"key": "Y", "label": "yank", "payload": {"text": display_text}},
+            {"key": "y", "label": "yank", "payload": {"text": display_text}},
         ]
         configured_actions = config.get("calendar", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))
@@ -122,5 +122,5 @@ def act(key, payload):
     if "command" in payload:
         run_configured_action(payload)
         return
-    if key == "Y":
+    if key == "y":
         copy_to_clipboard(payload["text"])
