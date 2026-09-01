@@ -681,15 +681,13 @@ def render_dashboard_rows(items, columns=None):
         max((len(item["context"]) for item in items), default=0),
         _CONTEXT_MAX,
     )
-    content_width = max(0, width - context_col - indicator_width - 4)
     title_col = min(
         max((len(item["title"]) for item in items), default=0),
         _TITLE_MAX,
-        max(0, int(content_width * 0.55)),
+        max(0, width - context_col - indicator_width - 2),
     )
-    details_col = max(0, content_width - title_col)
     indicator_metadata = json.dumps({
-        "offset": title_col + context_col + details_col + 6,
+        "offset": title_col + context_col + 4,
         "columns": [(label, cell_width) for _, label, cell_width in indicator_specs],
     })
 
@@ -697,11 +695,7 @@ def render_dashboard_rows(items, columns=None):
     for item in items:
         title = _clip(item["title"], title_col)
         context = _clip(item["context"], context_col)
-        details = _clip(item["details"], details_col)
-        visible = (
-            f"{title:<{title_col}}  {context:<{context_col}}  "
-            f"{details:<{details_col}}"
-        )
+        visible = f"{title:<{title_col}}  {context:<{context_col}}"
         if indicator_specs:
             indicators = item.get("indicators", {})
             indicator_cells = "  ".join(

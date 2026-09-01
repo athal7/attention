@@ -2321,7 +2321,7 @@ test_render_dashboard_rows_omits_status_and_retains_action_fields() {
 $LOAD_CORE
 items = [{
     'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the login bug',
-    'details': '', 'weight': 90, 'id': '42', '_plugin': 'github',
+    'details': 'Mention | Mention: keep this out of the dashboard row', 'weight': 90, 'id': '42', '_plugin': 'github',
     'actions': [
         {'key': 'o', 'label': 'open', 'primary': True, 'payload': {}},
         {'key': 's', 'label': 'session', 'payload': {}},
@@ -2336,6 +2336,7 @@ print(fields[2])
 print(fields[3])
 list_fields = m.render_rows([dict(items[0])])[0].split(chr(9))
 print(fields[1] == list_fields[1])
+print('Mention |' not in fields[0])
 ")"
   check "render_dashboard_rows() emits exactly one row per item" "$(sed -n 1p <<<"$out")" "1"
   check "render_dashboard_rows() emits exactly 4 tab-delimited fields" "$(sed -n 2p <<<"$out")" "4"
@@ -2343,6 +2344,7 @@ print(fields[1] == list_fields[1])
   check "render_dashboard_rows() field 3 is the comma-joined CSV of this item's own action keys" "$(sed -n 4p <<<"$out")" "o,s"
   check "render_dashboard_rows() field 4 is the same hint text render_rows() puts in field 3" "$(sed -n 5p <<<"$out")" "o open  s session"
   check "render_dashboard_rows() shares render_rows()'s hidden actions-blob field (field 2)" "$(sed -n 6p <<<"$out")" "True"
+  check "render_dashboard_rows() omits verbose details from the compact dashboard" "$(sed -n 7p <<<"$out")" "True"
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
 
