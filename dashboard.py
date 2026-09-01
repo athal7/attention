@@ -337,18 +337,17 @@ class CursesPresenter:
         if len(fields) < 5:
             return ""
         try:
-            columns = json.loads(fields[4])
-        except (TypeError, ValueError):
-            return ""
-        if not isinstance(columns, list):
-            return ""
-        try:
-            return "  ".join(
+            metadata = json.loads(fields[4])
+            offset = metadata["offset"]
+            columns = metadata["columns"]
+            if not isinstance(offset, int) or offset < 0 or not isinstance(columns, list):
+                return ""
+            return " " * offset + "  ".join(
                 f"{label:<{width}}"
                 for label, width in columns
                 if isinstance(label, str) and isinstance(width, int) and width > 0
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, KeyError):
             return ""
 
     def _draw(self, screen, rows, pending, selected, query):

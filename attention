@@ -562,6 +562,7 @@ _INDICATOR_LABELS = {
     "ready": "READY",
     "review": "REVIEW",
     "stacked": "STACKED",
+    "merge": "MERGE",
     "state": "STATE",
     "due": "DUE",
 }
@@ -661,29 +662,51 @@ def render_rows(items):
 
 
 def render_dashboard_rows(items, columns=None):
-    """Render interactive rows with optional shared indicator columns."""
+    """Render interactive rows as an aligned content-and-indicator table."""
+    import shutil
+
     _normalize_row_text(items)
-    status_col, context_col, title_col = _row_columns(items, include_status=False)
     indicator_specs = _indicator_specs(items, columns)
-    indicator_metadata = json.dumps([
-        (label, width) for _, label, width in indicator_specs
-    ])
+    width = shutil.get_terminal_size().columns
+    indicator_width = (
+        2 + sum(cell_width for _, _, cell_width in indicator_specs)
+        + 2 * max(0, len(indicator_specs) - 1)
+    )
+    context_col = min(
+        max((len(item["context"]) for item in items), default=0),
+        _CONTEXT_MAX,
+    )
+    content_width = max(0, width - context_col - indicator_width - 4)
+    title_col = min(
+        max((len(item["title"]) for item in items), default=0),
+        _TITLE_MAX,
+        max(0, int(content_width * 0.55)),
+    )
+    details_col = max(0, content_width - title_col)
+    indicator_metadata = json.dumps({
+        "offset": title_col + context_col + details_col + 6,
+        "columns": [(label, cell_width) for _, label, cell_width in indicator_specs],
+    })
 
     rows = []
     for item in items:
-        visible = _visible_row_text(
-            item, status_col, context_col, title_col, include_status=False,
+        title = _clip(item["title"], title_col)
+        context = _clip(item["context"], context_col)
+        details = _clip(item["details"], details_col)
+        visible = (
+            f"{title:<{title_col}}  {context:<{context_col}}  "
+            f"{details:<{details_col}}"
         )
         if indicator_specs:
             indicators = item.get("indicators", {})
             indicator_cells = "  ".join(
-                f"{indicators.get(key, '—'):<{width}}"
-                for key, _, width in indicator_specs
+                f"{indicators.get(key, '—'):<{cell_width}}"
+                for key, _, cell_width in indicator_specs
             )
             visible = f"{visible}  {indicator_cells}"
         actions = item.get("actions", [])
         blob = base64.b64encode(json.dumps(actions).encode()).decode()
-        keys_csv = ",".join(a["key"] for a in actions)
+        keys_csv = ",".join(action["key"] for action in actions)
         hint = _dashboard_hint_for_actions(actions)
         row = f"{visible}\t{blob}\t{keys_csv}\t{hint}"
         if indicator_specs:
@@ -695,7 +718,7 @@ _DEFAULT_DASHBOARD_GROUPS = (
     {
         "name": "Pull Requests",
         "match": {"kinds": ["pull_request"]},
-        "columns": ["ci", "ready", "review", "stacked"],
+        "columns": ["ci", "ready", "review", "merge", "stacked"],
     },
     {"name": "Issues", "match": {"kinds": ["issue"]}, "columns": ["state"]},
     {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["due"]},

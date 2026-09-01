@@ -74,7 +74,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "linear":    { "apiToken": "lin_api_..." },
   "dashboard": {
     "groups": [
-      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["ci", "ready", "review", "stacked"] },
+      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["ci", "ready", "review", "merge", "stacked"] },
       { "name": "Needs Attention", "match": { "statuses": ["OVERDUE"] }, "columns": ["due"] },
       { "name": "My Repositories", "match": { "contextPrefixes": ["athal7/"] } },
       { "name": "Ready for Something New", "fallback": true }
@@ -113,12 +113,13 @@ cannot hide attention items.
 
 Each group can select a different table with `columns`. Columns display after
 the title, context, and details. The GitHub source supplies `ci`, `ready`,
-`review`, and `stacked` for pull requests. Linear and GitHub issues supply
-`state`. `ready` is `×` for a draft and `✓` otherwise. `stacked` is `✓` when
-the PR targets a non-default branch, and `×` when it targets the default
-branch. A combined group can use only keys that all of its sources share.
-Missing values render as `—`. Without explicit `columns`, the dashboard derives
-the columns from the items in the current list.
+`review`, `merge`, and `stacked` for pull requests. Linear and GitHub issues
+supply `state`. `ready` is `×` for a draft and `✓` otherwise. `merge` is `×`
+for a conflict, `✓` when the PR is mergeable, and `…` while GitHub has no
+answer. `stacked` is `✓` when the PR targets a non-default branch, and `×`
+when it targets the default branch. A combined group can use only keys that all
+of its sources share. Missing values render as `—`. Without explicit `columns`,
+the dashboard derives the columns from the items in the current list.
 
 ## What each bundled plugin surfaces
 
@@ -131,9 +132,9 @@ the columns from the items in the current list.
   changes requested, a merge conflict, or a new review comment from a
   non-bot reviewer -- see `github.botReviewAllowlist` to opt specific bots
   back in); issues assigned to you; open issues in repos you own regardless
-  of assignee. Draft PRs are shown with a `DRAFT:` status prefix rather than
-  hidden. De-duplicated by repo+number if an item matches more than one of
-  these. Also surfaces unread GitHub notifications (`mention`, `author`,
+  of assignee. Draft status and actionable PR state appear in table columns.
+  De-duplicated by repo+number if an item matches more than one of these.
+  Also surfaces unread GitHub notifications (`mention`, `author`,
   `state_change`, `ci_activity`) via `gh api /notifications`, which catches
   items the search-based queries miss: direct mentions, comments on your PRs
   that aren't review comments, state changes on subscribed PRs, and CI

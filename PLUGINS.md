@@ -81,9 +81,9 @@ omitted.
 ```
 
 `indicators` holds compact values for table columns. Keys are shared column
-identifiers such as `ci`, `ready`, `review`, and `stacked`. Values are visible
-strings, usually `✓`, `×`, `…`, or `—`. A dashboard group selects its columns
-by key. An item without a selected key shows `—`.
+identifiers such as `ci`, `ready`, `review`, `merge`, and `stacked`. Values are
+visible strings, usually `✓`, `×`, `…`, or `—`. A dashboard group selects its
+columns by key. An item without a selected key shows `—`.
 
 ### Indicator tables
 

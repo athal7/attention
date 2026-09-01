@@ -425,17 +425,16 @@ test_github_source() {
     *) bad "assigned issue gets ASSIGNED status with repo as context (got: $issue_line)" ;;
   esac
   case "$authored_line" in
-    "NEEDS ATTENTION"*"Changes Requested, Review Commented, Merge Conflict, Checks Failing"*)
-      ok "authored PR review, conflict, and failing-check signals appear as attention reasons" ;;
-    *) bad "authored PR needing attention gets NEEDS ATTENTION status with reasons in details (got: $authored_line)" ;;
+    "NEEDS ATTENTION"*"GHTEST-authored-me"*) ok "authored PR keeps its attention status without duplicating column state in details" ;;
+    *) bad "authored PR keeps its attention status without duplicating column state in details (got: $authored_line)" ;;
   esac
   case "$repo_issue_line" in
     "OPEN"*"myorg/kb"*) ok "owned-repo issue (not assigned to me) appears with OPEN status" ;;
     *) bad "owned-repo issue (not assigned to me) appears with OPEN status (got: $repo_issue_line)" ;;
   esac
   case "$draft_line" in
-    "DRAFT:"*"myorg/kb"*) ok "draft PR shown with DRAFT status, distinguishable from ready-to-review" ;;
-    *) bad "draft PR shown with DRAFT status, distinguishable from ready-to-review (got: $draft_line)" ;;
+    "REVIEW REQUESTED"*"myorg/kb"*) ok "draft PR stays visible without a duplicate DRAFT status prefix" ;;
+    *) bad "draft PR stays visible without a duplicate DRAFT status prefix (got: $draft_line)" ;;
   esac
 
   check "issue matching both assignee and owner queries appears exactly once" \
@@ -1836,18 +1835,20 @@ detail = {
     'reviewDecision': 'APPROVED',
     'reviewRequests': [],
     'baseRefName': 'feature/base',
+    'mergeable': 'MERGEABLE',
 }
 print(json.dumps(p._pr_indicators(detail, True, 'main'), sort_keys=True))
 detail['statusCheckRollup'] = [{'conclusion': 'FAILURE'}]
 detail['latestReviews'] = [{'state': 'CHANGES_REQUESTED'}]
 detail['reviewDecision'] = 'CHANGES_REQUESTED'
 detail['baseRefName'] = 'main'
+detail['mergeable'] = 'CONFLICTING'
 print(json.dumps(p._pr_indicators(detail, False, 'main'), sort_keys=True))
 ")"
-  check "draft stacked PR shows ready false, passed CI, approved review, and stacked true" \
-    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "ready": "\u00d7", "review": "\u2713", "stacked": "\u2713"}'
-  check "base-branch PR shows failing CI, changes requested, and stacked false" \
-    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "ready": "\u2713", "review": "\u00d7", "stacked": "\u00d7"}'
+  check "draft stacked PR shows draft, passed CI, approval, mergeable, and stacked state" \
+    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "merge": "\u2713", "ready": "\u00d7", "review": "\u2713", "stacked": "\u2713"}'
+  check "base-branch PR shows failing CI, changes requested, conflict, and stacked false" \
+    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "merge": "\u00d7", "ready": "\u2713", "review": "\u00d7", "stacked": "\u00d7"}'
 }
 test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state
 
@@ -2337,16 +2338,18 @@ items = [{
 rows = m.render_dashboard_rows(items, ['ci', 'ready', 'review', 'stacked'])
 fields = rows[0].split(chr(9))
 print(len(fields))
-print(m.json.loads(fields[4]))
-print(d.CursesPresenter()._indicator_header(rows))
-print(fields[0].index('Fix the login bug') < fields[0].rfind('✓'))
+metadata = m.json.loads(fields[4])
+print(metadata['columns'])
+header = d.CursesPresenter()._indicator_header(rows)
+print(header)
+print(header.index('CI') == fields[0].index('✓'))
 ")"
   check "dashboard indicator rows add one metadata field for their shared table columns" \
     "$(sed -n 1p <<<"$out")" "5"
-  check "dashboard indicator metadata keeps the CI, ready, review, and stacked table definition" \
+  check "dashboard indicator metadata keeps the shared table definition" \
     "$(sed -n 2p <<<"$out")" "[['CI', 2], ['READY', 5], ['REVIEW', 6], ['STACKED', 7]]"
-  check "curses dashboard renders the shared indicator table header" \
-    "$(sed -n 3p <<<"$out")" "CI  READY  REVIEW  STACKED"
+  check "curses dashboard places the shared indicator table header above its cells" \
+    "$(sed -n 3p <<<"$out" | sed 's/^ *//')" "CI  READY  REVIEW  STACKED"
   check "dashboard indicator values follow the item content" \
     "$(sed -n 4p <<<"$out")" "True"
 }

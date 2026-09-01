@@ -129,12 +129,17 @@ def _pr_indicators(detail, is_draft, default_branch):
     review_states = {review.get("state") for review in detail.get("latestReviews") or []}
     if "CHANGES_REQUESTED" in review_states:
         review = "×"
+    elif "COMMENTED" in review_states:
+        review = "!"
     elif detail.get("reviewDecision") == "APPROVED":
         review = "✓"
     elif detail.get("reviewRequests") or detail.get("reviewDecision") == "REVIEW_REQUIRED":
         review = "…"
     else:
         review = "—"
+
+    mergeable = detail.get("mergeable")
+    merge = "×" if mergeable == "CONFLICTING" else "✓" if mergeable == "MERGEABLE" else "…"
 
     base_branch = detail.get("baseRefName", "")
     if not base_branch or not default_branch:
@@ -146,6 +151,7 @@ def _pr_indicators(detail, is_draft, default_branch):
         "ci": ci,
         "ready": "×" if is_draft else "✓",
         "review": review,
+        "merge": merge,
         "stacked": stacked,
     }
 
@@ -561,6 +567,7 @@ def fetch(config):
         is_draft = g.get("isDraft", False)
 
         gtype = g.get("type", "")
+        is_pull_request = gtype in {"review_request", "authored_attention", "tracked_attention"}
         details = ""
         if gtype == "review_request":
             weight, status = 90, "REVIEW REQUESTED"
@@ -568,12 +575,10 @@ def fetch(config):
             weight, status = 88, "NEEDS ATTENTION"
             if g.get("reviewRequested"):
                 status = "REVIEW REQUESTED"
-            details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "tracked_attention":
             weight, status = 85, f"{g.get('tracked_author', '').upper()}: NEEDS ATTENTION"
             if g.get("reviewRequested"):
                 status = f"{g.get('tracked_author', '').upper()}: REVIEW REQUESTED"
-            details = ", ".join(g.get("attention_reasons", []))
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
         elif gtype == "notification":
@@ -596,16 +601,16 @@ def fetch(config):
             # repo_issue: boost so they rank higher
             weight, status = 70, "OPEN"
 
-        if is_draft:
+        if is_draft and not is_pull_request:
             status = f"DRAFT: {status}"
 
-        is_pull_request = gtype in {"review_request", "authored_attention", "tracked_attention"}
         indicators = g.get("indicators")
         if is_pull_request and not indicators:
             indicators = {
                 "ci": "—",
                 "ready": "×" if is_draft else "✓",
                 "review": "…" if gtype == "review_request" else "—",
+                "merge": "…",
                 "stacked": "—",
             }
         if gtype in {"assigned_issue", "repo_issue"} and not indicators:
