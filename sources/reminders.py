@@ -75,7 +75,14 @@ def fetch(config):
             "context": list_name,
             "title": title,
             "details": details,
-            "indicators": {"due": due_indicator},
+            "indicators": {
+                "state": (
+                    "Overdue ❌" if status == "OVERDUE"
+                    else "Today ⏳" if status == "DUE TODAY"
+                    else "Ready ✅"
+                ),
+                "due": due_indicator,
+            },
             "weight": weight,
             "id": reminder_id,
             "kind": "reminder",

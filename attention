@@ -577,6 +577,8 @@ def _indicator_columns(items, columns):
         for item in items
         for key in item.get("indicators", {})
     }
+    if "state" in found:
+        return ["state"]
     return [
         *[key for key in _INDICATOR_ORDER if key in found],
         *sorted(found - set(_INDICATOR_ORDER)),
@@ -590,7 +592,10 @@ def _indicator_specs(items, columns):
             _INDICATOR_LABELS.get(key, key.replace("_", " ").upper()),
             max(
                 len(_INDICATOR_LABELS.get(key, key.replace("_", " ").upper())),
-                *(len(item.get("indicators", {}).get(key, "—")) for item in items),
+                max(
+                    (len(item.get("indicators", {}).get(key, "—")) for item in items),
+                    default=0,
+                ),
             ),
         )
         for key in _indicator_columns(items, columns)
@@ -718,12 +723,12 @@ _DEFAULT_DASHBOARD_GROUPS = (
     {
         "name": "Pull Requests",
         "match": {"kinds": ["pull_request"]},
-        "columns": ["ci", "ready", "review", "merge", "stacked"],
+        "columns": ["state"],
     },
     {"name": "Issues", "match": {"kinds": ["issue"]}, "columns": ["state"]},
-    {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["due"]},
-    {"name": "Events", "match": {"kinds": ["event"]}, "columns": None},
-    {"name": "Other", "fallback": True, "columns": None},
+    {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["state"]},
+    {"name": "Events", "match": {"kinds": ["event"]}, "columns": ["state"]},
+    {"name": "Other", "fallback": True, "columns": ["state"]},
 )
 
 

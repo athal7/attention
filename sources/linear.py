@@ -121,7 +121,12 @@ query {
             "context": project,
             "title": title,
             "details": "",
-            "indicators": {"state": state.upper()},
+            "indicators": {
+                "state": (
+                    f"{state.title()} ❌" if "block" in state.lower()
+                    else f"{state.title()} ⏳"
+                ),
+            },
             "weight": weight,
             "id": identifier,
             "kind": "issue",

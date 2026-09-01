@@ -111,6 +111,14 @@ def fetch(config):
             "context": calendar_name,
             "title": title,
             "details": time_tag,
+            "indicators": {
+                "state": (
+                    "Now ⏳" if status == "NOW"
+                    else "Soon ⏳" if status == "SOON"
+                    else "Past ❌" if status == "PAST"
+                    else "Upcoming ✅"
+                ),
+            },
             "weight": weight,
             "id": event_id,
             "kind": "event",

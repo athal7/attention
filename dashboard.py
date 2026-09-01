@@ -377,7 +377,8 @@ class CursesPresenter:
         write(1, _pending_header(pending))
         header = self._indicator_header(rows)
         filter_text = f"Filter: {query}" if query is not None else ""
-        write(2, f"{filter_text}  {header}".strip() if header else filter_text)
+        header_line = f"{filter_text}  {header}" if filter_text and header else header or filter_text
+        write(2, header_line)
         if not visible:
             write(3, "No matching items.")
         for index, row in enumerate(visible[start:start + capacity], start):

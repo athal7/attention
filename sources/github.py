@@ -155,6 +155,27 @@ def _pr_indicators(detail, is_draft, default_branch):
         "stacked": stacked,
     }
 
+def _status_badge(gtype, reasons, is_draft, review_requested):
+    if "Merge Conflict" in reasons:
+        return "Merge ❌"
+    if "Changes Requested" in reasons:
+        return "Changes ❌"
+    if "Checks Failing" in reasons:
+        return "CI ❌"
+    if "Review Commented" in reasons:
+        return "Reply ⏳"
+    if gtype == "review_request" or review_requested:
+        return "Review ⏳"
+    if is_draft:
+        return "Draft ⏳"
+    if gtype == "assigned_issue":
+        return "Assigned ⏳"
+    if gtype == "repo_issue":
+        return "Triage ⏳"
+    if gtype == "notification":
+        return "Reply ⏳"
+    return "Ready ✅"
+
 
 def _fetch_pr_attention(
     author, detail_pool, bot_review_allowlist=frozenset(),
@@ -256,13 +277,12 @@ def _fetch_pr_attention(
 
 
 def _fetch_my_repo_issues():
-    # Open issues in repos I own, regardless of assignee -- distinct from
-    # the assignee=@me query below, which only catches issues explicitly
-    # assigned to me and misses everything else in my own repos.
-    return _gh_json([
+    """Return only unassigned issues in owned repositories for triage."""
+    issues = _gh_json([
         "search", "issues", "--owner=@me", "--state=open", "--archived=false", "--limit", "50",
-        "--json", "number,title,repository,url,createdAt",
+        "--json", "number,title,repository,url,createdAt,assignees",
     ])
+    return [issue for issue in issues or [] if not issue.get("assignees")]
 
 
 def _fetch_notifications():
@@ -289,6 +309,8 @@ def _fetch_notifications():
         if not notif.get("unread"):
             continue
         reason = notif.get("reason", "")
+        if reason not in {"mention", "author"}:
+            continue
         subject = notif.get("subject") or {}
         repo_info = notif.get("repository") or {}
         repo_name = repo_info.get("full_name", "")
@@ -604,7 +626,7 @@ def fetch(config):
         if is_draft and not is_pull_request:
             status = f"DRAFT: {status}"
 
-        indicators = g.get("indicators")
+        indicators = dict(g.get("indicators") or {})
         if is_pull_request and not indicators:
             indicators = {
                 "ci": "—",
@@ -613,8 +635,12 @@ def fetch(config):
                 "merge": "…",
                 "stacked": "—",
             }
-        if gtype in {"assigned_issue", "repo_issue"} and not indicators:
-            indicators = {"state": status}
+        indicators["state"] = _status_badge(
+            gtype,
+            g.get("attention_reasons", []),
+            is_draft,
+            bool(g.get("reviewRequested")),
+        )
         kind = (
             "pull_request" if is_pull_request
             else "issue" if gtype in {"assigned_issue", "repo_issue"}

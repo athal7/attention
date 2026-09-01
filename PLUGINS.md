@@ -80,10 +80,11 @@ omitted.
 }
 ```
 
-`indicators` holds compact values for table columns. Keys are shared column
-identifiers such as `ci`, `ready`, `review`, `merge`, and `stacked`. Values are
-visible strings, usually `✓`, `×`, `…`, or `—`. A dashboard group selects its
-columns by key. An item without a selected key shows `—`.
+`indicators` holds visible table values. The shared `state` key should contain
+a short status label and an inline result emoji, such as `Ready ✅`,
+`Blocked ❌`, or `Review ⏳`. Bundled sources provide this key so mixed-source
+groups remain one status column wide. Source-specific groups can select detail
+keys such as `ci`, `ready`, `review`, `merge`, and `stacked`.
 
 ### Indicator tables
 
@@ -117,8 +118,8 @@ Configure a group table with the indicator keys that it should display:
 }
 ```
 
-The dashboard displays an upper-case label for each key. A combined group
-should select only shared keys. Missing keys display `—`.
+The dashboard displays an upper-case label for each key. A group without
+explicit columns prefers the shared `state` key. Missing keys display `—`.
 
 Every bundled source assigns a `kind`. The default dashboard groups pull
 requests, issues, reminders, and events by this value. Custom sources should

@@ -111,15 +111,13 @@ group wins; the fallback receives every remaining item. Invalid grouping
 configuration emits a warning and uses the existing flat dashboard, so it
 cannot hide attention items.
 
-Each group can select a different table with `columns`. Columns display after
-the title, context, and details. The GitHub source supplies `ci`, `ready`,
-`review`, `merge`, and `stacked` for pull requests. Linear and GitHub issues
-supply `state`. `ready` is `×` for a draft and `✓` otherwise. `merge` is `×`
-for a conflict, `✓` when the PR is mergeable, and `…` while GitHub has no
-answer. `stacked` is `✓` when the PR targets a non-default branch, and `×`
-when it targets the default branch. A combined group can use only keys that all
-of its sources share. Missing values render as `—`. Without explicit `columns`,
-the dashboard derives the columns from the items in the current list.
+Each group can select a different table with `columns`. Bundled sources share
+one compact `state` column. Its value combines a short status label with `✅`,
+`❌`, or `⏳`, such as `Ready ✅`, `Merge ❌`, or `Review ⏳`. A group without
+explicit columns uses `state` when it is available, which keeps mixed-source
+views narrow. A source-specific group can still request detailed keys. GitHub
+pull requests provide `ci`, `ready`, `review`, `merge`, and `stacked`.
+Missing values render as `—`.
 
 ## What each bundled plugin surfaces
 
@@ -127,18 +125,14 @@ the dashboard derives the columns from the items in the current list.
   how soon they start (declined/free/cancelled events excluded).
 - **reminders**: open (incomplete) reminders on the configured lists, weighted
   by due date (overdue/due-today) or priority.
-- **github**: PRs where your review is requested; PRs you (or anyone listed
-  in `github.trackAuthors`) authored that need attention (failing checks,
-  changes requested, a merge conflict, or a new review comment from a
-  non-bot reviewer -- see `github.botReviewAllowlist` to opt specific bots
-  back in); issues assigned to you; open issues in repos you own regardless
-  of assignee. Draft status and actionable PR state appear in table columns.
-  De-duplicated by repo+number if an item matches more than one of these.
-  Also surfaces unread GitHub notifications (`mention`, `author`,
-  `state_change`, `ci_activity`) via `gh api /notifications`, which catches
-  items the search-based queries miss: direct mentions, comments on your PRs
-  that aren't review comments, state changes on subscribed PRs, and CI
-  failures on watched repos.
+- **github**: PRs where your review is requested; your authored PRs that need
+  attention; issues assigned to you; and unassigned issues in repositories you
+  own, for triage. Issues assigned to someone else are excluded. Direct
+  mentions and comments on your work are included. Passive subscription state
+  changes and CI activity from watched repositories are excluded. Configured
+  `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
+  Bot review comments are excluded unless the bot is in
+  `github.botReviewAllowlist`. Items are de-duplicated by repository and number.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate
   state, in your current cycle. Its status always wins on a cross-linked
   dashboard row: a PR title/body mentioning the issue's identifier folds

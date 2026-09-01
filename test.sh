@@ -446,6 +446,28 @@ test_github_source() {
 }
 test_github_source
 
+
+test_github_filters_items_without_my_action() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+p._gh_json = lambda args: [
+    {'number': 1, 'assignees': [], 'title': 'Unassigned'},
+    {'number': 2, 'assignees': [{'login': 'someone-else'}], 'title': 'Owned elsewhere'},
+] if args[:2] == ['search', 'issues'] else [
+    {'id': 'mention', 'unread': True, 'reason': 'mention', 'subject': {'type': 'Issue', 'title': 'Please reply', 'url': 'https://api.github.com/repos/o/r/issues/3'}, 'repository': {'full_name': 'o/r'}},
+    {'id': 'state', 'unread': True, 'reason': 'state_change', 'subject': {'type': 'Issue', 'title': 'Passive update', 'url': 'https://api.github.com/repos/o/r/issues/4'}, 'repository': {'full_name': 'o/r'}},
+    {'id': 'ci', 'unread': True, 'reason': 'ci_activity', 'subject': {'type': 'CheckSuite', 'title': 'Watched CI'}, 'repository': {'full_name': 'o/r'}},
+]
+print([item['number'] for item in p._fetch_my_repo_issues()])
+print([item['notification_id'] for item in p._fetch_notifications()])
+")"
+  check "owned-repository issues assigned to someone else are filtered out" \
+    "$(sed -n 1p <<<"$out")" "[1]"
+  check "passive state and watched-CI notifications are filtered out" \
+    "$(sed -n 2p <<<"$out")" "['mention']"
+}
+test_github_filters_items_without_my_action
 echo
 echo "-- repo_path resolves via git-remote auto-detection, not the repo's own name --"
 
@@ -1919,7 +1941,7 @@ print(json.dumps({'query': captured['query'], 'result': result}))
     *) bad "Linear issues outrank a cross-linked host's status on merge (got: $out)" ;;
   esac
   case "$out" in
-    *'"indicators": {"state": "IN PROGRESS"}'*'"kind": "issue"'*)
+    *'"indicators": {"state": "In Progress \u23f3"}'*'"kind": "issue"'*)
       ok "Linear issues expose an issue type and state indicator" ;;
     *) bad "Linear issues expose an issue type and state indicator (got: $out)" ;;
   esac
@@ -3302,11 +3324,16 @@ print(filtered_result == d.PresenterResult('', rows[1]))
 print(alt_result == d.PresenterResult('o', rows[0]))
 print(all(reserved_results))
 print('Filter: z' not in lowercase_screen.drawn)
+table_screen = RecordingScreen([])
+table_row = 'Item      ✓ ' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'o open' + chr(9) + '{\"offset\": 10, \"columns\": [[\"CI\", 2]]}'
+d.CursesPresenter()._draw(table_screen, [table_row], [], 0, None)
+print('          CI' in table_screen.drawn)
 ")"
   check "curses presenter filters after slash before Enter selects the filtered row" "$(sed -n 1p <<<"$out")" "True"
   check "curses presenter dispatches a lowercase action on the selected row" "$(sed -n 2p <<<"$out")" "True"
   check "curses presenter reserves q, j, and k before action dispatch" "$(sed -n 3p <<<"$out")" "True"
   check "curses presenter does not filter on an unbound lowercase key without slash" "$(sed -n 4p <<<"$out")" "True"
+  check "curses presenter preserves the indicator header offset when drawing" "$(sed -n 5p <<<"$out")" "True"
 }
 test_curses_presenter_preserves_selection_after_action() {
   local out
