@@ -41,6 +41,16 @@ def _query(token, query, variables=None):
         return None
 
 
+def _blocking_issue(issue):
+    identifier = issue.get("identifier", "")
+    for relation in issue.get("relations", {}).get("nodes", []):
+        if (
+            relation.get("type") == "blocks"
+            and relation.get("relatedIssue", {}).get("identifier") == identifier
+        ):
+            return relation.get("issue") or {}
+    return {}
+
 def fetch(config):
     token = _get_token(config)
     if not token:
@@ -60,6 +70,13 @@ query {
         }
         project {
           name
+        }
+        relations(first: 20) {
+          nodes {
+            type
+            issue { identifier title }
+            relatedIssue { identifier }
+          }
         }
       }
     }
@@ -94,7 +111,11 @@ query {
         db_id = l.get("id", "")
         url = l.get("url", "")
 
-        weight = 80 if state.lower() == "in progress" else 65
+        blocker = _blocking_issue(l)
+        blocker_identifier = blocker.get("identifier", "")
+        blocker_title = blocker.get("title", "")
+        weight = 90 if blocker_identifier else 80 if state.lower() == "in progress" else 65
+        status = f"BLOCKED BY {blocker_identifier}" if blocker_identifier else state.upper()
 
         record = {
             "url": url,
@@ -105,7 +126,9 @@ query {
             "db_id": db_id,
             "title": title,
             "context": project,
-            "status": state,
+            "status": status,
+            "blocking_issue": blocker_identifier,
+            "blocking_issue_title": blocker_title,
         }
 
         actions = [
@@ -117,13 +140,13 @@ query {
         actions.extend(resolve_configured_actions(configured_actions, record))
 
         items.append({
-            "status": state.upper(),
+            "status": status,
             "context": project,
             "title": title,
-            "details": "",
+            "details": f"Blocked by {blocker_identifier}: {blocker_title}" if blocker_identifier else "",
             "indicators": {
                 "state": (
-                    f"{state.title()} ❌" if "block" in state.lower()
+                    f"Blocked ❌" if blocker_identifier or "block" in state.lower()
                     else f"{state.title()} ⏳"
                 ),
             },

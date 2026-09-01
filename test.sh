@@ -1924,6 +1924,7 @@ print(json.dumps({'query': captured['query'], 'result': result}))
   case "$out" in
     *'cycle: { isActive: { eq: true } }'*)
       ok "assignedIssues is scoped to the current cycle" ;;
+
     *) bad "assignedIssues is scoped to the current cycle (got: $out)" ;;
   esac
   case "$out" in
@@ -1947,6 +1948,26 @@ print(json.dumps({'query': captured['query'], 'result': result}))
   esac
 }
 test_fetch_linear_functional
+test_linear_blocking_relationships_surface_as_blocked_status() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py linear)
+import json
+p._query = lambda token, query: {'data': {'viewer': {'assignedIssues': {'nodes': [{
+  'id': 'db-1', 'identifier': 'ABC-1', 'title': 'Blocked work', 'url': 'https://linear.app/issue/ABC-1',
+  'state': {'name': 'In Progress'}, 'project': {'name': 'Core'},
+  'relations': {'nodes': [{'type': 'blocks', 'issue': {'identifier': 'ABC-2', 'title': 'Prerequisite'}, 'relatedIssue': {'identifier': 'ABC-1'}}]},
+}]}}}}
+item = p.fetch({'linear': {'apiToken': 'token'}})[0]
+print(item['status'])
+print(item['details'])
+")"
+  check "Linear blocking relationship raises priority and exposes a blocked status badge" \
+    "$(sed -n 1p <<<"$out")" "BLOCKED BY ABC-2"
+  check "Linear blocking relationship names the prerequisite internally" \
+    "$(sed -n 2p <<<"$out")" "Blocked by ABC-2: Prerequisite"
+}
+test_linear_blocking_relationships_surface_as_blocked_status
 
 echo
 echo "-- linear token: config apiToken, env var fallback, no keychain coupling --"

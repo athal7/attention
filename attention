@@ -639,20 +639,7 @@ def _visible_row_text(item, status_col, context_col, title_col, include_status=T
 
 
 def render_rows(items):
-    """Format the (already merged, already sorted) item list for `attention
-    list`: STATUS/TITLE/CONTEXT columns sized to this run's longest value
-    (capped, so one outlier doesn't blow out the whole table) keep every
-    row's fields lined up. Each row's hidden second field is its actions
-    list, base64(JSON)-encoded (opaque and delimiter-safe, since a
-    plugin's payload can be arbitrary JSON) -- act() decodes it, never
-    needing to know which plugin produced the row until dispatch time.
-    Row shape: STATUS  TITLE  CONTEXT  DETAILS \t<base64 actions>\tHINT
-
-    Used only by the blocking `attention list`/`expect-keys` commands --
-    byte-for-byte unchanged by the interactive dashboard's progressive
-    rendering. See render_dashboard_rows() for the dashboard's own
-    four-field format.
-    """
+    """Render STATUS, TITLE, and CONTEXT with hidden action data."""
     _normalize_row_text(items)
     status_col, context_col, title_col = _row_columns(items)
 
