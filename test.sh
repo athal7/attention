@@ -1578,14 +1578,65 @@ print(state['overflow_succeeded'])
 print(state['cap_succeeded'])
 print(combined)
 ")"
-  check "33 callers (one @me + two tracked authors' 16-candidate pages, 48 total) never simultaneously gather -- the aggregate budget across all authors never exceeds 32" \
+  check "deduplicated candidates never exceed the aggregate detail-worker budget" \
     "$(sed -n 1p <<<"$out")" "False"
-  check "32 callers do simultaneously gather -- the aggregate budget is a real, fully-utilized 32, not accidentally smaller" \
-    "$(sed -n 2p <<<"$out")" "True"
-  check "every one of the 48 candidates across all 3 authors was still processed without error" \
+  check "three identical 16-candidate pages share 16 detail requests instead of reaching the 32-worker ceiling" \
+    "$(sed -n 2p <<<"$out")" "False"
+  check "every duplicate candidate is processed without an aggregation error" \
     "$(sed -n 3p <<<"$out")" "[]"
 }
 test_pr_detail_aggregate_concurrency_capped_at_32_across_authors
+
+test_pr_attention_classification_runs_concurrently_after_detail_aggregation() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import threading
+
+classification_barrier = threading.Barrier(4)
+state = {'overlapped': False}
+lock = threading.Lock()
+
+
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs'] and '--author=@me' in args:
+        return [{'number': n, 'repository': {'nameWithOwner': 'owner/repo'}} for n in [1, 2]]
+    if args[:2] == ['search', 'prs'] and '--author=alice' in args:
+        return [{'number': n, 'repository': {'nameWithOwner': 'owner/repo'}} for n in [3, 4]]
+    if args[:2] == ['search', 'prs']:
+        return []
+    if args[:2] == ['search', 'issues'] or args[:2] == ['api', '/notifications']:
+        return []
+    if args[:2] == ['pr', 'view']:
+        return {
+            'mergeable': 'MERGEABLE', 'reviewDecision': None, 'statusCheckRollup': [],
+            'latestReviews': [{'author': {'login': 'reviewer'}, 'state': 'COMMENTED'}],
+        }
+    if args[:2] == ['api', 'graphql']:
+        try:
+            classification_barrier.wait(timeout=1)
+            with lock:
+                state['overlapped'] = True
+        except threading.BrokenBarrierError:
+            pass
+        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
+            {'author': {'__typename': 'User', 'login': 'reviewer'}}
+        ]}}}}}
+    raise AssertionError(args)
+
+
+p._gh_json = fake_gh_json
+p._get_gh_login = lambda: 'me'
+result = p._fetch_raw({'github': {'trackAuthors': ['alice']}})
+print(state['overlapped'])
+print([(pr['type'], pr['number']) for pr in result])
+")"
+  check "authored and tracked PR classifications overlap while bot-review lookups run" \
+    "$(sed -n 1p <<<"$out")" "True"
+  check "concurrent classification retains the existing tracked-before-authored category precedence and candidate order" \
+    "$(sed -n 2p <<<"$out")" "[('tracked_attention', 3), ('tracked_attention', 4), ('authored_attention', 1), ('authored_attention', 2)]"
+}
+test_pr_attention_classification_runs_concurrently_after_detail_aggregation
 
 test_pr_detail_preserves_submission_order_and_isolates_per_candidate_failures() {
   local out
@@ -1827,7 +1878,7 @@ def fake_gh_json(args):
     if args[:2] == ['search', 'prs']:
         return [dict(pr)]
     if args[:2] == ['pr', 'view']:
-        return {'closingIssuesReferences': []}
+        return {'closingIssuesReferences': [], 'mergeable': 'CONFLICTING', 'statusCheckRollup': [], 'latestReviews': []}
     return []
 
 
@@ -1841,6 +1892,55 @@ print([(item['type'], item.get('tracked_author')) for item in items])
     "$out" "[('tracked_attention', 'teammate')]"
 }
 test_tracked_attention_wins_over_duplicate_review_request
+
+test_github_round_deduplicates_login_and_pr_details() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+state = {'logins': 0, 'details': 0}
+pr = {'number': 7, 'title': 'Duplicate', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/pull/7'}
+def login():
+    state['logins'] += 1
+    return 'me'
+def fake_gh_json(args):
+    if args[:2] == ['search', 'prs']:
+        return [dict(pr)]
+    if args[:2] == ['search', 'issues'] or args[:2] == ['api', '/notifications']:
+        return []
+    if args[:2] == ['pr', 'view']:
+        state['details'] += 1
+        return {'mergeable': 'CONFLICTING', 'statusCheckRollup': [], 'latestReviews': []}
+    raise AssertionError(args)
+p._get_gh_login = login
+p._gh_json = fake_gh_json
+p._fetch_my_repo_issues = lambda: []
+combined = p._fetch_raw({'github': {'trackAuthors': ['alice']}})
+print(state)
+print([(item['type'], item.get('tracked_author')) for item in combined])
+")"
+  check "one GitHub round obtains the current login once and shares one detail call across duplicate category candidates" \
+    "$(sed -n 1p <<<"$out")" "{'logins': 1, 'details': 1}"
+  check "the tracked category remains the displayed winner after shared detail aggregation" \
+    "$(sed -n 2p <<<"$out")" "[('tracked_attention', 'alice')]"
+}
+test_github_round_deduplicates_login_and_pr_details
+
+test_github_repository_index_is_process_local_and_code_dir_keyed() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+p._fetch_raw = lambda config: [{'number': 1, 'title': 'x', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/issues/1', 'type': 'assigned_issue'}]
+calls = []
+p._build_repo_dir_index = lambda code_dir: calls.append(code_dir) or {}
+p.fetch({'codeDir': '/tmp/attention-index'})
+p.fetch({'codeDir': '/tmp/attention-index/'})
+p.fetch({'codeDir': '/tmp/attention-other'})
+print(calls)
+")"
+  check "the checkout index is memoized per process and canonical codeDir" \
+    "$out" "['/tmp/attention-index', '/tmp/attention-other']"
+}
+test_github_repository_index_is_process_local_and_code_dir_keyed
 test_github_session_prompt_state_aware() {
   local out
   out="$(python3 -c "
@@ -3079,7 +3179,7 @@ presenter = FakePresenter()
 controller = d.DashboardController(
     ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
-    render_rows=titles_render_rows, act=lambda key, row: None,
+    render_rows=titles_render_rows, act=lambda key, row: None, cache_ttl=0,
 )
 th = threading.Thread(target=controller.run, args=(3600,))
 th.start()
@@ -3220,7 +3320,7 @@ presenter = FakePresenter()
 controller = d.DashboardController(
     ['a', 'b'], presenter,
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
-    render_rows=titles_render_rows, act=lambda key, row: None,
+    render_rows=titles_render_rows, act=lambda key, row: None, cache_ttl=0,
 )
 th = threading.Thread(target=controller.run, args=(3600,))
 th.start()
@@ -3332,6 +3432,138 @@ print(calls_after_quit == calls_after_release)
     "$(sed -n 4p <<<"$out")" "True"
 }
 test_quit_returns_promptly_and_discards_a_later_gated_completion
+
+test_dashboard_cache_revalidates_stale_results_and_keeps_fresh_hits_terminal() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+clock = [0]
+gate = threading.Event()
+calls = CallLog()
+items = iter([
+    [{'title': 'Old', 'id': 'a'}],
+    [{'title': 'New', 'id': 'a'}],
+])
+def fetch_plugin(name):
+    calls.append(name)
+    result = next(items)
+    if len(calls.snapshot()) > 1:
+        gate.wait()
+    return result
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['a'], presenter, fetch_plugin=fetch_plugin,
+    build_snapshot=flatten_build_snapshot, render_rows=titles_render_rows,
+    act=lambda key, row: None, cache_ttl=10, clock=lambda: clock[0],
+)
+th = threading.Thread(target=controller.run, args=(3600,))
+th.start()
+calls.wait_for_count(1)
+presenter.wait_for_push_count(2)
+clock[0] = 1
+presenter.send_timeout()
+presenter.wait_for_launch_count(2)
+fresh_calls = calls.snapshot()
+clock[0] = 11
+presenter.send_timeout()
+presenter.wait_for_launch_count(3)
+stale_push = presenter.push_calls()[-1]
+pushes_before_release = len(presenter.push_calls())
+gate.set()
+presenter.wait_for_push_count(pushes_before_release + 1)
+new_rows = presenter.push_calls()[-1][1]
+presenter.send_result('', '')
+th.join(timeout=5)
+print(fresh_calls)
+print(stale_push[1:])
+print(new_rows)
+")"
+  check "a fresh cache hit starts no fetch and the round is terminal" "$(sed -n 1p <<<"$out")" "['a']"
+  check "an expired cache entry stays visible while its replacement is pending" "$(sed -n 2p <<<"$out")" "(['Old'], ['a'])"
+  check "the expired entry is replaced when revalidation succeeds" "$(sed -n 3p <<<"$out")" "['New']"
+}
+test_dashboard_cache_revalidates_stale_results_and_keeps_fresh_hits_terminal
+
+test_dashboard_action_invalidates_its_plugin_cache() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+clock = [0]
+gate = threading.Event()
+calls = CallLog()
+def fetch_plugin(name):
+    calls.append(name)
+    if len(calls.snapshot()) > 1:
+        gate.wait()
+    return [{'title': 'A', 'id': 'a', 'actions': [{'key': 'o', 'primary': True, '_plugin': 'a', '_item_id': 'a'}]}]
+def render(items):
+    return [
+        item['title'] + chr(9) + base64.b64encode(json.dumps(item['actions']).encode()).decode()
+        for item in items
+    ]
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['a'], presenter, fetch_plugin=fetch_plugin,
+    build_snapshot=flatten_build_snapshot, render_rows=render,
+    act=lambda key, row: None, cache_ttl=60, clock=lambda: clock[0],
+)
+th = threading.Thread(target=controller.run, args=(3600,))
+th.start()
+calls.wait_for_count(1)
+presenter.wait_for_push_count(2)
+row = presenter.push_calls()[-1][1][0]
+presenter.send_result('o', row)
+presenter.wait_for_launch_count(2)
+presenter.send_timeout()
+calls.wait_for_count(2)
+pushes_before_release = len(presenter.push_calls())
+gate.set()
+presenter.wait_for_push_count(pushes_before_release + 1)
+presenter.send_result('', '')
+th.join(timeout=5)
+print(calls.snapshot())
+")"
+  check "a successful action invalidates only its plugin's cache before the TTL expires" "$out" "['a', 'a']"
+}
+test_dashboard_action_invalidates_its_plugin_cache
+
+test_dashboard_failed_action_preserves_its_plugin_cache() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+calls = CallLog()
+def fetch_plugin(name):
+    calls.append(name)
+    return [{'title': 'A', 'id': 'a', 'actions': [{'key': 'o', 'primary': True, '_plugin': 'a', '_item_id': 'a'}]}]
+def render(items):
+    return [
+        item['title'] + chr(9) + base64.b64encode(json.dumps(item['actions']).encode()).decode()
+        for item in items
+    ]
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['a'], presenter, fetch_plugin=fetch_plugin,
+    build_snapshot=flatten_build_snapshot, render_rows=render,
+    act=lambda key, row: False, cache_ttl=60,
+)
+th = threading.Thread(target=controller.run, args=(3600,))
+th.start()
+calls.wait_for_count(1)
+presenter.wait_for_push_count(2)
+presenter.send_result('o', presenter.push_calls()[-1][1][0])
+presenter.wait_for_launch_count(2)
+presenter.send_timeout()
+presenter.wait_for_launch_count(3)
+presenter.send_result('', '')
+th.join(timeout=5)
+print(calls.snapshot())
+")"
+  check "a failed action does not invalidate the still-fresh plugin cache" "$out" "['a']"
+}
+test_dashboard_failed_action_preserves_its_plugin_cache
 
 # ---------------------------------------------------------------------------
 echo
