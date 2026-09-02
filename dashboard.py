@@ -77,11 +77,11 @@ def _pending_header(pending):
 
 
 class _Round:
-    def __init__(self, plugin_names, generation):
+    def __init__(self, plugin_names, generation, items_by_plugin, pending):
         self.generation = generation
-        self.pending = set(plugin_names)
-        self.items_by_plugin = {}
-        self.terminal = False
+        self.pending = pending
+        self.items_by_plugin = items_by_plugin
+        self.terminal = not pending
 
 
 class DashboardController:
@@ -96,8 +96,10 @@ class DashboardController:
         fetch_plugin: Callable[[str], list],
         build_snapshot: Callable[[dict, dict], list],
         render_rows: Callable[[list], list],
-        act: Callable[[str, str], None],
+        act: Callable[[str, str], object],
         acknowledge_action: Callable[[], None] = lambda: None,
+        cache_ttl: float = 60,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.plugin_names = list(plugin_names)
         self.presenter = presenter
@@ -106,7 +108,9 @@ class DashboardController:
         self._render_rows = render_rows
         self._act = act
         self._acknowledge_action = acknowledge_action
-
+        self._cache_ttl = cache_ttl
+        self._clock = clock
+        self._cache = {}
         self._state_lock = threading.Lock()
         self._presenter_lock = threading.Lock()
         self._generation = 0
@@ -139,8 +143,11 @@ class DashboardController:
                     # advancing the round so the list stays on screen.
                     self._relaunch_presenter()
                     continue
-                item_id = self._item_id_for(result.key, result.row)
-                self._act(result.key, result.row)
+                action = self._action_for(result.key, result.row)
+                item_id = action.get("_item_id") if action else None
+                completed = self._act(result.key, result.row)
+                if completed is not False and action:
+                    self._invalidate_plugin(action.get("_plugin"))
                 self._acknowledge_action()
                 self._deprioritize(item_id)
                 self._relaunch_presenter()
@@ -182,13 +189,27 @@ class DashboardController:
         self._submit_round_fetches(round_)
 
     def _create_round(self):
+        now = self._clock()
         with self._state_lock:
-            round_ = _Round(self.plugin_names, self._next_generation())
+            cached = {
+                name: entry for name in self.plugin_names
+                if (entry := self._cache.get(name)) is not None
+            }
+            items_by_plugin = {name: entry[0] for name, entry in cached.items()}
+            pending = {
+                name for name in self.plugin_names
+                if name not in cached or cached[name][1] <= now
+            }
+            round_ = _Round(
+                self.plugin_names, self._next_generation(), items_by_plugin, pending,
+            )
             self._round = round_
         return round_
 
     def _submit_round_fetches(self, round_):
         for name in self.plugin_names:
+            if name not in round_.pending:
+                continue
             threading.Thread(
                 target=self._run_plugin_fetch, args=(round_, name), daemon=True,
             ).start()
@@ -206,21 +227,23 @@ class DashboardController:
         try:
             items = self._fetch_plugin(name)
         except Exception:
-            items = []
-        self._on_plugin_result(round_, name, items)
+            self._on_plugin_result(round_, name, None, False)
+            return
+        self._on_plugin_result(round_, name, items, True)
 
-    def _on_plugin_result(self, round_, name, items):
+    def _on_plugin_result(self, round_, name, items, succeeded):
         with self._state_lock:
             if self._closed or self._round is not round_:
                 return
-            round_.items_by_plugin[name] = items
+            if succeeded:
+                self._cache[name] = (items, self._clock() + self._cache_ttl)
+                round_.items_by_plugin[name] = items
             round_.pending.discard(name)
             terminal_now = not round_.pending
             if terminal_now:
                 round_.terminal = True
             items_by_plugin = dict(round_.items_by_plugin)
             pending = [n for n in self.plugin_names if n in round_.pending]
-
         rows = self._render_snapshot(items_by_plugin)
 
         with self._presenter_lock:
@@ -238,9 +261,14 @@ class DashboardController:
             round_ = self._round
             items_by_plugin = dict(round_.items_by_plugin)
             pending = [n for n in self.plugin_names if n in round_.pending]
+            terminal = round_.terminal
         rows = self._render_snapshot(items_by_plugin)
         with self._presenter_lock:
             if self._empty_final:
+                return
+            if terminal and not rows:
+                self._empty_final = True
+                self.presenter.stop()
                 return
             self.presenter.launch()
             self.presenter.push_snapshot(rows, pending)
@@ -251,7 +279,7 @@ class DashboardController:
         items = self._build_snapshot(items_by_plugin, recently_acted)
         return self._render_rows(items)
 
-    def _item_id_for(self, key, row):
+    def _action_for(self, key, row):
         parts = row.split("\t", 1)
         if len(parts) < 2:
             return None
@@ -259,10 +287,20 @@ class DashboardController:
             actions = json.loads(base64.b64decode(parts[1].split("\t", 1)[0]).decode())
         except Exception:
             return None
-        for a in actions:
-            if a.get("key") == key or (key == "" and a.get("primary")):
-                return a.get("_item_id")
+        for action in actions:
+            if action.get("key") == key or (key == "" and action.get("primary")):
+                return action
         return None
+
+    def _item_id_for(self, key, row):
+        action = self._action_for(key, row)
+        return action.get("_item_id") if action else None
+
+    def _invalidate_plugin(self, name):
+        if not name:
+            return
+        with self._state_lock:
+            self._cache.pop(name, None)
 
     def _deprioritize(self, item_id):
         if not item_id:

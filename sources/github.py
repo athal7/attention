@@ -28,6 +28,27 @@ from _util import resolve_configured_actions, run_cmd, run_configured_action, sl
 _MAX_WORKERS = 8
 
 _MAX_PR_DETAIL_WORKERS = 32
+_PR_DETAIL_FIELDS = (
+    "mergeable,reviewDecision,statusCheckRollup,latestReviews,"
+    "closingIssuesReferences,isDraft,reviewRequests,baseRefName"
+)
+_repo_dir_indexes = {}
+_repo_dir_indexes_lock = threading.Lock()
+
+
+def _pr_key(pr):
+    repo = pr.get("repository", {}).get("nameWithOwner", "")
+    number = pr.get("number")
+    if not repo or number is None:
+        return None
+    return repo.casefold(), str(number)
+
+
+def _fetch_pr_detail(repo, number):
+    detail = _gh_json([
+        "pr", "view", str(number), "-R", repo, "--json", _PR_DETAIL_FIELDS,
+    ])
+    return detail if isinstance(detail, dict) else None
 
 
 def _body_association_keys(body):
@@ -177,103 +198,87 @@ def _status_badge(gtype, reasons, is_draft, review_requested):
     return "Ready ✅"
 
 
+def _classify_pr_attention(
+    pr, expected_author, bot_review_allowlist, default_branches, default_branch_lock, detail,
+):
+    key = _pr_key(pr)
+    if key is None or detail is None:
+        return None
+    repo, number = pr["repository"]["nameWithOwner"], pr["number"]
+    reasons = []
+    latest_review_states = set()
+    bot_flags = None
+    for review in detail.get("latestReviews") or []:
+        reviewer = review.get("author", {}).get("login") or ""
+        if not reviewer or reviewer.casefold() == expected_author.casefold():
+            continue
+        reviewer_cf = reviewer.casefold()
+        if bot_flags is None:
+            bot_flags = _fetch_review_bot_flags(repo, number)
+        is_bot = bot_flags.get(reviewer_cf)
+        if is_bot is None:
+            is_bot = _is_bot_login(reviewer)
+        if is_bot:
+            canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
+            if canonical not in bot_review_allowlist and reviewer_cf not in bot_review_allowlist:
+                continue
+        latest_review_states.add(review.get("state"))
+    if "CHANGES_REQUESTED" in latest_review_states:
+        reasons.append("Changes Requested")
+    if "COMMENTED" in latest_review_states:
+        reasons.append("Review Commented")
+    if detail.get("mergeable") == "CONFLICTING":
+        reasons.append("Merge Conflict")
+    checks = detail.get("statusCheckRollup") or []
+    if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
+        reasons.append("Checks Failing")
+    if not reasons:
+        return None
+    pr = dict(pr)
+    pr["reviewRequested"] = bool(detail.get("reviewRequests"))
+    pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+    pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
+    pr["attention_reasons"] = reasons
+    default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
+    pr["indicators"] = _pr_indicators(
+        detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
+    )
+    return pr
+
+
 def _fetch_pr_attention(
     author, detail_pool, bot_review_allowlist=frozenset(),
-    default_branches=None, default_branch_lock=None,
+    default_branches=None, default_branch_lock=None, current_login=None, detail_lookup=None,
 ):
-    """Open PRs `author` authored that need attention right now: failing
-    checks, changes requested, a merge conflict, or a comment from
-    someone else. `author` is a `gh search prs --author=` value ("@me"
-    for yourself, or any other GitHub username to also track a
-    teammate's PRs, see config["github"]["trackAuthors"]). `gh search
-    prs` (used to find the candidates) exposes none of that state --
-    its `--json` fields are limited to search-index metadata -- so
-    this follows up with one `gh pr view` per candidate (repo is
-    already known from the search hit, so this is a targeted lookup,
-    not a repo-wide scan) to pull the actionable fields. Each `pr view`
-    is an independent network round trip, so they run concurrently
-    against `detail_pool` -- the one aggregate budget `_fetch_raw`
-    shares across `_authored_prs` and every `_tracked_prs` call, so N
-    tracked authors never multiply the concurrency past that single
-    fixed cap.
-
-    A review from a bot account never counts toward "Review
-    Commented"/"Changes Requested" on its own: automated review noise
-    (Copilot's code review, CodeRabbit, dependabot, etc.) shouldn't
-    inflate a PR's attention score. Bot-ness is determined by
-    `_fetch_review_bot_flags()` (GraphQL actor type), falling back to
-    `_is_bot_login()` only if that lookup is unreachable.
-    `bot_review_allowlist` (casefolded logins, from
-    config["github"]["botReviewAllowlist"], matched with or without a
-    "[bot]" suffix) opts specific bots back in.
-    """
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
         "--json", "number,title,body,repository,url,isDraft,createdAt",
     ])
     if not prs:
         return []
-
     default_branches = {} if default_branches is None else default_branches
     default_branch_lock = threading.Lock() if default_branch_lock is None else default_branch_lock
-
-    me = _get_gh_login()
-    expected_author = me if author == "@me" else author
-
-    def _flag_if_attention(p):
-        repo = p.get("repository", {}).get("nameWithOwner", "")
-        number = p.get("number")
-        if not repo or number is None:
+    expected_author = current_login if current_login is not None else _get_gh_login()
+    details = {}
+    if detail_lookup is None:
+        details = {
+            key: detail_pool.submit(_fetch_pr_detail, pr["repository"]["nameWithOwner"], pr["number"])
+            for pr in prs if (key := _pr_key(pr)) is not None
+        }
+    def detail_for(pr):
+        key = _pr_key(pr)
+        if key is None:
             return None
-        detail = _gh_json([
-            "pr", "view", str(number), "-R", repo,
-            "--json", "mergeable,reviewDecision,statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,reviewRequests,baseRefName",
-        ])
-        if not isinstance(detail, dict):
-            return None
-
-        reasons = []
-        latest_review_states = set()
-        bot_flags = None
-        for review in detail.get("latestReviews") or []:
-            reviewer = review.get("author", {}).get("login") or ""
-            if not reviewer or reviewer.casefold() == expected_author.casefold():
-                continue
-            reviewer_cf = reviewer.casefold()
-            if bot_flags is None:
-                bot_flags = _fetch_review_bot_flags(repo, number)
-            is_bot = bot_flags.get(reviewer_cf)
-            if is_bot is None:
-                is_bot = _is_bot_login(reviewer)
-            if is_bot:
-                canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
-                if canonical not in bot_review_allowlist and reviewer_cf not in bot_review_allowlist:
-                    continue
-            latest_review_states.add(review.get("state"))
-        if "CHANGES_REQUESTED" in latest_review_states:
-            reasons.append("Changes Requested")
-        if "COMMENTED" in latest_review_states:
-            reasons.append("Review Commented")
-        if detail.get("mergeable") == "CONFLICTING":
-            reasons.append("Merge Conflict")
-        checks = detail.get("statusCheckRollup") or []
-        if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
-            reasons.append("Checks Failing")
-
-        if not reasons:
-            return None
-        p["reviewRequested"] = bool(detail.get("reviewRequests"))
-        p["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
-        p["isDraft"] = detail.get("isDraft", p.get("isDraft", False))
-        p["attention_reasons"] = reasons
-        default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
-        p["indicators"] = _pr_indicators(
-            detail, detail.get("isDraft", p.get("isDraft", False)), default_branch,
-        )
-        return p
-
-    futures = [detail_pool.submit(_flag_if_attention, p) for p in prs]
-    return [r for f in futures for r in [f.result()] if r is not None]
+        if detail_lookup is not None:
+            return detail_lookup(pr)
+        return details[key].result()
+    return [
+        result for pr in prs
+        if (result := _classify_pr_attention(
+            pr, expected_author, bot_review_allowlist, default_branches, default_branch_lock,
+            detail_for(pr),
+        )) is not None
+    ]
 
 
 def _fetch_my_repo_issues():
@@ -417,120 +422,163 @@ def _build_repo_dir_index(code_dir):
                 index[result[0]] = result[1]
     return index
 
+def _repo_dir_index(code_dir):
+    key = os.path.realpath(os.path.abspath(os.path.expanduser(code_dir)))
+    with _repo_dir_indexes_lock:
+        index = _repo_dir_indexes.get(key)
+        if index is None:
+            index = _build_repo_dir_index(code_dir)
+            _repo_dir_indexes[key] = index
+        return index
+
+
+
 
 def _fetch_raw(config):
-    # `gh pr list`/`gh issue list` are repo-scoped: they resolve a single
-    # target repo from the cwd's git remote (or an explicit -R) and only
-    # filter *within* that repo, so --search never made them search across
-    # all of @me's repos. `gh search prs`/`gh search issues` are the actual
-    # global cross-repo search subcommands.
     default_branches = {}
     default_branch_lock = threading.Lock()
-
-    def _review_prs():
-        prs = _gh_json([
-            "search", "prs", "--review-requested=@me", "--state=open", "--archived=false", "--limit", "50",
-            "--json", "number,title,body,repository,url,isDraft,createdAt",
-        ])
-        def _with_closing_references(pr):
-            repo = pr.get("repository", {}).get("nameWithOwner", "")
-            number = pr.get("number")
-            if repo and number is not None:
-                detail = _gh_json([
-                    "pr", "view", str(number), "-R", repo,
-                    "--json", "closingIssuesReferences,isDraft,baseRefName,statusCheckRollup,latestReviews,reviewDecision,reviewRequests",
-                ])
-                if isinstance(detail, dict):
-                    pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
-                    pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
-                    default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
-                    pr["indicators"] = _pr_indicators(
-                        detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
-                    )
-            return pr
-        prs = [future.result() for future in [detail_pool.submit(_with_closing_references, pr) for pr in prs]]
-        for p in prs:
-            p["type"] = "review_request"
-        return prs
-
-    def _assigned_issues():
-        issues = _gh_json([
-            "search", "issues", "--assignee=@me", "--state=open", "--archived=false", "--limit", "50",
-            "--json", "number,title,repository,url,createdAt",
-        ])
-        for i in issues:
-            i["type"] = "assigned_issue"
-        return issues
-
-    def _authored_prs():
-        prs = _fetch_pr_attention(
-            "@me", detail_pool, bot_review_allowlist, default_branches, default_branch_lock,
-        )
-        for p in prs:
-            p["type"] = "authored_attention"
-        return prs
-
-    def _tracked_prs(author):
-        prs = _fetch_pr_attention(
-            author, detail_pool, bot_review_allowlist, default_branches, default_branch_lock,
-        )
-        for p in prs:
-            p["type"] = "tracked_attention"
-            p["tracked_author"] = author
-        return prs
-
-    def _repo_issues():
-        issues = _fetch_my_repo_issues()
-        for i in issues:
-            i["type"] = "repo_issue"
-        return issues
-
-    def _notifications():
-        """Wrap _fetch_notifications with type tagging for the shared pipeline."""
-        try:
-            notifs = _fetch_notifications()
-        except Exception:
-            return []
-        for n in notifs:
-            n["type"] = "notification"
-        return notifs
-
     track_authors = config.get("github", {}).get("trackAuthors", [])
     bot_review_allowlist = frozenset(
         login.casefold() for login in config.get("github", {}).get("botReviewAllowlist", [])
     )
+    current_login = _get_gh_login()
 
-    # These five queries (plus one per tracked author) share no state
-    # and each costs at least one gh round trip -- some (authored/tracked
-    # attention) already fan out further internally. Running them
-    # one-after-another would stack all of that latency; a thread pool
-    # collapses it to the slowest single query.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as detail_pool, \
-         concurrent.futures.ThreadPoolExecutor(max_workers=min(4 + len(track_authors), _MAX_WORKERS)) as pool:
-        review_fut = pool.submit(_review_prs)
-        assigned_fut = pool.submit(_assigned_issues)
-        authored_fut = pool.submit(_authored_prs)
-        tracked_futs = [pool.submit(_tracked_prs, author) for author in track_authors]
-        repo_fut = pool.submit(_repo_issues)
-        notif_fut = pool.submit(_notifications)
+    def search_prs(*filters):
+        return _gh_json([
+            "search", "prs", *filters, "--state=open", "--archived=false", "--limit", "50",
+            "--json", "number,title,body,repository,url,isDraft,createdAt",
+        ]) or []
 
-        review_prs = review_fut.result()
-        assigned_issues = assigned_fut.result()
-        authored_prs = authored_fut.result()
-        tracked_prs = [p for fut in tracked_futs for p in fut.result()]
-        repo_issues = repo_fut.result()
-        notifications = notif_fut.result()
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(5 + len(track_authors), _MAX_WORKERS),
+    ) as pool:
+        review_future = pool.submit(search_prs, "--review-requested=@me")
+        authored_future = pool.submit(search_prs, "--author=@me")
+        tracked_futures = [
+            pool.submit(search_prs, f"--author={author}") for author in track_authors
+        ]
+        assigned_future = pool.submit(_gh_json, [
+            "search", "issues", "--assignee=@me", "--state=open", "--archived=false", "--limit", "50",
+            "--json", "number,title,repository,url,createdAt",
+        ])
+        repo_future = pool.submit(_fetch_my_repo_issues)
+        notification_future = pool.submit(_fetch_notifications)
 
-    # De-dupe: the same PR/issue can surface from more than one query (a PR
-    # I authored could also be review-requested; an issue assigned to me in
-    # my own repo matches both the assignee and owner queries). Issue and PR
-    # numbers share one counter per repo, so (repo, number) alone uniquely
-    # identifies the item. A tracked-attention item has the extra tracked
-    # author context, so it wins over a duplicate review-request item.
+        review_candidates = review_future.result()
+        authored_candidates = authored_future.result()
+        tracked_candidates = [
+            (author, future.result()) for author, future in zip(track_authors, tracked_futures)
+        ]
+        assigned_issues = assigned_future.result() or []
+        repo_issues = repo_future.result() or []
+        try:
+            notifications = notification_future.result() or []
+        except Exception:
+            notifications = []
+
+    candidates = review_candidates + authored_candidates
+    candidates.extend(pr for _, prs in tracked_candidates for pr in prs)
+    unique_candidates = {}
+    for pr in candidates:
+        key = _pr_key(pr)
+        if key is not None:
+            unique_candidates.setdefault(key, pr)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as detail_pool:
+        detail_futures = {
+            key: detail_pool.submit(
+                _fetch_pr_detail,
+                pr["repository"]["nameWithOwner"],
+                pr["number"],
+            )
+            for key, pr in unique_candidates.items()
+        }
+        details = {key: future.result() for key, future in detail_futures.items()}
+
+        def detail_for(pr):
+            key = _pr_key(pr)
+            return details.get(key) if key is not None else None
+
+        authored_futures = [
+            detail_pool.submit(
+                _classify_pr_attention,
+                candidate,
+                current_login,
+                bot_review_allowlist,
+                default_branches,
+                default_branch_lock,
+                detail_for(candidate),
+            )
+            for candidate in authored_candidates
+        ]
+        tracked_futures = [
+            (
+                author,
+                [
+                    detail_pool.submit(
+                        _classify_pr_attention,
+                        candidate,
+                        author,
+                        bot_review_allowlist,
+                        default_branches,
+                        default_branch_lock,
+                        detail_for(candidate),
+                    )
+                    for candidate in candidates
+                ],
+            )
+            for author, candidates in tracked_candidates
+        ]
+        authored_prs = [
+            pr for future in authored_futures
+            if (pr := future.result()) is not None
+        ]
+        tracked_prs = []
+        for author, futures in tracked_futures:
+            for future in futures:
+                pr = future.result()
+                if pr is not None:
+                    pr["tracked_author"] = author
+                    tracked_prs.append(pr)
+
+    for pr in authored_prs:
+        pr["type"] = "authored_attention"
+    for pr in tracked_prs:
+        pr["type"] = "tracked_attention"
+
+    def detail_for(pr):
+        key = _pr_key(pr)
+        return details.get(key) if key is not None else None
+
+    review_prs = []
+    for candidate in review_candidates:
+        pr = dict(candidate)
+        detail = detail_for(pr)
+        if detail is not None:
+            pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+            pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
+            repo = pr["repository"]["nameWithOwner"]
+            default_branch = _default_branch(
+                repo, default_branches, default_branch_lock,
+            ) if detail.get("baseRefName") else ""
+            pr["indicators"] = _pr_indicators(
+                detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
+            )
+        pr["type"] = "review_request"
+        review_prs.append(pr)
+
+    for issue in assigned_issues:
+        issue["type"] = "assigned_issue"
+    for issue in repo_issues:
+        issue["type"] = "repo_issue"
+    for notification in notifications:
+        notification["type"] = "notification"
+
     seen = set()
     combined = []
     for item in tracked_prs + review_prs + authored_prs + assigned_issues + repo_issues + notifications:
-        key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
+        key = _pr_key(item)
+        if key is None:
+            key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
         if key in seen:
             continue
         seen.add(key)
@@ -594,7 +642,7 @@ def fetch(config):
     # directories under code_dir, so a repo cloned under a shorthand name
     # still resolves. One-time scan, only when there's something to
     # resolve.
-    repo_dir_index = _build_repo_dir_index(code_dir)
+    repo_dir_index = _repo_dir_index(code_dir)
 
     items = []
     for g in raw:

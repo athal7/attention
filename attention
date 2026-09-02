@@ -908,25 +908,25 @@ def act(key, line):
     parts = line.split("\t", 1)
     if len(parts) < 2:
         print("No action bound to this row (malformed row).")
-        return
+        return False
     blob = parts[1].split("\t", 1)[0]
     try:
         actions = json.loads(base64.b64decode(blob).decode())
     except Exception:
         print("No action bound to this row (malformed row).")
-        return
+        return False
 
     valid_keys = {a["key"] for a in actions}
     resolved_key = key
     if resolved_key == "":
         primary = next((a for a in actions if a.get("primary")), None)
         if primary is None:
-            return
+            return False
         resolved_key = primary["key"]
 
     if resolved_key not in valid_keys:
         print(f"No action bound to '{resolved_key}' for this item.")
-        return
+        return False
 
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
@@ -940,10 +940,14 @@ def act(key, line):
                 unmark_wip_item(action.get("_wip_id"))
             elif action.get("wip"):
                 mark_wip_item(action.get("_wip_id"))
+            return True
+        return False
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
+        return False
     except Exception as e:
         print(f"Action failed: {e}")
+        return False
 
 
 def acknowledge_action():
