@@ -451,22 +451,36 @@ test_github_filters_items_without_my_action() {
   local out
   out=$(python3 -c "
 $(load_plugin_py github)
-p._gh_json = lambda args: [
-    {'number': 1, 'assignees': [], 'title': 'Unassigned'},
-    {'number': 2, 'assignees': [{'login': 'someone-else'}], 'title': 'Owned elsewhere'},
-] if args[:2] == ['search', 'issues'] else [
-    {'id': 'mention', 'unread': True, 'reason': 'mention', 'subject': {'type': 'Issue', 'title': 'Please reply', 'url': 'https://api.github.com/repos/o/r/issues/3'}, 'repository': {'full_name': 'o/r'}},
-    {'id': 'pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Review this PR', 'url': 'https://api.github.com/repos/o/r/pulls/42'}, 'repository': {'full_name': 'o/r'}},
-    {'id': 'state', 'unread': True, 'reason': 'state_change', 'subject': {'type': 'Issue', 'title': 'Passive update', 'url': 'https://api.github.com/repos/o/r/issues/4'}, 'repository': {'full_name': 'o/r'}},
-    {'id': 'ci', 'unread': True, 'reason': 'ci_activity', 'subject': {'type': 'CheckSuite', 'title': 'Watched CI'}, 'repository': {'full_name': 'o/r'}},
-]
+def gh_json(args):
+    if args[:2] == ['search', 'issues']:
+        return [
+            {'number': 1, 'assignees': [], 'title': 'Unassigned'},
+            {'number': 2, 'assignees': [{'login': 'someone-else'}], 'title': 'Owned elsewhere'},
+        ]
+    if args[:2] == ['api', '/notifications']:
+        return [
+            {'id': 'mention', 'unread': True, 'reason': 'mention', 'subject': {'type': 'Issue', 'title': 'Please reply', 'url': 'https://api.github.com/repos/o/r/issues/3'}, 'repository': {'full_name': 'o/r'}},
+            {'id': 'open-pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Review this PR', 'url': 'https://api.github.com/repos/o/r/pulls/42'}, 'repository': {'full_name': 'o/r'}},
+            {'id': 'closed-pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Closed PR', 'url': 'https://api.github.com/repos/o/r/pulls/43'}, 'repository': {'full_name': 'o/r'}},
+            {'id': 'state', 'unread': True, 'reason': 'state_change', 'subject': {'type': 'Issue', 'title': 'Passive update', 'url': 'https://api.github.com/repos/o/r/issues/4'}, 'repository': {'full_name': 'o/r'}},
+            {'id': 'ci', 'unread': True, 'reason': 'ci_activity', 'subject': {'type': 'CheckSuite', 'title': 'Watched CI'}, 'repository': {'full_name': 'o/r'}},
+        ]
+    if args == ['api', 'https://api.github.com/repos/o/r/issues/3']:
+        return {'state': 'open'}
+    if args == ['api', 'https://api.github.com/repos/o/r/pulls/42']:
+        return {'state': 'open'}
+    if args == ['api', 'https://api.github.com/repos/o/r/pulls/43']:
+        return {'state': 'closed'}
+    return []
+p._gh_json = gh_json
 notifications = p._fetch_notifications()
-pull = next(item for item in notifications if item['notification_id'] == 'pull')
+pull = next(item for item in notifications if item['notification_id'] == 'open-pull')
 p._fetch_raw = lambda config: notifications
 p._build_repo_dir_index = lambda code_dir: {}
 fetched = {item['id']: item for item in p.fetch({'codeDir': '/tmp'})}
 print([item['number'] for item in p._fetch_my_repo_issues()])
 print([item['notification_id'] for item in notifications])
+print('closed-pull' in [item['notification_id'] for item in notifications])
 print(pull['number'])
 print(pull['url'])
 print(fetched['42']['kind'])
@@ -474,16 +488,18 @@ print(fetched['3']['kind'])
 ")
   check "owned-repository issues assigned to someone else are filtered out" \
     "$(sed -n 1p <<<"$out")" "[1]"
-  check "passive state and watched-CI notifications are filtered out" \
-    "$(sed -n 2p <<<"$out")" "['mention', 'pull']"
+  check "open PullRequest notification is retained while passive and watched-CI notifications are filtered out" \
+    "$(sed -n 2p <<<"$out")" "['mention', 'open-pull']"
+  check "closed PullRequest notification is absent" \
+    "$(sed -n 3p <<<"$out")" "False"
   check "PullRequest notification recovers its numeric identifier" \
-    "$(sed -n 3p <<<"$out")" "42"
+    "$(sed -n 4p <<<"$out")" "42"
   check "PullRequest notification links to its browser PR URL" \
-    "$(sed -n 4p <<<"$out")" "https://github.com/o/r/pull/42"
+    "$(sed -n 5p <<<"$out")" "https://github.com/o/r/pull/42"
   check "PullRequest notifications are classified as pull requests" \
-    "$(sed -n 5p <<<"$out")" "pull_request"
+    "$(sed -n 6p <<<"$out")" "pull_request"
   check "Issue notifications remain classified as notifications" \
-    "$(sed -n 6p <<<"$out")" "notification"
+    "$(sed -n 7p <<<"$out")" "notification"
 }
 test_github_filters_items_without_my_action
 echo
