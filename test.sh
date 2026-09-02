@@ -451,6 +451,7 @@ test_github_filters_items_without_my_action() {
   local out
   out=$(python3 -c "
 $(load_plugin_py github)
+repo_api_calls = []
 def gh_json(args):
     if args[:2] == ['search', 'issues']:
         return [
@@ -462,9 +463,16 @@ def gh_json(args):
             {'id': 'mention', 'unread': True, 'reason': 'mention', 'subject': {'type': 'Issue', 'title': 'Please reply', 'url': 'https://api.github.com/repos/o/r/issues/3'}, 'repository': {'full_name': 'o/r'}},
             {'id': 'open-pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Review this PR', 'url': 'https://api.github.com/repos/o/r/pulls/42'}, 'repository': {'full_name': 'o/r'}},
             {'id': 'closed-pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Closed PR', 'url': 'https://api.github.com/repos/o/r/pulls/43'}, 'repository': {'full_name': 'o/r'}},
+            {'id': 'archived-pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Archived PR', 'url': 'https://api.github.com/repos/o/archived/pulls/44'}, 'repository': {'full_name': 'o/archived'}},
             {'id': 'state', 'unread': True, 'reason': 'state_change', 'subject': {'type': 'Issue', 'title': 'Passive update', 'url': 'https://api.github.com/repos/o/r/issues/4'}, 'repository': {'full_name': 'o/r'}},
             {'id': 'ci', 'unread': True, 'reason': 'ci_activity', 'subject': {'type': 'CheckSuite', 'title': 'Watched CI'}, 'repository': {'full_name': 'o/r'}},
         ]
+    if args[:2] == ['api', 'repos/o/r']:
+        repo_api_calls.append(args)
+        return {'archived': False}
+    if args[:2] == ['api', 'repos/o/archived']:
+        repo_api_calls.append(args)
+        return {'archived': True}
     if args == ['api', 'https://api.github.com/repos/o/r/issues/3']:
         return {'state': 'open'}
     if args == ['api', 'https://api.github.com/repos/o/r/pulls/42']:
@@ -481,6 +489,8 @@ fetched = {item['id']: item for item in p.fetch({'codeDir': '/tmp'})}
 print([item['number'] for item in p._fetch_my_repo_issues()])
 print([item['notification_id'] for item in notifications])
 print('closed-pull' in [item['notification_id'] for item in notifications])
+print('archived-pull' in [item['notification_id'] for item in notifications])
+print(len(repo_api_calls))
 print(pull['number'])
 print(pull['url'])
 print(fetched['42']['kind'])
@@ -492,14 +502,18 @@ print(fetched['3']['kind'])
     "$(sed -n 2p <<<"$out")" "['mention', 'open-pull']"
   check "closed PullRequest notification is absent" \
     "$(sed -n 3p <<<"$out")" "False"
+  check "archived PullRequest notification is absent" \
+    "$(sed -n 4p <<<"$out")" "False"
+  check "notification repository lookups are cached per repository" \
+    "$(sed -n 5p <<<"$out")" "2"
   check "PullRequest notification recovers its numeric identifier" \
-    "$(sed -n 4p <<<"$out")" "42"
+    "$(sed -n 6p <<<"$out")" "42"
   check "PullRequest notification links to its browser PR URL" \
-    "$(sed -n 5p <<<"$out")" "https://github.com/o/r/pull/42"
+    "$(sed -n 7p <<<"$out")" "https://github.com/o/r/pull/42"
   check "PullRequest notifications are classified as pull requests" \
-    "$(sed -n 6p <<<"$out")" "pull_request"
+    "$(sed -n 8p <<<"$out")" "pull_request"
   check "Issue notifications remain classified as notifications" \
-    "$(sed -n 7p <<<"$out")" "notification"
+    "$(sed -n 9p <<<"$out")" "notification"
 }
 test_github_filters_items_without_my_action
 echo

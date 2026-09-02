@@ -304,6 +304,8 @@ def _fetch_notifications():
     if not notifications:
         return []
 
+    repository_archived = {}
+
     items = []
     for notif in notifications:
         if not notif.get("unread"):
@@ -314,6 +316,16 @@ def _fetch_notifications():
         subject = notif.get("subject") or {}
         repo_info = notif.get("repository") or {}
         repo_name = repo_info.get("full_name", "")
+        if repo_name not in repository_archived:
+            try:
+                repository = _gh_json(["api", f"repos/{repo_name}"])
+            except Exception:
+                repository = None
+            repository_archived[repo_name] = (
+                repository.get("archived") is True if isinstance(repository, dict) else False
+            )
+        if repository_archived[repo_name]:
+            continue
         subject_type = subject.get("type", "")
         title = subject.get("title") or repo_name
         subject_url = subject.get("url") or ""
