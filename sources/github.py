@@ -325,7 +325,12 @@ def _fetch_notifications():
             if m:
                 number = m.group(2)
 
-        if subject_type == "PullRequest" or subject_type == "Issue":
+        if subject_type in {"PullRequest", "Issue"} and subject_url:
+            subject_info = _gh_json(["api", subject_url])
+            subject_state = subject_info.get("state") if isinstance(subject_info, dict) else None
+            if isinstance(subject_state, str) and subject_state and subject_state != "open":
+                continue
+
             items.append({
                 "number": number,
                 "title": title,
