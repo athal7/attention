@@ -449,23 +449,41 @@ test_github_source
 
 test_github_filters_items_without_my_action() {
   local out
-  out="$(python3 -c "
+  out=$(python3 -c "
 $(load_plugin_py github)
 p._gh_json = lambda args: [
     {'number': 1, 'assignees': [], 'title': 'Unassigned'},
     {'number': 2, 'assignees': [{'login': 'someone-else'}], 'title': 'Owned elsewhere'},
 ] if args[:2] == ['search', 'issues'] else [
     {'id': 'mention', 'unread': True, 'reason': 'mention', 'subject': {'type': 'Issue', 'title': 'Please reply', 'url': 'https://api.github.com/repos/o/r/issues/3'}, 'repository': {'full_name': 'o/r'}},
+    {'id': 'pull', 'unread': True, 'reason': 'mention', 'subject': {'type': 'PullRequest', 'title': 'Review this PR', 'url': 'https://api.github.com/repos/o/r/pulls/42'}, 'repository': {'full_name': 'o/r'}},
     {'id': 'state', 'unread': True, 'reason': 'state_change', 'subject': {'type': 'Issue', 'title': 'Passive update', 'url': 'https://api.github.com/repos/o/r/issues/4'}, 'repository': {'full_name': 'o/r'}},
     {'id': 'ci', 'unread': True, 'reason': 'ci_activity', 'subject': {'type': 'CheckSuite', 'title': 'Watched CI'}, 'repository': {'full_name': 'o/r'}},
 ]
+notifications = p._fetch_notifications()
+pull = next(item for item in notifications if item['notification_id'] == 'pull')
+p._fetch_raw = lambda config: notifications
+p._build_repo_dir_index = lambda code_dir: {}
+fetched = {item['id']: item for item in p.fetch({'codeDir': '/tmp'})}
 print([item['number'] for item in p._fetch_my_repo_issues()])
-print([item['notification_id'] for item in p._fetch_notifications()])
-")"
+print([item['notification_id'] for item in notifications])
+print(pull['number'])
+print(pull['url'])
+print(fetched['42']['kind'])
+print(fetched['3']['kind'])
+")
   check "owned-repository issues assigned to someone else are filtered out" \
     "$(sed -n 1p <<<"$out")" "[1]"
   check "passive state and watched-CI notifications are filtered out" \
-    "$(sed -n 2p <<<"$out")" "['mention']"
+    "$(sed -n 2p <<<"$out")" "['mention', 'pull']"
+  check "PullRequest notification recovers its numeric identifier" \
+    "$(sed -n 3p <<<"$out")" "42"
+  check "PullRequest notification links to its browser PR URL" \
+    "$(sed -n 4p <<<"$out")" "https://github.com/o/r/pull/42"
+  check "PullRequest notifications are classified as pull requests" \
+    "$(sed -n 5p <<<"$out")" "pull_request"
+  check "Issue notifications remain classified as notifications" \
+    "$(sed -n 6p <<<"$out")" "notification"
 }
 test_github_filters_items_without_my_action
 echo
@@ -1876,18 +1894,18 @@ test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state
 
 # ---------------------------------------------------------------------------
 echo
-echo "== linear plugin: state.type filter, no pagination truncation, project as context =="
+echo "== linear plugin: state.type filter, cursor pagination, project as context =="
 
 # fetch() hits the network directly (urllib), which a bash-level PATH stub
 # can't intercept, so this loads the module in-process and monkeypatches
-# urlopen with a fake response, capturing the outgoing GraphQL request body.
+# urlopen with a fake response, capturing each outgoing GraphQL request body.
 test_fetch_linear_functional() {
   local out
   out="$(python3 -c "
 $(load_plugin_py linear)
 import json
 
-captured = {}
+requests = []
 
 class FakeResp:
     def __init__(self, data):
@@ -1900,20 +1918,40 @@ class FakeResp:
         return False
 
 def fake_urlopen(req, timeout=10):
-    captured['query'] = json.loads(req.data.decode())['query']
-    payload = {
-        'data': {'viewer': {'assignedIssues': {'nodes': [
+    request = json.loads(req.data.decode())
+    requests.append(request)
+    after = request['variables']['after']
+    pages = {
+        None: {'nodes': [
             {'id': 'u1', 'identifier': 'ABC-1', 'title': 'Fix it',
              'url': 'https://linear.app/x/issue/ABC-1',
-             'state': {'name': 'In Progress'}, 'project': {'name': 'Backend'}}
-        ]}}}
+             'state': {'name': 'In Progress'}, 'project': {'name': 'Backend'},
+             'relations': {'nodes': [
+                 {'type': 'related',
+                  'issue': {'identifier': 'NESTED-1', 'title': 'Not assigned'},
+                  'relatedIssue': {'identifier': 'ABC-1'}}
+             ]}}
+        ], 'pageInfo': {'hasNextPage': True, 'endCursor': 'cursor-1'}},
+        'cursor-1': {'nodes': [
+            {'id': 'u2', 'identifier': 'ABC-2', 'title': 'Ship it',
+             'url': 'https://linear.app/x/issue/ABC-2',
+             'state': {'name': 'Todo'}, 'project': {'name': 'Backend'},
+             'relations': {'nodes': []}}
+        ], 'pageInfo': {'hasNextPage': False, 'endCursor': 'cursor-2'}},
     }
+    payload = {'data': {'viewer': {'assignedIssues': pages[after]}}}
     return FakeResp(json.dumps(payload).encode())
 
 p.urllib.request.urlopen = fake_urlopen
 
 result = p.fetch({'linear': {'apiToken': 'fake-token'}})
-print(json.dumps({'query': captured['query'], 'result': result}))
+print(json.dumps({
+    'first_query': requests[0]['query'],
+    'request_cursors': [request['variables']['after'] for request in requests],
+    'request_count': len(requests),
+    'identifiers': [item['id'] for item in result],
+    'result': result,
+}))
 ")"
 
   case "$out" in
@@ -1924,12 +1962,22 @@ print(json.dumps({'query': captured['query'], 'result': result}))
   case "$out" in
     *'cycle: { isActive: { eq: true } }'*)
       ok "assignedIssues is scoped to the current cycle" ;;
-
     *) bad "assignedIssues is scoped to the current cycle (got: $out)" ;;
   esac
   case "$out" in
-    *'first: 250'*) ok "assignedIssues raises the page size past the 50-item default" ;;
-    *) bad "assignedIssues raises the page size past the 50-item default (got: $out)" ;;
+    *'first: 50, after: $after'*)
+      ok "assignedIssues uses a bounded cursor-paginated page size" ;;
+    *) bad "assignedIssues uses a bounded cursor-paginated page size (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"request_cursors": [null, "cursor-1"]'*'"request_count": 2'*)
+      ok "fetch() follows endCursor with exactly two assignedIssues requests" ;;
+    *) bad "fetch() follows endCursor with exactly two assignedIssues requests (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"identifiers": ["ABC-1", "ABC-2"]'*)
+      ok "fetch() collects every direct issue node across pages exactly once" ;;
+    *) bad "fetch() collects every direct issue node across pages exactly once (got: $out)" ;;
   esac
   case "$out" in
     *'"context": "Backend"'*'"id": "ABC-1"'*)
@@ -1953,11 +2001,14 @@ test_linear_blocking_relationships_surface_as_blocked_status() {
   out="$(python3 -c "
 $(load_plugin_py linear)
 import json
-p._query = lambda token, query: {'data': {'viewer': {'assignedIssues': {'nodes': [{
-  'id': 'db-1', 'identifier': 'ABC-1', 'title': 'Blocked work', 'url': 'https://linear.app/issue/ABC-1',
-  'state': {'name': 'In Progress'}, 'project': {'name': 'Core'},
-  'relations': {'nodes': [{'type': 'blocks', 'issue': {'identifier': 'ABC-2', 'title': 'Prerequisite'}, 'relatedIssue': {'identifier': 'ABC-1'}}]},
-}]}}}}
+p._query = lambda token, query, variables=None: {'data': {'viewer': {'assignedIssues': {
+  'nodes': [{
+    'id': 'db-1', 'identifier': 'ABC-1', 'title': 'Blocked work', 'url': 'https://linear.app/issue/ABC-1',
+    'state': {'name': 'In Progress'}, 'project': {'name': 'Core'},
+    'relations': {'nodes': [{'type': 'blocks', 'issue': {'identifier': 'ABC-2', 'title': 'Prerequisite'}, 'relatedIssue': {'identifier': 'ABC-1'}}]},
+  }],
+  'pageInfo': {'hasNextPage': False, 'endCursor': 'cursor-1'},
+}}}}
 item = p.fetch({'linear': {'apiToken': 'token'}})[0]
 print(item['status'])
 print(item['details'])

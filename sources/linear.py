@@ -57,9 +57,9 @@ def fetch(config):
         return []
 
     query = """
-query {
+query AssignedIssues($after: String) {
   viewer {
-    assignedIssues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, cycle: { isActive: { eq: true } } }, first: 250) {
+    assignedIssues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, cycle: { isActive: { eq: true } } }, first: 50, after: $after) {
       nodes {
         id
         identifier
@@ -79,27 +79,35 @@ query {
           }
         }
       }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
     }
   }
 }
 """
-    res_data = _query(token, query)
-    if not res_data or "errors" in res_data:
-        return []
+    raw = []
+    after = None
+    while True:
+        res_data = _query(token, query, {"after": after})
+        if not res_data or "errors" in res_data:
+            return []
 
-    def extract(data):
-        if isinstance(data, list):
-            for item in data:
-                yield from extract(item)
-        elif isinstance(data, dict):
-            if "identifier" in data and "title" in data:
-                yield data
-            else:
-                for val in data.values():
-                    yield from extract(val)
+        assigned_issues = (
+            res_data.get("data", {})
+            .get("viewer", {})
+            .get("assignedIssues", {})
+        )
+        raw.extend(assigned_issues.get("nodes", []))
 
-    raw = list(extract(res_data.get("data", {})))
+        page_info = assigned_issues.get("pageInfo", {})
+        if not page_info.get("hasNextPage"):
+            break
 
+        after = page_info.get("endCursor")
+        if not after:
+            break
     items = []
     for l in raw:
         title = l.get("title", "Untitled").strip().replace("\t", " ").replace("|", "/")
