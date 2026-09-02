@@ -319,12 +319,9 @@ def _fetch_notifications():
         subject_url = subject.get("url") or ""
         latest_comment_url = subject.get("latest_comment_url") or ""
 
-        # Derive a PR/issue number from the subject URL when possible.
-        # URLs look like https://api.github.com/repos/owner/repo/pulls/42
-        # or https://api.github.com/repos/owner/repo/issues/17
         number = None
         if subject_url:
-            m = re.search(r"/(issues|pull)/(\d+)$", subject_url)
+            m = re.search(r"/(issues|pulls)/(\d+)$", subject_url)
             if m:
                 number = m.group(2)
 
@@ -335,6 +332,7 @@ def _fetch_notifications():
                 "repository": {"nameWithOwner": repo_name},
                 "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
                 "type": "notification",
+                "subject_type": subject_type,
                 "notification_reason": reason,
                 "notification_id": notif.get("id", ""),
                 "latest_comment_url": latest_comment_url,
@@ -351,6 +349,7 @@ def _fetch_notifications():
                 "repository": {"nameWithOwner": repo_name},
                 "url": repo_info.get("html_url", ""),
                 "type": "notification",
+                "subject_type": subject_type,
                 "notification_reason": reason,
                 "notification_id": notif.get("id", ""),
                 "latest_comment_url": "",
@@ -589,7 +588,10 @@ def fetch(config):
         is_draft = g.get("isDraft", False)
 
         gtype = g.get("type", "")
-        is_pull_request = gtype in {"review_request", "authored_attention", "tracked_attention"}
+        is_pull_request = (
+            gtype in {"review_request", "authored_attention", "tracked_attention"}
+            or (gtype == "notification" and g.get("subject_type") == "PullRequest")
+        )
         details = ""
         if gtype == "review_request":
             weight, status = 90, "REVIEW REQUESTED"
