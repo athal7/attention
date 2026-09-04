@@ -309,27 +309,35 @@ def _fetch_notifications():
     if not notifications:
         return []
 
-    repository_archived = {}
+    # Phase 1: early filter to only mention/author, then batch-check
+    # archived repos in parallel (27 unique repos instead of 497 sequential).
+    filtered = [n for n in notifications if n.get("unread") and n.get("reason") in {"mention", "author"}]
+    repo_names = list({n.get("repository", {}).get("full_name", "") for n in filtered if n.get("repository", {}).get("full_name")})
 
+    def _check_archived(repo_name):
+        try:
+            repository = _gh_json(["api", f"repos/{repo_name}"])
+            return (repo_name, repository.get("archived") is True if isinstance(repository, dict) else False)
+        except Exception:
+            return (repo_name, False)
+
+    repository_archived = {}
+    if repo_names:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(repo_names), _MAX_WORKERS)) as pool:
+            for repo_name, archived in pool.map(_check_archived, repo_names):
+                repository_archived[repo_name] = archived
+
+    # Phase 2: two-pass approach. First pass collects CheckSuite items
+    # (no API call needed) and PR/Issue subjects that need state checks.
+    # Second pass batches all state checks in parallel.
     items = []
-    for notif in notifications:
-        if not notif.get("unread"):
-            continue
-        reason = notif.get("reason", "")
-        if reason not in {"mention", "author"}:
-            continue
+    subjects_to_check = []
+
+    for notif in filtered:
         subject = notif.get("subject") or {}
         repo_info = notif.get("repository") or {}
         repo_name = repo_info.get("full_name", "")
-        if repo_name not in repository_archived:
-            try:
-                repository = _gh_json(["api", f"repos/{repo_name}"])
-            except Exception:
-                repository = None
-            repository_archived[repo_name] = (
-                repository.get("archived") is True if isinstance(repository, dict) else False
-            )
-        if repository_archived[repo_name]:
+        if repository_archived.get(repo_name):
             continue
         subject_type = subject.get("type", "")
         title = subject.get("title") or repo_name
@@ -343,23 +351,7 @@ def _fetch_notifications():
                 number = m.group(2)
 
         if subject_type in {"PullRequest", "Issue"} and subject_url:
-            subject_info = _gh_json(["api", subject_url])
-            subject_state = subject_info.get("state") if isinstance(subject_info, dict) else None
-            if isinstance(subject_state, str) and subject_state and subject_state != "open":
-                continue
-
-            items.append({
-                "number": number,
-                "title": title,
-                "repository": {"nameWithOwner": repo_name},
-                "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
-                "type": "notification",
-                "subject_type": subject_type,
-                "notification_reason": reason,
-                "notification_id": notif.get("id", ""),
-                "latest_comment_url": latest_comment_url,
-                "createdAt": notif.get("updated_at", ""),
-            })
+            subjects_to_check.append((notif, subject_type, title, subject_url, latest_comment_url, number, repo_name))
         elif subject_type == "CheckSuite":
             # CI failure with no PR link. Build a synthetic number from
             # the title so it de-duplicates against itself but never collides
@@ -372,11 +364,40 @@ def _fetch_notifications():
                 "url": repo_info.get("html_url", ""),
                 "type": "notification",
                 "subject_type": subject_type,
-                "notification_reason": reason,
+                "notification_reason": notif.get("reason", ""),
                 "notification_id": notif.get("id", ""),
                 "latest_comment_url": "",
                 "createdAt": notif.get("updated_at", ""),
             })
+
+    # Phase 3: batch-fetch state for all PR/Issue subjects in parallel.
+    if subjects_to_check:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as pool:
+            def _check_subject(s):
+                notif, subject_type, title, subject_url, latest_comment_url, number, repo_name = s
+                try:
+                    subject_info = _gh_json(["api", subject_url])
+                    state = subject_info.get("state") if isinstance(subject_info, dict) else None
+                    if isinstance(state, str) and state == "open":
+                        return {
+                            "number": number,
+                            "title": title,
+                            "repository": {"nameWithOwner": repo_name},
+                            "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
+                            "type": "notification",
+                            "subject_type": subject_type,
+                            "notification_reason": notif.get("reason", ""),
+                            "notification_id": notif.get("id", ""),
+                            "latest_comment_url": latest_comment_url,
+                            "createdAt": notif.get("updated_at", ""),
+                        }
+                except Exception:
+                    pass
+                return None
+
+            for item in pool.map(_check_subject, subjects_to_check):
+                if item is not None:
+                    items.append(item)
 
     return items
 
