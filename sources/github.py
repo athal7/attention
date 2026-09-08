@@ -317,9 +317,9 @@ def _fetch_notifications():
     def _check_archived(repo_name):
         try:
             repository = _gh_json(["api", f"repos/{repo_name}"])
-            return (repo_name, repository.get("archived") is True if isinstance(repository, dict) else False)
+            return repo_name, repository.get("archived") is True if isinstance(repository, dict) else True
         except Exception:
-            return (repo_name, False)
+            return repo_name, True
 
     repository_archived = {}
     if repo_names:
@@ -337,7 +337,7 @@ def _fetch_notifications():
         subject = notif.get("subject") or {}
         repo_info = notif.get("repository") or {}
         repo_name = repo_info.get("full_name", "")
-        if repository_archived.get(repo_name):
+        if not repo_name or repository_archived.get(repo_name, True):
             continue
         subject_type = subject.get("type", "")
         title = subject.get("title") or repo_name
