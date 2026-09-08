@@ -378,7 +378,7 @@ def _fetch_notifications():
                 try:
                     subject_info = _gh_json(["api", subject_url])
                     state = subject_info.get("state") if isinstance(subject_info, dict) else None
-                    if isinstance(state, str) and state == "open":
+                    if not (isinstance(state, str) and state and state != "open"):
                         return {
                             "number": number,
                             "title": title,
