@@ -1994,7 +1994,7 @@ print(f('repo_issue', []))
 }
 test_github_session_prompt_state_aware
 
-test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state() {
+test_pull_request_indicators_show_draft_and_target_branch() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
@@ -2007,20 +2007,37 @@ detail = {
     'baseRefName': 'feature/base',
     'mergeable': 'MERGEABLE',
 }
-print(json.dumps(p._pr_indicators(detail, True, 'main'), sort_keys=True))
+print(json.dumps(p._pr_indicators(detail, True), sort_keys=True))
 detail['statusCheckRollup'] = [{'conclusion': 'FAILURE'}]
 detail['latestReviews'] = [{'state': 'CHANGES_REQUESTED'}]
 detail['reviewDecision'] = 'CHANGES_REQUESTED'
 detail['baseRefName'] = 'main'
 detail['mergeable'] = 'CONFLICTING'
-print(json.dumps(p._pr_indicators(detail, False, 'main'), sort_keys=True))
+print(json.dumps(p._pr_indicators(detail, False), sort_keys=True))
 ")"
-  check "draft stacked PR shows draft, passed CI, approval, mergeable, and stacked state" \
-    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "merge": "\u2713", "ready": "\u00d7", "review": "\u2713", "stacked": "\u2713"}'
-  check "base-branch PR shows failing CI, changes requested, conflict, and stacked false" \
-    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "merge": "\u00d7", "ready": "\u2713", "review": "\u00d7", "stacked": "\u00d7"}'
+  check "draft PR shows its draft flag, target branch, passed CI, approval, and mergeable state" \
+    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "draft": "\u2713", "merge": "\u2713", "review": "\u2713", "target": "feature/base"}'
+  check "ready PR clears its draft flag and shows its target branch and failing states" \
+    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "draft": "\u2014", "merge": "\u00d7", "review": "\u00d7", "target": "main"}'
 }
-test_pull_request_indicators_distinguish_draft_ci_review_and_stack_state
+test_pull_request_indicators_show_draft_and_target_branch
+
+test_github_pull_requests_link_visible_stack_parents() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+p._fetch_raw = lambda config: [
+    {'number': 10, 'title': 'Base', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'review_request', 'baseRefName': 'main', 'headRefName': 'feature/base'},
+    {'number': 11, 'title': 'Child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'review_request', 'isDraft': True, 'baseRefName': 'feature/base', 'headRefName': 'feature/child'},
+]
+p._repo_dir_index = lambda code_dir: {}
+items = p.fetch({})
+print([(item['title'], item['indicators']['draft'], item['indicators']['target'], item['indicators']['state'], item.get('parent_identity_key')) for item in items])
+")"
+  check "GitHub items expose draft only as a flag, show the target, and link a visible stack child" \
+    "$out" "[('Base', '—', 'main', 'Review ⏳', None), ('Child', '✓', 'feature/base', 'Review ⏳', 'github:owner/repo#10')]"
+}
+test_github_pull_requests_link_visible_stack_parents
 
 # ---------------------------------------------------------------------------
 echo
@@ -3831,6 +3848,7 @@ rows = m.render_grouped_dashboard_rows(items, groups)
 print(error)
 print([group['name'] for group in groups])
 print([row.rpartition(chr(9))[2] for row in rows])
+print(groups[0]['columns'])
 ")"
   check "dashboard uses typed groups when no groups configuration exists" \
     "$(sed -n 1p <<<"$out")" "None"
@@ -3838,8 +3856,32 @@ print([row.rpartition(chr(9))[2] for row in rows])
     "$(sed -n 2p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events', 'Other']"
   check "default dashboard groups route each built-in item type to its own section" \
     "$(sed -n 3p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events']"
+  check "default pull request group shows draft flag, target branch, and state" \
+    "$(sed -n 4p <<<"$out")" "['draft', 'target', 'state']"
 }
 test_default_dashboard_groups_items_by_type
+
+test_pull_request_stacks_render_as_trees() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, _ = m.dashboard_groups({})
+items = [
+    {'status': 'S', 'context': 'owner/repo', 'title': 'Grandchild', 'details': '', 'weight': 100, 'kind': 'pull_request', 'identity_key': 'pr:3', 'parent_identity_key': 'pr:2', 'indicators': {'draft': '—', 'target': 'feature/child', 'state': 'Ready'}, 'actions': []},
+    {'status': 'S', 'context': 'owner/repo', 'title': 'Child', 'details': '', 'weight': 90, 'kind': 'pull_request', 'identity_key': 'pr:2', 'parent_identity_key': 'pr:1', 'indicators': {'draft': '✓', 'target': 'feature/base', 'state': 'Draft'}, 'actions': []},
+    {'status': 'S', 'context': 'owner/repo', 'title': 'Base', 'details': '', 'weight': 80, 'kind': 'pull_request', 'identity_key': 'pr:1', 'indicators': {'draft': '—', 'target': 'main', 'state': 'Ready'}, 'actions': []},
+    {'status': 'S', 'context': 'owner/repo', 'title': 'Standalone', 'details': '', 'weight': 70, 'kind': 'pull_request', 'identity_key': 'pr:4', 'indicators': {'draft': '—', 'target': 'main', 'state': 'Ready'}, 'actions': []},
+]
+rows = m.render_grouped_dashboard_rows(items, groups)
+print([
+    row.split(chr(9))[0].split('  owner/repo', 1)[0].rstrip()
+    for row in rows
+])
+")"
+  check "visible PR stack rows put parents first and draw each child branch" \
+    "$out" "['Base', '└─ Child', '   └─ Grandchild', 'Standalone']"
+}
+test_pull_request_stacks_render_as_trees
 
 test_curses_group_presenter_scopes_rows() {
   local out

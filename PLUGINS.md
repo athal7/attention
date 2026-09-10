@@ -84,7 +84,7 @@ omitted.
 a short status label and an inline result emoji, such as `Ready ✅`,
 `Blocked ❌`, or `Review ⏳`. Bundled sources provide this key so mixed-source
 groups remain one status column wide. Source-specific groups can select detail
-keys such as `ci`, `ready`, `review`, `merge`, and `stacked`.
+keys such as `ci`, `draft`, `review`, `merge`, and `target`.
 
 ### Indicator tables
 

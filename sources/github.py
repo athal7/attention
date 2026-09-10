@@ -30,7 +30,7 @@ _MAX_WORKERS = 8
 _MAX_PR_DETAIL_WORKERS = 32
 _PR_DETAIL_FIELDS = (
     "mergeable,reviewDecision,statusCheckRollup,latestReviews,"
-    "closingIssuesReferences,isDraft,reviewRequests,baseRefName"
+    "closingIssuesReferences,isDraft,reviewRequests,baseRefName,headRefName"
 )
 _repo_dir_indexes = {}
 _repo_dir_indexes_lock = threading.Lock()
@@ -123,17 +123,9 @@ def _fetch_review_bot_flags(repo, number):
             flags[login] = author.get("__typename") == "Bot"
     return flags
 
-def _default_branch(repo, branches, lock):
-    with lock:
-        if repo in branches:
-            return branches[repo]
-        data = _gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])
-        branch = ((data or {}).get("defaultBranchRef") or {}).get("name", "")
-        branches[repo] = branch
-        return branch
 
 
-def _pr_indicators(detail, is_draft, default_branch):
+def _pr_indicators(detail, is_draft):
     checks = detail.get("statusCheckRollup") or []
     failing_checks = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
     complete_checks = {"SUCCESS", "NEUTRAL", "SKIPPED"}
@@ -162,21 +154,26 @@ def _pr_indicators(detail, is_draft, default_branch):
     mergeable = detail.get("mergeable")
     merge = "×" if mergeable == "CONFLICTING" else "✓" if mergeable == "MERGEABLE" else "…"
 
-    base_branch = detail.get("baseRefName", "")
-    if not base_branch or not default_branch:
-        stacked = "—"
-    else:
-        stacked = "×" if base_branch == default_branch else "✓"
-
     return {
         "ci": ci,
-        "ready": "×" if is_draft else "✓",
+        "draft": "✓" if is_draft else "—",
         "review": review,
         "merge": merge,
-        "stacked": stacked,
+        "target": detail.get("baseRefName") or "—",
     }
 
-def _status_badge(gtype, reasons, is_draft, review_requested):
+
+def _apply_pr_detail(pr, detail):
+    if detail is None:
+        return
+    pr["reviewRequested"] = bool(detail.get("reviewRequests"))
+    pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
+    pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
+    pr["baseRefName"] = detail.get("baseRefName") or ""
+    pr["headRefName"] = detail.get("headRefName") or ""
+    pr["indicators"] = _pr_indicators(detail, pr["isDraft"])
+
+def _status_badge(gtype, reasons, review_requested):
     if "Merge Conflict" in reasons:
         return "Merge ❌"
     if "Changes Requested" in reasons:
@@ -187,8 +184,6 @@ def _status_badge(gtype, reasons, is_draft, review_requested):
         return "Reply ⏳"
     if gtype == "review_request" or review_requested:
         return "Review ⏳"
-    if is_draft:
-        return "Draft ⏳"
     if gtype == "assigned_issue":
         return "Assigned ⏳"
     if gtype == "repo_issue":
@@ -198,9 +193,7 @@ def _status_badge(gtype, reasons, is_draft, review_requested):
     return "Ready ✅"
 
 
-def _classify_pr_attention(
-    pr, expected_author, bot_review_allowlist, default_branches, default_branch_lock, detail,
-):
+def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
     key = _pr_key(pr)
     if key is None or detail is None:
         return None
@@ -235,20 +228,14 @@ def _classify_pr_attention(
     if not reasons:
         return None
     pr = dict(pr)
-    pr["reviewRequested"] = bool(detail.get("reviewRequests"))
-    pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
-    pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
+    _apply_pr_detail(pr, detail)
     pr["attention_reasons"] = reasons
-    default_branch = _default_branch(repo, default_branches, default_branch_lock) if detail.get("baseRefName") else ""
-    pr["indicators"] = _pr_indicators(
-        detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
-    )
     return pr
 
 
 def _fetch_pr_attention(
     author, detail_pool, bot_review_allowlist=frozenset(),
-    default_branches=None, default_branch_lock=None, current_login=None, detail_lookup=None,
+    current_login=None, detail_lookup=None,
 ):
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
@@ -256,8 +243,6 @@ def _fetch_pr_attention(
     ])
     if not prs:
         return []
-    default_branches = {} if default_branches is None else default_branches
-    default_branch_lock = threading.Lock() if default_branch_lock is None else default_branch_lock
     expected_author = current_login if current_login is not None else _get_gh_login()
     details = {}
     if detail_lookup is None:
@@ -275,8 +260,7 @@ def _fetch_pr_attention(
     return [
         result for pr in prs
         if (result := _classify_pr_attention(
-            pr, expected_author, bot_review_allowlist, default_branches, default_branch_lock,
-            detail_for(pr),
+            pr, expected_author, bot_review_allowlist, detail_for(pr),
         )) is not None
     ]
 
@@ -377,9 +361,10 @@ def _fetch_notifications():
                 notif, subject_type, title, subject_url, latest_comment_url, number, repo_name = s
                 try:
                     subject_info = _gh_json(["api", subject_url])
-                    state = subject_info.get("state") if isinstance(subject_info, dict) else None
+                    info = subject_info if isinstance(subject_info, dict) else {}
+                    state = info.get("state")
                     if not (isinstance(state, str) and state and state != "open"):
-                        return {
+                        item = {
                             "number": number,
                             "title": title,
                             "repository": {"nameWithOwner": repo_name},
@@ -391,6 +376,11 @@ def _fetch_notifications():
                             "latest_comment_url": latest_comment_url,
                             "createdAt": notif.get("updated_at", ""),
                         }
+                        if subject_type == "PullRequest":
+                            item["isDraft"] = bool(info.get("draft"))
+                            item["baseRefName"] = (info.get("base") or {}).get("ref", "")
+                            item["headRefName"] = (info.get("head") or {}).get("ref", "")
+                        return item
                 except Exception:
                     pass
                 return None
@@ -456,8 +446,6 @@ def _repo_dir_index(code_dir):
 
 
 def _fetch_raw(config):
-    default_branches = {}
-    default_branch_lock = threading.Lock()
     track_authors = config.get("github", {}).get("trackAuthors", [])
     bot_review_allowlist = frozenset(
         login.casefold() for login in config.get("github", {}).get("botReviewAllowlist", [])
@@ -525,8 +513,6 @@ def _fetch_raw(config):
                 candidate,
                 current_login,
                 bot_review_allowlist,
-                default_branches,
-                default_branch_lock,
                 detail_for(candidate),
             )
             for candidate in authored_candidates
@@ -540,8 +526,6 @@ def _fetch_raw(config):
                         candidate,
                         author,
                         bot_review_allowlist,
-                        default_branches,
-                        default_branch_lock,
                         detail_for(candidate),
                     )
                     for candidate in candidates
@@ -573,17 +557,7 @@ def _fetch_raw(config):
     review_prs = []
     for candidate in review_candidates:
         pr = dict(candidate)
-        detail = detail_for(pr)
-        if detail is not None:
-            pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
-            pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
-            repo = pr["repository"]["nameWithOwner"]
-            default_branch = _default_branch(
-                repo, default_branches, default_branch_lock,
-            ) if detail.get("baseRefName") else ""
-            pr["indicators"] = _pr_indicators(
-                detail, detail.get("isDraft", pr.get("isDraft", False)), default_branch,
-            )
+        _apply_pr_detail(pr, detail_for(pr))
         pr["type"] = "review_request"
         review_prs.append(pr)
 
@@ -718,15 +692,14 @@ def fetch(config):
         if is_pull_request and not indicators:
             indicators = {
                 "ci": "—",
-                "ready": "×" if is_draft else "✓",
+                "draft": "✓" if is_draft else "—",
                 "review": "…" if gtype == "review_request" else "—",
                 "merge": "…",
-                "stacked": "—",
+                "target": g.get("baseRefName") or "—",
             }
         indicators["state"] = _status_badge(
             gtype,
             g.get("attention_reasons", []),
-            is_draft,
             bool(g.get("reviewRequested")),
         )
         kind = (
@@ -777,6 +750,8 @@ def fetch(config):
             "created_at": g.get("createdAt", ""),
             "absorb_note": f"{details}: {title}" if details else f"{status}: {title}",
             "identity_key": f"github:{repo_name.lower()}#{number}",
+            "base_branch": g.get("baseRefName", ""),
+            "head_branch": g.get("headRefName", ""),
             "association_keys": [
                 f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
                 for reference in g.get("closingIssuesReferences", [])
@@ -784,6 +759,17 @@ def fetch(config):
             ] + _body_association_keys(g.get("body", "")),
             "actions": actions,
         })
+    branch_owners = {
+        (item["context"].casefold(), item["head_branch"]): item["identity_key"]
+        for item in items
+        if item.get("kind") == "pull_request" and item.get("head_branch")
+    }
+    for item in items:
+        if item.get("kind") != "pull_request" or not item.get("base_branch"):
+            continue
+        parent = branch_owners.get((item["context"].casefold(), item["base_branch"]))
+        if parent and parent != item["identity_key"]:
+            item["parent_identity_key"] = parent
     return items
 
 

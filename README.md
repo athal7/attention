@@ -74,7 +74,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "linear":    { "apiToken": "lin_api_..." },
   "dashboard": {
     "groups": [
-      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["ci", "ready", "review", "merge", "stacked"] },
+      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["draft", "target", "state"] },
       { "name": "Needs Attention", "match": { "statuses": ["OVERDUE"] }, "columns": ["due"] },
       { "name": "My Repositories", "match": { "contextPrefixes": ["athal7/"] } },
       { "name": "Ready for Something New", "fallback": true }
@@ -111,13 +111,13 @@ group wins; the fallback receives every remaining item. Invalid grouping
 configuration emits a warning and uses the existing flat dashboard, so it
 cannot hide attention items.
 
-Each group can select a different table with `columns`. Bundled sources share
-one compact `state` column. Its value combines a short status label with `✅`,
-`❌`, or `⏳`, such as `Ready ✅`, `Merge ❌`, or `Review ⏳`. A group without
-explicit columns uses `state` when it is available, which keeps mixed-source
-views narrow. A source-specific group can still request detailed keys. GitHub
-pull requests provide `ci`, `ready`, `review`, `merge`, and `stacked`.
-Missing values render as `—`.
+Each group can select a different table with `columns`. Most bundled groups
+use one compact `state` column. Its value combines a short status label with
+`✅`, `❌`, or `⏳`, such as `Ready ✅`, `Merge ❌`, or `Review ⏳`. The default
+pull request group also shows a `draft` flag and the PR's `target` branch.
+A group without explicit columns uses `state` when it is available, which
+keeps mixed-source views narrow. GitHub pull requests also provide `ci`,
+`review`, and `merge`. Missing values render as `—`.
 
 ## What each bundled plugin surfaces
 
@@ -133,6 +133,8 @@ Missing values render as `—`.
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
   Bot review comments are excluded unless the bot is in
   `github.botReviewAllowlist`. Items are de-duplicated by repository and number.
+  Visible PRs that target another visible PR's head branch render as a tree,
+  with the target PR above its child.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate
   state, in your current cycle. Its status always wins on a cross-linked
   dashboard row: a PR title/body mentioning the issue's identifier folds

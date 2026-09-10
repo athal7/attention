@@ -559,10 +559,10 @@ def _normalize_row_text(items):
 
 _INDICATOR_LABELS = {
     "ci": "CI",
-    "ready": "READY",
+    "draft": "DRAFT",
     "review": "REVIEW",
-    "stacked": "STACKED",
     "merge": "MERGE",
+    "target": "TARGET",
     "state": "STATE",
     "due": "DUE",
 }
@@ -586,15 +586,19 @@ def _indicator_columns(items, columns):
 
 
 def _indicator_specs(items, columns):
+    max_widths = {"target": 24}
     return [
         (
             key,
             _INDICATOR_LABELS.get(key, key.replace("_", " ").upper()),
-            max(
-                len(_INDICATOR_LABELS.get(key, key.replace("_", " ").upper())),
+            min(
+                max_widths.get(key, float("inf")),
                 max(
-                    (len(item.get("indicators", {}).get(key, "—")) for item in items),
-                    default=0,
+                    len(_INDICATOR_LABELS.get(key, key.replace("_", " ").upper())),
+                    max(
+                        (len(item.get("indicators", {}).get(key, "—")) for item in items),
+                        default=0,
+                    ),
                 ),
             ),
         )
@@ -686,7 +690,7 @@ def render_dashboard_rows(items, columns=None):
         if indicator_specs:
             indicators = item.get("indicators", {})
             indicator_cells = "  ".join(
-                f"{indicators.get(key, '—'):<{cell_width}}"
+                f"{_clip(indicators.get(key, '—'), cell_width):<{cell_width}}"
                 for key, _, cell_width in indicator_specs
             )
             visible = f"{visible}  {indicator_cells}"
@@ -704,7 +708,7 @@ _DEFAULT_DASHBOARD_GROUPS = (
     {
         "name": "Pull Requests",
         "match": {"kinds": ["pull_request"]},
-        "columns": ["state"],
+        "columns": ["draft", "target", "state"],
     },
     {"name": "Issues", "match": {"kinds": ["issue"]}, "columns": ["state"]},
     {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["state"]},
@@ -801,6 +805,52 @@ def _group_matches(item, match):
         for key, values in match.items()
         if key != "contextPrefixes"
     )
+
+
+def _tree_order(items):
+    by_identity = {
+        item["identity_key"]: item
+        for item in items
+        if item.get("identity_key")
+    }
+    children = {}
+    attached = set()
+    for item in items:
+        parent = item.get("parent_identity_key")
+        if parent in by_identity and parent != item.get("identity_key"):
+            children.setdefault(parent, []).append(item)
+            attached.add(id(item))
+    if not children:
+        return items
+
+    ordered = []
+    visited = set()
+
+    def append_item(item, prefix="", connector=""):
+        marker = id(item)
+        if marker in visited:
+            return
+        visited.add(marker)
+        row = dict(item)
+        if connector:
+            row["title"] = f"{prefix}{connector}{item['title']}"
+        ordered.append(row)
+        descendants = children.get(item.get("identity_key"), [])
+        descendant_prefix = prefix + (
+            "   " if connector == "└─ " else "│  " if connector else ""
+        )
+        for index, child in enumerate(descendants):
+            child_connector = "└─ " if index == len(descendants) - 1 else "├─ "
+            append_item(child, descendant_prefix, child_connector)
+
+    for item in items:
+        if id(item) not in attached:
+            append_item(item)
+    for item in items:
+        append_item(item)
+    return ordered
+
+
 def render_grouped_dashboard_rows(items, groups):
     grouped_items = {group["name"]: [] for group in groups}
     fallback = next(group["name"] for group in groups if group.get("fallback"))
@@ -818,7 +868,7 @@ def render_grouped_dashboard_rows(items, groups):
         f"{row}\t{group['name']}"
         for group in groups
         for row in render_dashboard_rows(
-            grouped_items[group["name"]], group.get("columns"),
+            _tree_order(grouped_items[group["name"]]), group.get("columns"),
         )
     ]
 
