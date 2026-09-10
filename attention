@@ -559,12 +559,12 @@ def _normalize_row_text(items):
 
 _INDICATOR_LABELS = {
     "ci": "CI",
-    "draft": "DRAFT",
-    "review": "REVIEW",
-    "merge": "MERGE",
-    "target": "TARGET",
-    "state": "STATE",
-    "due": "DUE",
+    "draft": "Draft",
+    "review": "Review",
+    "merge": "Merge",
+    "target": "Target",
+    "state": "Status",
+    "due": "Due",
 }
 _INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
 
@@ -590,11 +590,11 @@ def _indicator_specs(items, columns):
     return [
         (
             key,
-            _INDICATOR_LABELS.get(key, key.replace("_", " ").upper()),
+            _INDICATOR_LABELS.get(key, key.replace("_", " ").title()),
             min(
                 max_widths.get(key, float("inf")),
                 max(
-                    len(_INDICATOR_LABELS.get(key, key.replace("_", " ").upper())),
+                    len(_INDICATOR_LABELS.get(key, key.replace("_", " ").title())),
                     max(
                         (len(item.get("indicators", {}).get(key, "—")) for item in items),
                         default=0,
@@ -708,7 +708,7 @@ _DEFAULT_DASHBOARD_GROUPS = (
     {
         "name": "Pull Requests",
         "match": {"kinds": ["pull_request"]},
-        "columns": ["draft", "target", "state"],
+        "columns": ["state"],
     },
     {"name": "Issues", "match": {"kinds": ["issue"]}, "columns": ["state"]},
     {"name": "Reminders", "match": {"kinds": ["reminder"]}, "columns": ["state"]},

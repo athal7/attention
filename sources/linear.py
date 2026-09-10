@@ -154,8 +154,8 @@ query AssignedIssues($after: String) {
             "details": f"Blocked by {blocker_identifier}: {blocker_title}" if blocker_identifier else "",
             "indicators": {
                 "state": (
-                    f"Blocked ❌" if blocker_identifier or "block" in state.lower()
-                    else f"{state.title()} ⏳"
+                    "Blocked" if blocker_identifier or "block" in state.lower()
+                    else state.title()
                 ),
             },
             "weight": weight,

@@ -113,10 +113,10 @@ def fetch(config):
             "details": time_tag,
             "indicators": {
                 "state": (
-                    "Now ⏳" if status == "NOW"
-                    else "Soon ⏳" if status == "SOON"
-                    else "Past ❌" if status == "PAST"
-                    else "Upcoming ✅"
+                    "Now" if status == "NOW"
+                    else "Soon" if status == "SOON"
+                    else "Past" if status == "PAST"
+                    else "Upcoming"
                 ),
             },
             "weight": weight,

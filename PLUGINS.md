@@ -80,9 +80,9 @@ omitted.
 }
 ```
 
-`indicators` holds visible table values. The shared `state` key should contain
-a short status label and an inline result emoji, such as `Ready ✅`,
-`Blocked ❌`, or `Review ⏳`. Bundled sources provide this key so mixed-source
+`indicators` holds visible table values. Indicator values should use text
+instead of icons. The shared `state` key should contain a short label such as
+`Ready`, `Blocked`, or `Review requested`. Bundled sources provide this key so
 groups remain one status column wide. Source-specific groups can select detail
 keys such as `ci`, `draft`, `review`, `merge`, and `target`.
 

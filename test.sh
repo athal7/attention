@@ -2015,10 +2015,10 @@ detail['baseRefName'] = 'main'
 detail['mergeable'] = 'CONFLICTING'
 print(json.dumps(p._pr_indicators(detail, False), sort_keys=True))
 ")"
-  check "draft PR shows its draft flag, target branch, passed CI, approval, and mergeable state" \
-    "$(sed -n 1p <<<"$out")" '{"ci": "\u2713", "draft": "\u2713", "merge": "\u2713", "review": "\u2713", "target": "feature/base"}'
-  check "ready PR clears its draft flag and shows its target branch and failing states" \
-    "$(sed -n 2p <<<"$out")" '{"ci": "\u00d7", "draft": "\u2014", "merge": "\u00d7", "review": "\u00d7", "target": "main"}'
+  check "draft PR uses text for its draft, target, CI, review, and merge indicators" \
+    "$(sed -n 1p <<<"$out")" '{"ci": "Passed", "draft": "Yes", "merge": "Ready", "review": "Approved", "target": "feature/base"}'
+  check "ready PR uses text for its target branch and failing indicators" \
+    "$(sed -n 2p <<<"$out")" '{"ci": "Failed", "draft": "No", "merge": "Conflict", "review": "Changes", "target": "main"}'
 }
 test_pull_request_indicators_show_draft_and_target_branch
 
@@ -2027,15 +2027,16 @@ test_github_pull_requests_link_visible_stack_parents() {
   out="$(python3 -c "
 $(load_plugin_py github)
 p._fetch_raw = lambda config: [
-    {'number': 10, 'title': 'Base', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'review_request', 'baseRefName': 'main', 'headRefName': 'feature/base'},
-    {'number': 11, 'title': 'Child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'review_request', 'isDraft': True, 'baseRefName': 'feature/base', 'headRefName': 'feature/child'},
+    {'number': 10, 'title': 'Base', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'baseRefName': 'main', 'headRefName': 'feature/base'},
+    {'number': 11, 'title': 'Child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'attention_reasons': ['Checks Failing'], 'baseRefName': 'feature/base', 'headRefName': 'feature/child'},
+    {'number': 12, 'title': 'Draft child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'attention_reasons': ['Changes Requested'], 'isDraft': True, 'baseRefName': 'feature/base', 'headRefName': 'feature/draft'},
 ]
 p._repo_dir_index = lambda code_dir: {}
 items = p.fetch({})
-print([(item['title'], item['indicators']['draft'], item['indicators']['target'], item['indicators']['state'], item.get('parent_identity_key')) for item in items])
+print([(item['title'], item['indicators']['state'], item.get('parent_identity_key')) for item in items])
 ")"
-  check "GitHub items expose draft only as a flag, show the target, and link a visible stack child" \
-    "$out" "[('Base', '—', 'main', 'Review ⏳', None), ('Child', '✓', 'feature/base', 'Review ⏳', 'github:owner/repo#10')]"
+  check "GitHub items keep their status while stack relationships drive the tree" \
+    "$out" "[('Base', 'Ready', None), ('Child', 'CI failing', 'github:owner/repo#10'), ('Draft child', 'Draft', 'github:owner/repo#10')]"
 }
 test_github_pull_requests_link_visible_stack_parents
 
@@ -2137,7 +2138,7 @@ print(json.dumps({
     *) bad "Linear issues outrank a cross-linked host's status on merge (got: $out)" ;;
   esac
   case "$out" in
-    *'"indicators": {"state": "In Progress \u23f3"}'*'"kind": "issue"'*)
+    *'"indicators": {"state": "In Progress"}'*'"kind": "issue"'*)
       ok "Linear issues expose an issue type and state indicator" ;;
     *) bad "Linear issues expose an issue type and state indicator (got: $out)" ;;
   esac
@@ -2575,7 +2576,7 @@ $LOAD_DASHBOARD
 items = [{
     'status': 'NEEDS ATTENTION', 'context': 'myorg/kb', 'title': 'Fix the login bug',
     'details': '', 'weight': 90, 'id': '42',
-    'indicators': {'ci': '✓', 'ready': '✓', 'review': '×', 'stacked': '✓'},
+    'indicators': {'ci': 'Passed', 'ready': 'Yes', 'review': 'Changes', 'stacked': 'Yes'},
     'actions': [{'key': 'o', 'label': 'open', 'primary': True, 'payload': {}}],
 }]
 rows = m.render_dashboard_rows(items, ['ci', 'ready', 'review', 'stacked'])
@@ -2585,14 +2586,14 @@ metadata = m.json.loads(fields[4])
 print(metadata['columns'])
 header = d.CursesPresenter()._indicator_header(rows)
 print(header)
-print(header.index('CI') == fields[0].index('✓'))
+print(header.index('CI') == fields[0].index('Passed'))
 ")"
   check "dashboard indicator rows add one metadata field for their shared table columns" \
     "$(sed -n 1p <<<"$out")" "5"
   check "dashboard indicator metadata keeps the shared table definition" \
-    "$(sed -n 2p <<<"$out")" "[['CI', 2], ['READY', 5], ['REVIEW', 6], ['STACKED', 7]]"
+    "$(sed -n 2p <<<"$out")" "[['CI', 6], ['Ready', 5], ['Review', 7], ['Stacked', 7]]"
   check "curses dashboard places the shared indicator table header above its cells" \
-    "$(sed -n 3p <<<"$out" | sed 's/^ *//')" "CI  READY  REVIEW  STACKED"
+    "$(sed -n 3p <<<"$out" | sed 's/^ *//')" "CI      Ready  Review   Stacked"
   check "dashboard indicator values follow the item content" \
     "$(sed -n 4p <<<"$out")" "True"
 }
@@ -3856,10 +3857,45 @@ print(groups[0]['columns'])
     "$(sed -n 2p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events', 'Other']"
   check "default dashboard groups route each built-in item type to its own section" \
     "$(sed -n 3p <<<"$out")" "['Pull Requests', 'Issues', 'Reminders', 'Events']"
-  check "default pull request group shows draft flag, target branch, and state" \
-    "$(sed -n 4p <<<"$out")" "['draft', 'target', 'state']"
+  check "default pull request group uses one status column" \
+    "$(sed -n 4p <<<"$out")" "['state']"
 }
 test_default_dashboard_groups_items_by_type
+
+test_custom_groups_default_to_one_status_column() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, error = m.dashboard_groups({
+    'dashboard': {
+        'groups': [
+            {'name': 'Work GitHub', 'match': {'plugins': ['github']}},
+            {'name': 'Other', 'fallback': True},
+        ],
+    },
+})
+pull_request = {
+    'status': 'S', 'context': 'owner/repo', 'title': 'PR', 'details': '',
+    'weight': 1, 'kind': 'pull_request', '_plugin': 'github',
+    'indicators': {'draft': '—', 'target': 'main', 'state': 'Review requested'},
+    'actions': [],
+}
+issue = {
+    'status': 'S', 'context': 'owner/repo', 'title': 'Issue', 'details': '',
+    'weight': 1, 'kind': 'issue', '_plugin': 'github',
+    'indicators': {'state': 'Open'}, 'actions': [],
+}
+pr_rows = m.render_grouped_dashboard_rows([pull_request], groups)
+mixed_rows = m.render_grouped_dashboard_rows([pull_request, issue], groups)
+print([column[0] for column in m.json.loads(pr_rows[0].split(chr(9))[4])['columns']])
+print([column[0] for column in m.json.loads(mixed_rows[0].split(chr(9))[4])['columns']])
+")"
+  check "custom pull request group defaults to one title-case status column" \
+    "$(sed -n 1p <<<"$out")" "['Status']"
+  check "custom mixed-kind group keeps the same status column" \
+    "$(sed -n 2p <<<"$out")" "['Status']"
+}
+test_custom_groups_default_to_one_status_column
 
 test_pull_request_stacks_render_as_trees() {
   local out

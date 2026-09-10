@@ -131,32 +131,32 @@ def _pr_indicators(detail, is_draft):
     complete_checks = {"SUCCESS", "NEUTRAL", "SKIPPED"}
     conclusions = {check.get("conclusion") for check in checks}
     if conclusions & failing_checks:
-        ci = "×"
+        ci = "Failed"
     elif checks and conclusions <= complete_checks:
-        ci = "✓"
+        ci = "Passed"
     elif checks:
-        ci = "…"
+        ci = "Running"
     else:
-        ci = "—"
+        ci = "None"
 
     review_states = {review.get("state") for review in detail.get("latestReviews") or []}
     if "CHANGES_REQUESTED" in review_states:
-        review = "×"
+        review = "Changes"
     elif "COMMENTED" in review_states:
-        review = "!"
+        review = "Commented"
     elif detail.get("reviewDecision") == "APPROVED":
-        review = "✓"
+        review = "Approved"
     elif detail.get("reviewRequests") or detail.get("reviewDecision") == "REVIEW_REQUIRED":
-        review = "…"
+        review = "Requested"
     else:
-        review = "—"
+        review = "None"
 
     mergeable = detail.get("mergeable")
-    merge = "×" if mergeable == "CONFLICTING" else "✓" if mergeable == "MERGEABLE" else "…"
+    merge = "Conflict" if mergeable == "CONFLICTING" else "Ready" if mergeable == "MERGEABLE" else "Unknown"
 
     return {
         "ci": ci,
-        "draft": "✓" if is_draft else "—",
+        "draft": "Yes" if is_draft else "No",
         "review": review,
         "merge": merge,
         "target": detail.get("baseRefName") or "—",
@@ -173,24 +173,26 @@ def _apply_pr_detail(pr, detail):
     pr["headRefName"] = detail.get("headRefName") or ""
     pr["indicators"] = _pr_indicators(detail, pr["isDraft"])
 
-def _status_badge(gtype, reasons, review_requested):
+def _status_label(gtype, reasons, review_requested, is_draft):
+    if is_draft:
+        return "Draft"
     if "Merge Conflict" in reasons:
-        return "Merge ❌"
+        return "Merge conflict"
     if "Changes Requested" in reasons:
-        return "Changes ❌"
+        return "Changes requested"
     if "Checks Failing" in reasons:
-        return "CI ❌"
+        return "CI failing"
     if "Review Commented" in reasons:
-        return "Reply ⏳"
+        return "Reply needed"
     if gtype == "review_request" or review_requested:
-        return "Review ⏳"
+        return "Review requested"
     if gtype == "assigned_issue":
-        return "Assigned ⏳"
+        return "Assigned"
     if gtype == "repo_issue":
-        return "Triage ⏳"
+        return "Triage"
     if gtype == "notification":
-        return "Reply ⏳"
-    return "Ready ✅"
+        return "Reply needed"
+    return "Ready"
 
 
 def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
@@ -691,16 +693,17 @@ def fetch(config):
         indicators = dict(g.get("indicators") or {})
         if is_pull_request and not indicators:
             indicators = {
-                "ci": "—",
-                "draft": "✓" if is_draft else "—",
-                "review": "…" if gtype == "review_request" else "—",
-                "merge": "…",
+                "ci": "None",
+                "draft": "Yes" if is_draft else "No",
+                "review": "Requested" if gtype == "review_request" else "None",
+                "merge": "Unknown",
                 "target": g.get("baseRefName") or "—",
             }
-        indicators["state"] = _status_badge(
+        indicators["state"] = _status_label(
             gtype,
             g.get("attention_reasons", []),
             bool(g.get("reviewRequested")),
+            is_draft,
         )
         kind = (
             "pull_request" if is_pull_request

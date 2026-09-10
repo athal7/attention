@@ -74,7 +74,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "linear":    { "apiToken": "lin_api_..." },
   "dashboard": {
     "groups": [
-      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["draft", "target", "state"] },
+      { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["state"] },
       { "name": "Needs Attention", "match": { "statuses": ["OVERDUE"] }, "columns": ["due"] },
       { "name": "My Repositories", "match": { "contextPrefixes": ["athal7/"] } },
       { "name": "Ready for Something New", "fallback": true }
@@ -111,13 +111,13 @@ group wins; the fallback receives every remaining item. Invalid grouping
 configuration emits a warning and uses the existing flat dashboard, so it
 cannot hide attention items.
 
-Each group can select a different table with `columns`. Most bundled groups
-use one compact `state` column. Its value combines a short status label with
-`✅`, `❌`, or `⏳`, such as `Ready ✅`, `Merge ❌`, or `Review ⏳`. The default
-pull request group also shows a `draft` flag and the PR's `target` branch.
-A group without explicit columns uses `state` when it is available, which
-keeps mixed-source views narrow. GitHub pull requests also provide `ci`,
-`review`, and `merge`. Missing values render as `—`.
+Each group can select a different table with `columns`. Bundled groups use one
+compact `state` column by default. Its value is a short status label such as
+`Ready`, `Draft`, `CI failing`, or `Review requested`. `Draft` replaces less
+relevant failure or review labels. Pull request stacks are shown by the row
+tree instead of the status. Status and indicator values use text instead of
+icons. GitHub pull requests also provide optional `ci`, `draft`,
+`review`, `merge`, and `target` indicators for explicit column configurations.
 
 ## What each bundled plugin surfaces
 
