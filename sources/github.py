@@ -16,6 +16,7 @@ attention" review-comment check, which otherwise ignores every
 reviewer GitHub's GraphQL API reports as a Bot actor.
 """
 import concurrent.futures
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -44,9 +45,10 @@ def _pr_key(pr):
     return repo.casefold(), str(number)
 
 
-def _fetch_pr_detail(repo, number):
+def _fetch_pr_detail(repo, number, include_commits=False):
+    fields = _PR_DETAIL_FIELDS + (",commits" if include_commits else "")
     detail = _gh_json([
-        "pr", "view", str(number), "-R", repo, "--json", _PR_DETAIL_FIELDS,
+        "pr", "view", str(number), "-R", repo, "--json", fields,
     ])
     return detail if isinstance(detail, dict) else None
 
@@ -123,6 +125,33 @@ def _fetch_review_bot_flags(repo, number):
             flags[login] = author.get("__typename") == "Bot"
     return flags
 
+
+def _parse_github_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+
+
+def _latest_commit_at(detail):
+    timestamps = [
+        timestamp
+        for commit in detail.get("commits") or []
+        if (timestamp := _parse_github_timestamp(commit.get("committedDate"))) is not None
+    ]
+    return max(timestamps, default=None)
+
+
+def _review_is_superseded(review, latest_commit_at):
+    submitted_at = _parse_github_timestamp(review.get("submittedAt"))
+    return (
+        submitted_at is not None
+        and latest_commit_at is not None
+        and submitted_at <= latest_commit_at
+    )
 
 
 def _pr_indicators(detail, is_draft):
@@ -235,6 +264,32 @@ def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
     return pr
 
 
+def _should_suppress_bot_review_notification(
+    detail, repo, number, expected_author, bot_review_allowlist,
+):
+    latest_commit_at = _latest_commit_at(detail)
+    bot_flags = _fetch_review_bot_flags(repo, number)
+    suppress = False
+    for review in detail.get("latestReviews") or []:
+        if review.get("state") != "COMMENTED":
+            continue
+        reviewer = review.get("author", {}).get("login") or ""
+        if not reviewer or reviewer.casefold() == expected_author.casefold():
+            continue
+        reviewer_cf = reviewer.casefold()
+        is_bot = bot_flags.get(reviewer_cf)
+        if is_bot is None:
+            is_bot = _is_bot_login(reviewer)
+        if not is_bot:
+            return False
+        canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
+        if canonical in bot_review_allowlist or reviewer_cf in bot_review_allowlist:
+            if not _review_is_superseded(review, latest_commit_at):
+                return False
+        suppress = True
+    return suppress
+
+
 def _fetch_pr_attention(
     author, detail_pool, bot_review_allowlist=frozenset(),
     current_login=None, detail_lookup=None,
@@ -276,7 +331,7 @@ def _fetch_my_repo_issues():
     return [issue for issue in issues or [] if not issue.get("assignees")]
 
 
-def _fetch_notifications():
+def _fetch_notifications(current_login=None, bot_review_allowlist=frozenset()):
     """Unread notifications from `gh api /notifications`. Covers reasons
     the search-based queries above miss: `mention` (direct mentions),
     `author` (comments on PRs I authored that aren't review comments),
@@ -366,6 +421,26 @@ def _fetch_notifications():
                     info = subject_info if isinstance(subject_info, dict) else {}
                     state = info.get("state")
                     if not (isinstance(state, str) and state and state != "open"):
+                        # GitHub review notifications omit latest_comment_url.
+                        # Keep human comments actionable, but apply the bot
+                        # allowlist and newer-commit check to review comments.
+                        if (
+                            subject_type == "PullRequest"
+                            and not latest_comment_url
+                            and notif.get("reason") == "author"
+                        ):
+                            detail = _fetch_pr_detail(repo_name, number, include_commits=True)
+                            if (
+                                detail is not None
+                                and _should_suppress_bot_review_notification(
+                                    detail,
+                                    repo_name,
+                                    number,
+                                    current_login or "",
+                                    bot_review_allowlist,
+                                )
+                            ):
+                                return None
                         item = {
                             "number": number,
                             "title": title,
@@ -473,7 +548,9 @@ def _fetch_raw(config):
             "--json", "number,title,repository,url,createdAt",
         ])
         repo_future = pool.submit(_fetch_my_repo_issues)
-        notification_future = pool.submit(_fetch_notifications)
+        notification_future = pool.submit(
+            _fetch_notifications, current_login, bot_review_allowlist,
+        )
 
         review_candidates = review_future.result()
         authored_candidates = authored_future.result()
