@@ -16,23 +16,73 @@ attention" review-comment check, which otherwise ignores every
 reviewer GitHub's GraphQL API reports as a Bot actor.
 """
 import concurrent.futures
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+import math
 import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 _MAX_WORKERS = 8
-
 _MAX_PR_DETAIL_WORKERS = 32
+_SNAPSHOT_TTL_SECONDS = 60
+_NOTIFICATION_REASONS = {
+    "mention", "team_mention", "author", "comment", "manual", "subscribed",
+}
+
 _PR_DETAIL_FIELDS = (
     "mergeable,reviewDecision,statusCheckRollup,latestReviews,"
     "closingIssuesReferences,isDraft,reviewRequests,baseRefName,headRefName"
 )
+_PR_GRAPHQL_SELECTION = """
+pullRequest(number: %d) {
+  mergeable
+  reviewDecision
+  isDraft
+  baseRefName
+  headRefName
+  reviewRequests(first: 50) {
+    nodes {
+      requestedReviewer {
+        __typename
+        ... on User { login }
+        ... on Bot { login }
+        ... on Team { name }
+      }
+    }
+  }
+  latestReviews(first: 50) {
+    nodes {
+      state
+      submittedAt
+      author { login __typename }
+    }
+  }
+  closingIssuesReferences(first: 50) {
+    nodes { number repository { nameWithOwner } }
+  }
+  commits(last: 1) {
+    nodes { commit { committedDate } }
+  }
+  statusCheckRollup {
+    contexts(first: 100) {
+      nodes {
+        ... on CheckRun { conclusion }
+        ... on StatusContext { state }
+      }
+    }
+  }
+}
+"""
 _repo_dir_indexes = {}
 _repo_dir_indexes_lock = threading.Lock()
 
@@ -43,6 +93,140 @@ def _pr_key(pr):
     if not repo or number is None:
         return None
     return repo.casefold(), str(number)
+
+
+def _normalize_pr_detail(detail):
+    if not isinstance(detail, dict):
+        return None
+
+    reviews_payload = detail.get("latestReviews") or []
+    reviews = (
+        reviews_payload.get("nodes", [])
+        if isinstance(reviews_payload, dict)
+        else reviews_payload
+    )
+    reviews = [review for review in reviews if isinstance(review, dict)]
+    bot_flags = {}
+    for review in reviews:
+        author = review.get("author") or {}
+        login = (author.get("login") or "").casefold()
+        if login and author.get("__typename") in {"Bot", "User", "Organization"}:
+            bot_flags[login] = author["__typename"] == "Bot"
+
+    check_payload = detail.get("statusCheckRollup") or []
+    check_nodes = (
+        check_payload.get("contexts", {}).get("nodes", [])
+        if isinstance(check_payload, dict)
+        else check_payload
+    )
+    state_to_conclusion = {
+        "SUCCESS": "SUCCESS",
+        "FAILURE": "FAILURE",
+        "ERROR": "ERROR",
+    }
+    checks = []
+    for node in check_nodes or []:
+        if not isinstance(node, dict):
+            continue
+        conclusion = node.get("conclusion")
+        if conclusion is None:
+            conclusion = state_to_conclusion.get(node.get("state"))
+        checks.append({"conclusion": conclusion})
+
+    review_request_payload = detail.get("reviewRequests") or []
+    review_request_nodes = (
+        review_request_payload.get("nodes", [])
+        if isinstance(review_request_payload, dict)
+        else review_request_payload
+    )
+    closing_payload = detail.get("closingIssuesReferences") or []
+    closing_nodes = (
+        closing_payload.get("nodes", [])
+        if isinstance(closing_payload, dict)
+        else closing_payload
+    )
+    commit_payload = detail.get("commits") or []
+    commit_nodes = (
+        commit_payload.get("nodes", [])
+        if isinstance(commit_payload, dict)
+        else commit_payload
+    )
+    return {
+        "mergeable": detail.get("mergeable"),
+        "reviewDecision": detail.get("reviewDecision"),
+        "isDraft": detail.get("isDraft", False),
+        "baseRefName": detail.get("baseRefName") or "",
+        "headRefName": detail.get("headRefName") or "",
+        "reviewRequests": [
+            node.get("requestedReviewer", node)
+            for node in review_request_nodes
+            if isinstance(node, dict) and node.get("requestedReviewer", node)
+        ],
+        "latestReviews": reviews,
+        "closingIssuesReferences": [
+            node for node in closing_nodes if isinstance(node, dict)
+        ],
+        "commits": [
+            {"committedDate": node.get("commit", node).get("committedDate")}
+            for node in commit_nodes
+            if isinstance(node, dict) and node.get("commit", node).get("committedDate")
+        ],
+        "statusCheckRollup": checks,
+        "_bot_flags": bot_flags,
+    }
+
+
+def _fetch_pr_details(prs):
+    """Fetch all candidate PR details in one GraphQL request.
+
+    GitHub CLI starts a new process for every `gh pr view` invocation. A
+    single aliased GraphQL query keeps the same detail fields while avoiding
+    that per-PR process and network overhead.
+    """
+    grouped = {}
+    for pr in prs:
+        key = _pr_key(pr)
+        if key is None:
+            continue
+        try:
+            number = int(pr["number"])
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(pr["repository"]["nameWithOwner"], []).append((key, number))
+    if not grouped:
+        return {}
+
+    query = ["query {"]
+    for repo_index, (repo, entries) in enumerate(grouped.items()):
+        owner, _, name = repo.partition("/")
+        if not owner or not name:
+            continue
+        query.append(
+            f"r{repo_index}: repository(owner: {json.dumps(owner)}, "
+            f"name: {json.dumps(name)}) {{"
+        )
+        for entry_index, (key, number) in enumerate(entries):
+            alias = f"p{repo_index}_{entry_index}"
+            query.append(f"{alias}: {_PR_GRAPHQL_SELECTION % number}")
+        query.append("}")
+    query.append("}")
+    try:
+        result = _gh_json(["api", "graphql", "-f", "query=" + "".join(query)])
+    except Exception:
+        return {}
+    data = (result or {}).get("data") if isinstance(result, dict) else None
+    if not isinstance(data, dict):
+        return {}
+
+    details = {}
+    for repo_index, (repo, entries) in enumerate(grouped.items()):
+        repository = data.get(f"r{repo_index}") or {}
+        for entry_index, (key, _number) in enumerate(entries):
+            raw = repository.get(f"p{repo_index}_{entry_index}")
+            detail = _normalize_pr_detail(raw)
+            if detail is not None:
+                details[key] = detail
+    return details
 
 
 def _fetch_pr_detail(repo, number, include_commits=False):
@@ -60,17 +244,284 @@ def _body_association_keys(body):
     ]
 
 
-def _gh_json(args):
-    """Run `gh <args...>` and parse its stdout as JSON, returning [] on
-    any failure (non-zero exit, timeout, malformed JSON).
+class GitHubFetchError(RuntimeError):
+    """A required GitHub request did not produce complete JSON."""
+
+
+def _gh_json(args, *, required=False):
+    """Run `gh <args...>` and parse JSON.
+
+    Tolerant callers receive [] on failure. Required callers raise so a
+    failed refresh cannot replace a last-good snapshot.
     """
     try:
         res = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=30)
         if res.returncode != 0:
-            return []
+            raise GitHubFetchError(f"gh {' '.join(args)} exited {res.returncode}")
         return json.loads(res.stdout or "[]")
-    except Exception:
+    except Exception as exc:
+        if required:
+            raise GitHubFetchError(f"gh {' '.join(args)} failed: {exc}") from exc
         return []
+
+
+def _required_gh_json(args):
+    """Call the required path while keeping direct-plugin test doubles usable."""
+    try:
+        return _gh_json(args, required=True)
+    except TypeError:
+        return _gh_json(args)
+
+
+def _snapshot_config(config):
+    github = config.get("github", {}) if isinstance(config, dict) else {}
+    track_authors = github.get("trackAuthors", []) if isinstance(github, dict) else []
+    allowlist = github.get("botReviewAllowlist", []) if isinstance(github, dict) else []
+    return {
+        "GH_HOST": os.environ.get("GH_HOST", "github.com"),
+        "botReviewAllowlist": sorted(
+            {str(login).casefold() for login in allowlist if isinstance(login, str)}
+        ),
+        "trackAuthors": list(track_authors) if isinstance(track_authors, list) else [],
+    }
+
+
+def _snapshot_key(config):
+    canonical = json.dumps(
+        _snapshot_config(config), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _snapshot_cache_dir():
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    directory = root / "attention"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    return directory
+
+
+def _snapshot_path_for_key(key):
+    return _snapshot_cache_dir() / f"github-snapshot-v1-{key}.json"
+
+
+def _snapshot_path(config):
+    return _snapshot_path_for_key(_snapshot_key(config))
+
+
+def _refresh_lock_path(key):
+    return _snapshot_cache_dir() / f"github-refresh-v1-{key}.lock"
+
+
+def _snapshot_timestamp(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _valid_notification_cursor(value):
+    timestamp = _parse_github_timestamp(value)
+    return timestamp is not None and timestamp.utcoffset() == timedelta(0)
+
+
+def _read_snapshot(config):
+    try:
+        with _snapshot_path(config).open(encoding="utf-8") as source:
+            snapshot = json.load(source)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        return None
+    if _snapshot_timestamp(snapshot.get("refreshed_at")) is None:
+        return None
+    if not _valid_notification_cursor(snapshot.get("notification_cursor")):
+        return None
+    for name in ("search_items", "notification_items"):
+        if not isinstance(snapshot.get(name), list):
+            return None
+        if not all(isinstance(item, dict) for item in snapshot[name]):
+            return None
+    return snapshot
+
+
+def _write_snapshot(config, snapshot):
+    directory = _snapshot_cache_dir()
+    target = _snapshot_path(config)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=directory,
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(snapshot, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _snapshot_config_from_environment():
+    try:
+        value = json.loads(os.environ["ATTENTION_GITHUB_REFRESH_CONFIG"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubFetchError("invalid refresh configuration") from exc
+    if not isinstance(value, dict):
+        raise GitHubFetchError("invalid refresh configuration")
+    expected = {"GH_HOST", "botReviewAllowlist", "trackAuthors"}
+    if set(value) != expected:
+        raise GitHubFetchError("invalid refresh configuration")
+    if (
+        not isinstance(value["GH_HOST"], str)
+        or not isinstance(value["trackAuthors"], list)
+        or not isinstance(value["botReviewAllowlist"], list)
+        or not all(isinstance(author, str) for author in value["trackAuthors"])
+        or not all(isinstance(login, str) for login in value["botReviewAllowlist"])
+    ):
+        raise GitHubFetchError("invalid refresh configuration")
+    os.environ["GH_HOST"] = value["GH_HOST"]
+    return {
+        "github": {
+            "trackAuthors": value["trackAuthors"],
+            "botReviewAllowlist": value["botReviewAllowlist"],
+        },
+    }
+
+
+def _spawn_snapshot_refresh(config):
+    key = _snapshot_key(config)
+    descriptor = os.open(_refresh_lock_path(key), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return False
+    try:
+        refresh_config = json.dumps(
+            _snapshot_config(config), sort_keys=True, separators=(",", ":"),
+        )
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--refresh-snapshot"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            pass_fds=(descriptor,),
+            env={**os.environ, "ATTENTION_GITHUB_REFRESH_CONFIG": refresh_config},
+        )
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _compose_raw(search_items, notification_items):
+    """Combine the two snapshot streams with search as the display winner."""
+    combined = [dict(item) for item in search_items]
+    by_subject = {}
+    for item in combined:
+        key = _pr_key(item)
+        if key is not None:
+            by_subject[key] = item
+    for notification in notification_items:
+        notification = dict(notification)
+        notification_id = notification.get("notification_id")
+        ids = [str(thread_id) for thread_id in notification.get("notification_ids", [])]
+        if isinstance(notification_id, (str, int)):
+            ids.insert(0, str(notification_id))
+        key = _pr_key(notification)
+        winner = by_subject.get(key) if key is not None else None
+        if winner is None:
+            if key is not None:
+                by_subject[key] = notification
+            winner = notification
+            combined.append(winner)
+        target_ids = winner.setdefault("notification_ids", [])
+        for thread_id in ids:
+            if thread_id not in target_ids:
+                target_ids.append(thread_id)
+        if target_ids and "notification_id" not in winner:
+            winner["notification_id"] = target_ids[0]
+    return combined
+
+
+def _merge_notification_delta(previous_items, delta_items):
+    """Update the persistent notification queue without dropping absent rows."""
+    merged = []
+    indexes = {}
+    for item in previous_items:
+        thread_id = str(item.get("notification_id", ""))
+        if thread_id and thread_id not in indexes:
+            indexes[thread_id] = len(merged)
+            merged.append(dict(item))
+    removed = set()
+    for item in delta_items:
+        thread_id = str(item.get("notification_id", ""))
+        if not thread_id:
+            continue
+        if item.get("_remove"):
+            removed.add(thread_id)
+            continue
+        if thread_id in indexes:
+            merged[indexes[thread_id]] = dict(item)
+        else:
+            indexes[thread_id] = len(merged)
+            merged.append(dict(item))
+    return [
+        item for item in merged
+        if str(item.get("notification_id", "")) not in removed
+    ]
+
+
+def _refresh_snapshot(config):
+    previous = _read_snapshot(config) or {}
+    previous_notifications = previous.get("notification_items", [])
+    cursor = previous.get("notification_cursor")
+    github = config.get("github", {}) if isinstance(config, dict) else {}
+    allowlist = frozenset(
+        login.casefold()
+        for login in github.get("botReviewAllowlist", [])
+        if isinstance(login, str)
+    )
+    current_login = _get_gh_login()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        search_future = pool.submit(_fetch_search_items, config, current_login, allowlist)
+        notification_future = pool.submit(
+            _fetch_notification_delta, current_login, allowlist, cursor,
+        )
+        search_items = search_future.result()
+        delta_items, next_cursor = notification_future.result()
+    snapshot = {
+        "version": 1,
+        "refreshed_at": time.time(),
+        "notification_cursor": next_cursor,
+        "search_items": search_items,
+        "notification_items": _merge_notification_delta(
+            previous_notifications, delta_items,
+        ),
+    }
+    _write_snapshot(config, snapshot)
+    return _compose_raw(snapshot["search_items"], snapshot["notification_items"])
+
+
+def _fetch_cached_raw(config):
+    snapshot = _read_snapshot(config)
+    if snapshot is not None:
+        if time.time() - snapshot["refreshed_at"] >= _SNAPSHOT_TTL_SECONDS:
+            _spawn_snapshot_refresh(config)
+        return _compose_raw(
+            snapshot["search_items"], snapshot["notification_items"],
+        )
+    return _refresh_snapshot(config)
 
 
 def _get_gh_login():
@@ -222,8 +673,6 @@ def _status_label(gtype, reasons, review_requested, is_draft):
     if gtype == "notification":
         return "Reply needed"
     return "Ready"
-
-
 def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
     key = _pr_key(pr)
     if key is None or detail is None:
@@ -231,7 +680,7 @@ def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
     repo, number = pr["repository"]["nameWithOwner"], pr["number"]
     reasons = []
     latest_review_states = set()
-    bot_flags = None
+    bot_flags = detail.get("_bot_flags")
     for review in detail.get("latestReviews") or []:
         reviewer = review.get("author", {}).get("login") or ""
         if not reviewer or reviewer.casefold() == expected_author.casefold():
@@ -268,7 +717,9 @@ def _should_suppress_bot_review_notification(
     detail, repo, number, expected_author, bot_review_allowlist,
 ):
     latest_commit_at = _latest_commit_at(detail)
-    bot_flags = _fetch_review_bot_flags(repo, number)
+    bot_flags = detail.get("_bot_flags")
+    if bot_flags is None:
+        bot_flags = _fetch_review_bot_flags(repo, number)
     suppress = False
     for review in detail.get("latestReviews") or []:
         if review.get("state") != "COMMENTED":
@@ -288,6 +739,7 @@ def _should_suppress_bot_review_notification(
                 return False
         suppress = True
     return suppress
+
 
 
 def _fetch_pr_attention(
@@ -322,153 +774,278 @@ def _fetch_pr_attention(
     ]
 
 
-def _fetch_my_repo_issues():
+def _fetch_my_repo_issues(required=False):
     """Return only unassigned issues in owned repositories for triage."""
-    issues = _gh_json([
+    request = [
         "search", "issues", "--owner=@me", "--state=open", "--archived=false", "--limit", "50",
         "--json", "number,title,repository,url,createdAt,assignees",
-    ])
+    ]
+    issues = _required_gh_json(request) if required else _gh_json(request)
     return [issue for issue in issues or [] if not issue.get("assignees")]
 
 
-def _fetch_notifications(current_login=None, bot_review_allowlist=frozenset()):
-    """Unread notifications from `gh api /notifications`. Covers reasons
-    the search-based queries above miss: `mention` (direct mentions),
-    `author` (comments on PRs I authored that aren't review comments),
-    `state_change` (state changes on PRs I'm subscribed to), and
-    `ci_activity` (CI failures on repos I watch). `review_requested`
-    notifications overlap with the review-requested search; de-dup
-    handles that.
+def _fetch_notification_state(notifications):
+    """Fetch notification repository and subject state in one GraphQL query."""
+    targets = {}
+    for notif in notifications:
+        subject = notif.get("subject") or {}
+        repo = (notif.get("repository") or {}).get("full_name", "")
+        if not repo:
+            continue
+        repo_targets = targets.setdefault(repo, set())
+        subject_url = subject.get("url") or ""
+        match = re.search(r"/(issues|pulls)/(\d+)$", subject_url)
+        if subject.get("type") not in {"Issue", "PullRequest"} or not match:
+            continue
+        subject_type = "PullRequest" if match.group(1) == "pulls" else "Issue"
+        repo_targets.add((subject_type, int(match.group(2))))
+    if not targets:
+        return {}, {}
 
-    Each notification subject maps to the same (repo, number) item
-    shape the search queries produce, so the shared de-dup logic works.
-    CheckSuite subjects have no number; they surface as CI-failure
-    items keyed by the repo alone with a synthetic number derived from
-    the title so they don't collide with real PRs/issues.
-    """
-    notifications = _gh_json(["api", "/notifications", "--paginate"])
-    if not notifications:
-        return []
-
-    # Phase 1: early filter to only mention/author, then batch-check
-    # archived repos in parallel (27 unique repos instead of 497 sequential).
-    filtered = [n for n in notifications if n.get("unread") and n.get("reason") in {"mention", "author"}]
-    repo_names = list({n.get("repository", {}).get("full_name", "") for n in filtered if n.get("repository", {}).get("full_name")})
-
-    def _check_archived(repo_name):
-        try:
-            repository = _gh_json(["api", f"repos/{repo_name}"])
-            return repo_name, repository.get("archived") is True if isinstance(repository, dict) else True
-        except Exception:
-            return repo_name, True
+    query = ["query {"]
+    target_aliases = {}
+    for repo_index, (repo, repo_targets) in enumerate(targets.items()):
+        owner, _, name = repo.partition("/")
+        if not owner or not name:
+            return None
+        query.append(
+            f"r{repo_index}: repository(owner: {json.dumps(owner)}, "
+            f"name: {json.dumps(name)}) {{ isArchived "
+        )
+        for target_index, (subject_type, number) in enumerate(sorted(repo_targets)):
+            alias = f"s{repo_index}_{target_index}"
+            field = "pullRequest" if subject_type == "PullRequest" else "issue"
+            query.append(
+                f"{alias}: {field}(number: {number}) {{ state "
+                + ("isDraft baseRefName headRefName " if subject_type == "PullRequest" else "")
+                + "}"
+            )
+            target_aliases[(repo, subject_type, number)] = alias
+        query.append("}")
+    query.append("}")
+    try:
+        result = _gh_json(["api", "graphql", "-f", "query=" + "".join(query)])
+    except Exception:
+        return None
+    data = (result or {}).get("data") if isinstance(result, dict) else None
+    if not isinstance(data, dict):
+        return None
 
     repository_archived = {}
-    if repo_names:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(repo_names), _MAX_WORKERS)) as pool:
-            for repo_name, archived in pool.map(_check_archived, repo_names):
-                repository_archived[repo_name] = archived
-
-    # Phase 2: two-pass approach. First pass collects CheckSuite items
-    # (no API call needed) and PR/Issue subjects that need state checks.
-    # Second pass batches all state checks in parallel.
-    items = []
-    subjects_to_check = []
-
-    for notif in filtered:
-        subject = notif.get("subject") or {}
-        repo_info = notif.get("repository") or {}
-        repo_name = repo_info.get("full_name", "")
-        if not repo_name or repository_archived.get(repo_name, True):
-            continue
-        subject_type = subject.get("type", "")
-        title = subject.get("title") or repo_name
-        subject_url = subject.get("url") or ""
-        latest_comment_url = subject.get("latest_comment_url") or ""
-
-        number = None
-        if subject_url:
-            m = re.search(r"/(issues|pulls)/(\d+)$", subject_url)
-            if m:
-                number = m.group(2)
-
-        if subject_type in {"PullRequest", "Issue"} and subject_url:
-            subjects_to_check.append((notif, subject_type, title, subject_url, latest_comment_url, number, repo_name))
-        elif subject_type == "CheckSuite":
-            # CI failure with no PR link. Build a synthetic number from
-            # the title so it de-duplicates against itself but never collides
-            # with a real PR/issue number.
-            hash_val = int(hashlib.md5(title.encode()).hexdigest(), 16) % (10**6)
-            items.append({
-                "number": f"ci-{hash_val}",
-                "title": title,
-                "repository": {"nameWithOwner": repo_name},
-                "url": repo_info.get("html_url", ""),
-                "type": "notification",
-                "subject_type": subject_type,
-                "notification_reason": notif.get("reason", ""),
-                "notification_id": notif.get("id", ""),
-                "latest_comment_url": "",
-                "createdAt": notif.get("updated_at", ""),
-            })
-
-    # Phase 3: batch-fetch state for all PR/Issue subjects in parallel.
-    if subjects_to_check:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as pool:
-            def _check_subject(s):
-                notif, subject_type, title, subject_url, latest_comment_url, number, repo_name = s
-                try:
-                    subject_info = _gh_json(["api", subject_url])
-                    info = subject_info if isinstance(subject_info, dict) else {}
-                    state = info.get("state")
-                    if not (isinstance(state, str) and state and state != "open"):
-                        # GitHub review notifications omit latest_comment_url.
-                        # Keep human comments actionable, but apply the bot
-                        # allowlist and newer-commit check to review comments.
-                        if (
-                            subject_type == "PullRequest"
-                            and not latest_comment_url
-                            and notif.get("reason") == "author"
-                        ):
-                            detail = _fetch_pr_detail(repo_name, number, include_commits=True)
-                            if (
-                                detail is not None
-                                and _should_suppress_bot_review_notification(
-                                    detail,
-                                    repo_name,
-                                    number,
-                                    current_login or "",
-                                    bot_review_allowlist,
-                                )
-                            ):
-                                return None
-                        item = {
-                            "number": number,
-                            "title": title,
-                            "repository": {"nameWithOwner": repo_name},
-                            "url": f"https://github.com/{repo_name}/issues/{number}" if subject_type == "Issue" else f"https://github.com/{repo_name}/pull/{number}",
-                            "type": "notification",
-                            "subject_type": subject_type,
-                            "notification_reason": notif.get("reason", ""),
-                            "notification_id": notif.get("id", ""),
-                            "latest_comment_url": latest_comment_url,
-                            "createdAt": notif.get("updated_at", ""),
-                        }
-                        if subject_type == "PullRequest":
-                            item["isDraft"] = bool(info.get("draft"))
-                            item["baseRefName"] = (info.get("base") or {}).get("ref", "")
-                            item["headRefName"] = (info.get("head") or {}).get("ref", "")
-                        return item
-                except Exception:
-                    pass
+    subject_state = {}
+    for repo_index, (repo, repo_targets) in enumerate(targets.items()):
+        repository = data.get(f"r{repo_index}")
+        if not isinstance(repository, dict):
+            return None
+        repository_archived[repo] = repository.get("isArchived") is True
+        for subject_type, number in sorted(repo_targets):
+            alias = target_aliases[(repo, subject_type, number)]
+            raw = repository.get(alias)
+            if not isinstance(raw, dict):
                 return None
+            base_ref = raw.get("baseRefName") or ""
+            head_ref = raw.get("headRefName") or ""
+            raw_state = raw.get("state")
+            subject_state[(repo, subject_type, number)] = {
+                "state": raw_state.lower() if isinstance(raw_state, str) else raw_state,
+                "draft": raw.get("isDraft"),
+                "base": {"ref": base_ref} if base_ref else {},
+                "head": {"ref": head_ref} if head_ref else {},
+            }
+    return repository_archived, subject_state
 
-            for item in pool.map(_check_subject, subjects_to_check):
-                if item is not None:
-                    items.append(item)
 
-    return items
+def _notification_state_key(notif):
+    subject = notif.get("subject") or {}
+    repo = (notif.get("repository") or {}).get("full_name", "")
+    match = re.search(r"/(issues|pulls)/(\d+)$", subject.get("url") or "")
+    if not repo or not match:
+        return None
+    subject_type = "PullRequest" if match.group(1) == "pulls" else "Issue"
+    return repo, subject_type, int(match.group(2))
+
+def _notification_browser_url(notification, subject_info):
+    subject = notification.get("subject") or {}
+    repository = notification.get("repository") or {}
+    return (
+        subject_info.get("html_url", "") if isinstance(subject_info, dict) else ""
+    ) or repository.get("html_url", "")
 
 
+def _notification_item(notification, subject_state=None, subject_info=None):
+    subject = notification.get("subject") or {}
+    repository = notification.get("repository") or {}
+    thread_id = str(notification.get("id", ""))
+    repo_name = repository.get("full_name", "")
+    subject_type = subject.get("type", "")
+    subject_url = subject.get("url") or ""
+    match = re.search(r"/(issues|pulls)/(\d+)$", subject_url)
+    if subject_type in {"Issue", "PullRequest"} and match:
+        number = match.group(2)
+        url = (
+            f"https://github.com/{repo_name}/issues/{number}"
+            if subject_type == "Issue"
+            else f"https://github.com/{repo_name}/pull/{number}"
+        )
+    else:
+        number = f"notification-{thread_id}"
+        url = _notification_browser_url(notification, subject_info)
+    item = {
+        "number": number,
+        "title": subject.get("title") or repo_name,
+        "repository": {"nameWithOwner": repo_name},
+        "url": url,
+        "type": "notification",
+        "subject_type": subject_type,
+        "notification_reason": notification.get("reason", ""),
+        "notification_id": thread_id,
+        "latest_comment_url": subject.get("latest_comment_url") or "",
+        "createdAt": notification.get("updated_at", ""),
+    }
+    if subject_type == "PullRequest" and isinstance(subject_state, dict):
+        item["isDraft"] = bool(subject_state.get("draft"))
+        item["baseRefName"] = (subject_state.get("base") or {}).get("ref", "")
+        item["headRefName"] = (subject_state.get("head") or {}).get("ref", "")
+    return item
+
+
+def _fetch_notification_delta(
+    current_login=None, bot_review_allowlist=frozenset(), since=None,
+):
+    """Fetch and validate a durable delta of unread notification threads."""
+    poll_started = datetime.now(timezone.utc)
+    args = ["api", "/notifications", "--method", "GET", "--paginate", "-f", "per_page=50"]
+    if since:
+        cursor = _parse_github_timestamp(since)
+        if cursor is None:
+            raise GitHubFetchError("invalid notification cursor")
+        replay_from = cursor - timedelta(seconds=60)
+        args.extend(["-f", f"since={replay_from.isoformat().replace('+00:00', 'Z')}"])
+    notifications = _required_gh_json(args)
+    if not isinstance(notifications, list):
+        raise GitHubFetchError("notification response was not a list")
+
+    outcomes = {}
+    accepted = []
+    for notification in notifications:
+        if not isinstance(notification, dict):
+            continue
+        thread_id = str(notification.get("id", ""))
+        if not thread_id:
+            continue
+        subject = notification.get("subject") or {}
+        repository = notification.get("repository") or {}
+        if (
+            not notification.get("unread")
+            or notification.get("reason") not in _NOTIFICATION_REASONS
+            or not isinstance(subject, dict)
+            or not isinstance(repository, dict)
+            or not repository.get("full_name")
+        ):
+            outcomes[thread_id] = {"notification_id": thread_id, "_remove": True}
+            continue
+        accepted.append(notification)
+
+    batched_state = _fetch_notification_state(accepted)
+    if batched_state is None:
+        repository_archived = {}
+        repo_names = sorted({
+            notification["repository"]["full_name"] for notification in accepted
+        })
+
+        def fetch_repository_state(repo_name):
+            try:
+                repository = _gh_json(["api", f"repos/{repo_name}"])
+            except Exception:
+                return repo_name, True
+            return (
+                repo_name,
+                repository.get("archived") is True if isinstance(repository, dict) else True,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(repo_names), _MAX_WORKERS) or 1,
+        ) as pool:
+            for repo_name, archived in pool.map(fetch_repository_state, repo_names):
+                repository_archived[repo_name] = archived
+        subject_state = {}
+    else:
+        repository_archived, subject_state = batched_state
+        unresolved_repositories = sorted({
+            notification["repository"]["full_name"]
+            for notification in accepted
+            if notification["repository"]["full_name"] not in repository_archived
+        })
+
+        def fetch_unresolved_repository(repo_name):
+            try:
+                repository = _gh_json(["api", f"repos/{repo_name}"])
+            except Exception:
+                return repo_name, True
+            return (
+                repo_name,
+                repository.get("archived") is True if isinstance(repository, dict) else True,
+            )
+
+        if unresolved_repositories:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(unresolved_repositories), _MAX_WORKERS),
+            ) as pool:
+                for repo_name, archived in pool.map(
+                    fetch_unresolved_repository, unresolved_repositories,
+                ):
+                    repository_archived[repo_name] = archived
+
+    def validate_notification(notification):
+        thread_id = str(notification["id"])
+        subject = notification["subject"]
+        repo_name = notification["repository"]["full_name"]
+        if repository_archived.get(repo_name, True):
+            return {"notification_id": thread_id, "_remove": True}
+        subject_type = subject.get("type", "")
+        state_key = _notification_state_key(notification)
+        state = subject_state.get(state_key) if state_key is not None else None
+        subject_info = None
+        if subject_type in {"Issue", "PullRequest"}:
+            if state is None:
+                subject_info = _gh_json(["api", subject.get("url", "")])
+                state = subject_info if isinstance(subject_info, dict) else {}
+            if state.get("state") != "open":
+                return {"notification_id": thread_id, "_remove": True}
+            if (
+                subject_type == "PullRequest"
+                and not subject.get("latest_comment_url")
+                and notification.get("reason") == "author"
+            ):
+                number = _notification_state_key(notification)[2]
+                detail = _fetch_pr_detail(repo_name, number, include_commits=True)
+                if (
+                    detail is not None
+                    and _should_suppress_bot_review_notification(
+                        detail, repo_name, number, current_login or "",
+                        bot_review_allowlist,
+                    )
+                ):
+                    return {"notification_id": thread_id, "_remove": True}
+            return _notification_item(notification, state)
+        subject_url = subject.get("url") or ""
+        if subject_url:
+            subject_info = _gh_json(["api", subject_url])
+        return _notification_item(notification, subject_info=subject_info)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        for result in pool.map(validate_notification, accepted):
+            outcomes[str(result["notification_id"])] = result
+    return (
+        [
+            outcomes[str(notification["id"])]
+            for notification in notifications
+            if isinstance(notification, dict)
+            and str(notification.get("id", ""))
+            and str(notification["id"]) in outcomes
+        ],
+        poll_started.isoformat().replace("+00:00", "Z"),
+    )
 def _build_repo_dir_index(code_dir):
     """Map "owner/repo" (lowercased) -> the actual local directory name
     under code_dir, derived from each subdirectory's own `git remote
@@ -522,18 +1099,31 @@ def _repo_dir_index(code_dir):
 
 
 
-def _fetch_raw(config):
-    track_authors = config.get("github", {}).get("trackAuthors", [])
-    bot_review_allowlist = frozenset(
-        login.casefold() for login in config.get("github", {}).get("botReviewAllowlist", [])
-    )
-    current_login = _get_gh_login()
+def _fetch_search_items(config, current_login=None, bot_review_allowlist=None):
+    github = config.get("github", {}) if isinstance(config, dict) else {}
+    track_authors = github.get("trackAuthors", [])
+    if not isinstance(track_authors, list):
+        track_authors = []
+    if bot_review_allowlist is None:
+        bot_review_allowlist = frozenset(
+            login.casefold()
+            for login in github.get("botReviewAllowlist", [])
+            if isinstance(login, str)
+        )
+    if current_login is None:
+        current_login = _get_gh_login()
 
     def search_prs(*filters):
-        return _gh_json([
+        return _required_gh_json([
             "search", "prs", *filters, "--state=open", "--archived=false", "--limit", "50",
             "--json", "number,title,body,repository,url,isDraft,createdAt",
         ]) or []
+
+    def fetch_repo_issues():
+        try:
+            return _fetch_my_repo_issues(required=True)
+        except TypeError:
+            return _fetch_my_repo_issues()
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(5 + len(track_authors), _MAX_WORKERS),
@@ -543,14 +1133,11 @@ def _fetch_raw(config):
         tracked_futures = [
             pool.submit(search_prs, f"--author={author}") for author in track_authors
         ]
-        assigned_future = pool.submit(_gh_json, [
+        assigned_future = pool.submit(_required_gh_json, [
             "search", "issues", "--assignee=@me", "--state=open", "--archived=false", "--limit", "50",
             "--json", "number,title,repository,url,createdAt",
         ])
-        repo_future = pool.submit(_fetch_my_repo_issues)
-        notification_future = pool.submit(
-            _fetch_notifications, current_login, bot_review_allowlist,
-        )
+        repo_future = pool.submit(fetch_repo_issues)
 
         review_candidates = review_future.result()
         authored_candidates = authored_future.result()
@@ -559,10 +1146,6 @@ def _fetch_raw(config):
         ]
         assigned_issues = assigned_future.result() or []
         repo_issues = repo_future.result() or []
-        try:
-            notifications = notification_future.result() or []
-        except Exception:
-            notifications = []
 
     candidates = review_candidates + authored_candidates
     candidates.extend(pr for _, prs in tracked_candidates for pr in prs)
@@ -572,15 +1155,23 @@ def _fetch_raw(config):
         if key is not None:
             unique_candidates.setdefault(key, pr)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_PR_DETAIL_WORKERS) as detail_pool:
-        detail_futures = {
-            key: detail_pool.submit(
-                _fetch_pr_detail,
-                pr["repository"]["nameWithOwner"],
-                pr["number"],
-            )
-            for key, pr in unique_candidates.items()
-        }
-        details = {key: future.result() for key, future in detail_futures.items()}
+        details = _fetch_pr_details(list(unique_candidates.values()))
+        missing = [
+            (key, pr) for key, pr in unique_candidates.items()
+            if key not in details
+        ]
+        if missing:
+            detail_futures = {
+                key: detail_pool.submit(
+                    _fetch_pr_detail,
+                    pr["repository"]["nameWithOwner"],
+                    pr["number"],
+                )
+                for key, pr in missing
+            }
+            details.update({
+                key: future.result() for key, future in detail_futures.items()
+            })
 
         def detail_for(pr):
             key = _pr_key(pr)
@@ -596,7 +1187,7 @@ def _fetch_raw(config):
             )
             for candidate in authored_candidates
         ]
-        tracked_futures = [
+        tracked_detail_futures = [
             (
                 author,
                 [
@@ -617,7 +1208,7 @@ def _fetch_raw(config):
             if (pr := future.result()) is not None
         ]
         tracked_prs = []
-        for author, futures in tracked_futures:
+        for author, futures in tracked_detail_futures:
             for future in futures:
                 pr = future.result()
                 if pr is not None:
@@ -644,12 +1235,10 @@ def _fetch_raw(config):
         issue["type"] = "assigned_issue"
     for issue in repo_issues:
         issue["type"] = "repo_issue"
-    for notification in notifications:
-        notification["type"] = "notification"
 
     seen = set()
     combined = []
-    for item in tracked_prs + review_prs + authored_prs + assigned_issues + repo_issues + notifications:
+    for item in tracked_prs + review_prs + authored_prs + assigned_issues + repo_issues:
         key = _pr_key(item)
         if key is None:
             key = (item.get("repository", {}).get("nameWithOwner", ""), item.get("number"))
@@ -659,6 +1248,19 @@ def _fetch_raw(config):
         combined.append(item)
     return combined
 
+
+def _fetch_raw(config):
+    """Live retrieval seam retained for focused tests and manual refreshes."""
+    github = config.get("github", {}) if isinstance(config, dict) else {}
+    allowlist = frozenset(
+        login.casefold()
+        for login in github.get("botReviewAllowlist", [])
+        if isinstance(login, str)
+    )
+    current_login = _get_gh_login()
+    search_items = _fetch_search_items(config, current_login, allowlist)
+    notification_items, _ = _fetch_notification_delta(current_login, allowlist)
+    return _compose_raw(search_items, notification_items)
 
 def get_repo_from_url(url):
     # e.g., https://github.com/athal7/kb/pull/40 -> athal7/kb
@@ -707,9 +1309,10 @@ def _session_prompt(gtype, reasons):
 
 
 def fetch(config):
-    raw = _fetch_raw(config)
+    raw = _fetch_cached_raw(config)
     if not raw:
         return []
+    snapshot_key = _snapshot_key(config)
 
     code_dir = config.get("codeDir", str(Path.home() / "code"))
     # Match each repo's actual `git remote origin` against local
@@ -817,6 +1420,27 @@ def fetch(config):
         ]
         configured_actions = config.get("github", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))
+        notification_ids = [str(thread_id) for thread_id in g.get("notification_ids", [])]
+        notification_id = str(g.get("notification_id", ""))
+        if notification_id and notification_id not in notification_ids:
+            notification_ids.insert(0, notification_id)
+        if notification_ids:
+            acknowledgement = {
+                "notification_ids": notification_ids,
+                "snapshot_key": snapshot_key,
+            }
+            for action in actions:
+                action["payload"].update(acknowledgement)
+            used_keys = {action["key"].lower() for action in actions}
+            dismiss_key = "d" if "d" not in used_keys else next(
+                str(digit) for digit in range(1, 10)
+                if str(digit) not in used_keys
+            )
+            actions.append({
+                "key": dismiss_key,
+                "label": "dismiss",
+                "payload": {"kind": "dismiss_notification", **acknowledgement},
+            })
 
         items.append({
             "status": status,
@@ -854,49 +1478,148 @@ def fetch(config):
 
 
 def _confirm_and_merge(item_id, url):
-    """Merge confirmation gate after the terminal UI has exited.
-    It uses a plain input() y/n prompt on the bare terminal.
-    """
+    """Run the merge only after explicit terminal confirmation."""
     if not url:
         print("No URL.")
-        return
+        return False
     repo = get_repo_from_url(url)
     try:
         choice = input(f"\nMerge {repo}#{item_id} (squash + delete branch)? [y/N]: ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
-        return
-    if choice == "y":
-        run_cmd(["gh", "pr", "merge", "--squash", "--delete-branch", item_id, "--repo", repo])
-    else:
+        return False
+    if choice != "y":
         print("Canceled.")
+        return False
+    return run_cmd(
+        ["gh", "pr", "merge", "--squash", "--delete-branch", item_id, "--repo", repo]
+    )
+
+
+def _mark_notification_threads_read(thread_ids):
+    marked = set()
+    for thread_id in thread_ids:
+        thread_id = str(thread_id)
+        if thread_id.isdigit() and run_cmd([
+            "gh", "api", "--method", "PATCH", f"/notifications/threads/{thread_id}",
+        ]):
+            marked.add(thread_id)
+    return marked
+
+
+def _drop_notification_threads(snapshot_key, thread_ids):
+    if not isinstance(snapshot_key, str) or not re.fullmatch(r"[0-9a-f]{16}", snapshot_key):
+        return
+    thread_ids = {str(thread_id) for thread_id in thread_ids if str(thread_id).isdigit()}
+    if not thread_ids:
+        return
+    descriptor = os.open(_refresh_lock_path(snapshot_key), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        target = _snapshot_path_for_key(snapshot_key)
+        try:
+            with target.open(encoding="utf-8") as source:
+                snapshot = json.load(source)
+        except (OSError, ValueError, TypeError):
+            return
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("version") != 1
+            or not isinstance(snapshot.get("notification_items"), list)
+        ):
+            return
+        snapshot["notification_items"] = [
+            item for item in snapshot["notification_items"]
+            if not isinstance(item, dict)
+            or str(item.get("notification_id", "")) not in thread_ids
+        ]
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(snapshot, output, sort_keys=True, separators=(",", ":"))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _acknowledge_notifications(payload):
+    marked = _mark_notification_threads_read(payload.get("notification_ids", []))
+    if marked:
+        _drop_notification_threads(payload.get("snapshot_key"), marked)
+    return bool(marked)
 
 
 def act(key, payload):
+    if payload.get("kind") == "dismiss_notification":
+        return _acknowledge_notifications(payload)
     if "command" in payload:
-        return run_configured_action(payload)
-    kind = payload.get("kind")
-    if kind == "open":
-        run_cmd(["open", payload["url"]]) if payload.get("url") else print("No URL.")
-    elif kind == "approve":
-        url = payload.get("url")
-        if not url:
-            print("No URL.")
-            return
-        run_cmd(["gh", "pr", "review", "--approve", payload["id"], "--repo", get_repo_from_url(url)])
-    elif kind == "merge":
-        _confirm_and_merge(payload["id"], payload.get("url"))
-    elif kind == "comment":
-        url = payload.get("url")
-        if not url:
-            print("No URL.")
-            return
-        body = input("\nEnter comment body: ").strip()
-        run_cmd(["gh", "issue", "comment", payload["id"], "-R", get_repo_from_url(url), "-b", body])
-    elif kind == "label":
-        url = payload.get("url")
-        if not url:
-            print("No URL.")
-            return
-        label = input("\nEnter label name: ").strip()
-        run_cmd(["gh", "issue", "edit", payload["id"], "-R", get_repo_from_url(url), "--add-label", label])
+        succeeded = run_configured_action(payload)
+    else:
+        kind = payload.get("kind")
+        if kind == "open":
+            if not payload.get("url"):
+                print("No URL.")
+                return False
+            succeeded = run_cmd(["open", payload["url"]])
+        elif kind == "approve":
+            url = payload.get("url")
+            if not url:
+                print("No URL.")
+                return False
+            succeeded = run_cmd([
+                "gh", "pr", "review", "--approve", payload["id"],
+                "--repo", get_repo_from_url(url),
+            ])
+        elif kind == "merge":
+            succeeded = _confirm_and_merge(payload["id"], payload.get("url"))
+        elif kind == "comment":
+            url = payload.get("url")
+            if not url:
+                print("No URL.")
+                return False
+            try:
+                body = input("\nEnter comment body: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCanceled.")
+                return False
+            succeeded = run_cmd([
+                "gh", "issue", "comment", payload["id"], "-R",
+                get_repo_from_url(url), "-b", body,
+            ])
+        elif kind == "label":
+            url = payload.get("url")
+            if not url:
+                print("No URL.")
+                return False
+            try:
+                label = input("\nEnter label name: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCanceled.")
+                return False
+            succeeded = run_cmd([
+                "gh", "issue", "edit", payload["id"], "-R",
+                get_repo_from_url(url), "--add-label", label,
+            ])
+        else:
+            return False
+    if succeeded:
+        _acknowledge_notifications(payload)
+    return succeeded
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--refresh-snapshot"]:
+    try:
+        _refresh_snapshot(_snapshot_config_from_environment())
+    except Exception:
+        raise SystemExit(1)
