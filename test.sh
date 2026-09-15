@@ -516,6 +516,85 @@ print(fetched['3']['kind'])
     "$(sed -n 9p <<<"$out")" "notification"
 }
 test_github_filters_items_without_my_action
+
+test_github_review_notification_respects_current_review_state() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+notifications = [
+    {'id': 'stale-bot', 'unread': True, 'reason': 'author',
+     'subject': {'type': 'PullRequest', 'title': 'Stale bot review',
+                 'url': 'https://api.github.com/repos/o/r/pulls/1',
+                 'latest_comment_url': None},
+     'repository': {'full_name': 'o/r'}},
+    {'id': 'human-review', 'unread': True, 'reason': 'author',
+     'subject': {'type': 'PullRequest', 'title': 'Human review',
+                 'url': 'https://api.github.com/repos/o/r/pulls/2',
+                 'latest_comment_url': None},
+     'repository': {'full_name': 'o/r'}},
+    {'id': 'current-bot', 'unread': True, 'reason': 'author',
+     'subject': {'type': 'PullRequest', 'title': 'Current bot review',
+                 'url': 'https://api.github.com/repos/o/r/pulls/3',
+                 'latest_comment_url': None},
+     'repository': {'full_name': 'o/r'}},
+]
+details = {
+    '1': {
+        'latestReviews': [
+            {'author': {'login': 'copilot-pull-request-reviewer'}, 'state': 'COMMENTED',
+             'submittedAt': '2026-09-15T00:40:52Z'},
+        ],
+        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
+    },
+    '2': {
+        'latestReviews': [
+            {'author': {'login': 'human-reviewer'}, 'state': 'COMMENTED',
+             'submittedAt': '2026-09-15T03:00:00Z'},
+        ],
+        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
+    },
+    '3': {
+        'latestReviews': [
+            {'author': {'login': 'copilot-pull-request-reviewer'}, 'state': 'COMMENTED',
+             'submittedAt': '2026-09-15T03:00:00Z'},
+        ],
+        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
+    },
+}
+
+def gh_json(args):
+    if args[:2] == ['api', '/notifications']:
+        return notifications
+    if args[:2] == ['api', 'repos/o/r']:
+        return {'archived': False}
+    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/1']:
+        return {'state': 'open'}
+    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/2']:
+        return {'state': 'open'}
+    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/3']:
+        return {'state': 'open'}
+    if args[:2] == ['pr', 'view']:
+        return details[args[2]]
+    return []
+
+p._gh_json = gh_json
+p._fetch_review_bot_flags = lambda repo, number: {
+    'copilot-pull-request-reviewer': True,
+    'human-reviewer': False,
+}
+default_result = p._fetch_notifications('author')
+allowlisted_result = p._fetch_notifications(
+    'author', frozenset(['copilot-pull-request-reviewer[bot]']),
+)
+print([item['notification_id'] for item in default_result])
+print([item['notification_id'] for item in allowlisted_result])
+")"
+  check "a bot review superseded by a newer commit is not Reply needed, while a human review after that commit remains" \
+    "$(sed -n 1p <<<"$out")" "['human-review']"
+  check "an allowlisted current bot review remains visible" \
+    "$(sed -n 2p <<<"$out")" "['human-review', 'current-bot']"
+}
+test_github_review_notification_respects_current_review_state
 echo
 echo "-- repo_path resolves via git-remote auto-detection, not the repo's own name --"
 
