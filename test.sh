@@ -488,7 +488,7 @@ def gh_json(args):
 p._gh_json = gh_json
 notifications, _ = p._fetch_notification_delta()
 pull = next(item for item in notifications if item['notification_id'] == 'open-pull')
-p._fetch_cached_raw = lambda config: notifications
+p._fetch_raw = lambda config: notifications
 p._build_repo_dir_index = lambda code_dir: {}
 fetched = {item['id']: item for item in p.fetch({'codeDir': '/tmp'})}
 print([item['number'] for item in p._fetch_my_repo_issues()])
@@ -655,44 +655,33 @@ print([item['notification_id'] for item in allowlisted_result if not item.get('_
 }
 test_github_review_notification_respects_current_review_state
 
-test_github_snapshot_cache_and_notifications() {
+test_github_fetch_always_retrieves_live_state() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-import json
-import os
-import tempfile
-
-cache = tempfile.mkdtemp()
-os.environ['XDG_CACHE_HOME'] = cache
-config = {'github': {'trackAuthors': ['alice'], 'botReviewAllowlist': ['BOT', 'bot']}}
-state = {'search': 0, 'delta': 0, 'spawn': 0}
-real_delta = p._fetch_notification_delta
+config = {'github': {'trackAuthors': ['alice'], 'botReviewAllowlist': ['bot']}}
+state = {'search': 0, 'delta': 0}
 def search(cfg, *_):
     state['search'] += 1
-    return [{'number': 7, 'title': 'Search', 'repository': {'nameWithOwner': 'o/r'}, 'type': 'review_request'}]
+    return []
 def delta(*_):
     state['delta'] += 1
-    return ([{'number': 7, 'title': 'Notification', 'repository': {'nameWithOwner': 'o/r'}, 'notification_id': '7', 'type': 'notification'}], '2026-01-01T00:00:00Z')
+    return ([], '2026-01-01T00:00:00Z')
 p._fetch_search_items = search
 p._fetch_notification_delta = delta
-first = p._fetch_cached_raw(config)
-snapshot = p._read_snapshot(config)
-second = p._fetch_cached_raw(config)
-snapshot['refreshed_at'] = 0
-p._write_snapshot(config, snapshot)
-p._spawn_snapshot_refresh = lambda cfg: state.__setitem__('spawn', state['spawn'] + 1)
-stale = p._fetch_cached_raw(config)
-path = p._snapshot_path(config)
-path.write_text('{bad json')
-p._fetch_cached_raw(config)
-other = {'github': {'trackAuthors': ['bob'], 'botReviewAllowlist': ['bot']}}
-p._fetch_cached_raw(other)
-print(state['search'], state['delta'], state['spawn'])
-print(first[0]['notification_ids'], first == second == stale)
-print(snapshot['version'], snapshot['notification_cursor'], oct(path.stat().st_mode & 0o777))
-print(p._read_snapshot(config) is not None, p._read_snapshot(other) is not None)
+p._get_gh_login = lambda: ''
+p._fetch_raw(config)
+p._fetch_raw(config)
+print(state)
+")"
+  check "each direct GitHub fetch performs a fresh search and notification request" "$(sed -n 1p <<<"$out")" "{'search': 2, 'delta': 2}"
+}
+test_github_fetch_always_retrieves_live_state
 
+test_github_notifications_are_fetched_live() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
 calls = []
 reasons = sorted(p._NOTIFICATION_REASONS)
 notifications = [
@@ -716,19 +705,10 @@ def gh_json(args):
         return {'html_url': 'https://github.com/o/r/discussions/1'}
     return {'html_url': 'https://github.com/o/r/discussions/fallback'}
 p._gh_json = gh_json
-p._fetch_notification_delta = real_delta
-items, cursor = p._fetch_notification_delta(since='2026-01-01T00:01:00Z')
-merged = p._merge_notification_delta(
-    [{'notification_id': '1', 'title': 'old'}, {'notification_id': '2', 'title': 'retain'}],
-    [{'notification_id': '1', 'title': 'new'}, {'notification_id': '3', 'title': 'add'}, {'notification_id': '2', '_remove': True}],
-)
+items, _ = p._fetch_notification_delta(since='2026-01-01T00:01:00Z')
 request = next(args for args in calls if args[:2] == ['api', '/notifications'])
 print([item['notification_id'] for item in items if not item.get('_remove')], items[0]['url'])
-print('since=2026-01-01T00:00:00Z' in request, [item['notification_id'] for item in merged], [item['title'] for item in merged])
-invalid_snapshot = dict(snapshot)
-invalid_snapshot['refreshed_at'] = float('inf')
-p._write_snapshot(config, invalid_snapshot)
-print(p._read_snapshot(config) is None)
+print('since=2026-01-01T00:00:00Z' in request)
 p._required_gh_json = lambda args: [
     {'id': '404', 'unread': True, 'reason': 'mention',
      'subject': {'type': 'Discussion', 'title': 'unreachable'},
@@ -736,53 +716,30 @@ p._required_gh_json = lambda args: [
 ]
 p._fetch_notification_state = lambda notifications: None
 p._gh_json = lambda args: (_ for _ in ()).throw(RuntimeError('offline'))
-fallback, _ = real_delta()
+fallback, _ = p._fetch_notification_delta()
 print(fallback)
 " )"
-  check "snapshot bootstrap writes once, fresh reads avoid retrieval, stale reads schedule one refresh, and invalid or mismatched snapshots refresh" \
-    "$(sed -n 1p <<<"$out")" "3 3 1"
-  check "search rows absorb duplicate notification thread IDs and fresh and stale reads preserve visible rows" \
-    "$(sed -n 2p <<<"$out")" "['7'] True"
-  check "snapshot uses version one, a UTC cursor, and private permissions" \
-    "$(sed -n 3p <<<"$out")" "1 2026-01-01T00:00:00Z 0o600"
-  check "malformed and configuration-mismatched snapshots are replaced independently" \
-    "$(sed -n 4p <<<"$out")" "True True"
-  check "all approved notification reasons survive, other reasons produce removals, and non-PR subject URLs resolve" \
-    "$(sed -n 5p <<<"$out")" "['1', '2', '3', '4', '5', '6'] https://github.com/o/r/discussions/1"
-  check "notification deltas replay sixty seconds and merge updates, additions, removals, and retained entries deterministically" \
-    "$(sed -n 6p <<<"$out")" "True ['1', '3'] ['new', 'add']"
-  check "snapshot validation rejects non-finite refresh timestamps" \
-    "$(sed -n 7p <<<"$out")" "True"
-  check "notification REST fallback treats a repository lookup failure as archived" \
-    "$(sed -n 8p <<<"$out")" "[{'notification_id': '404', '_remove': True}]"
+  check "all approved notification reasons survive and non-PR subject URLs resolve"     "$(sed -n 1p <<<"$out")" "['1', '2', '3', '4', '5', '6'] https://github.com/o/r/discussions/1"
+  check "notification deltas replay sixty seconds"     "$(sed -n 2p <<<"$out")" "True"
+  check "notification REST fallback treats a repository lookup failure as archived"     "$(sed -n 3p <<<"$out")" "[{'notification_id': '404', '_remove': True}]"
 }
-test_github_snapshot_cache_and_notifications
-
+test_github_notifications_are_fetched_live
 test_github_notification_actions() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-import os
-import tempfile
-os.environ['XDG_CACHE_HOME'] = tempfile.mkdtemp()
-config = {'github': {}}
-key = p._snapshot_key(config)
-snapshot = {'version': 1, 'refreshed_at': 1, 'notification_cursor': '2026-01-01T00:00:00Z', 'search_items': [], 'notification_items': [{'notification_id': '12'}, {'notification_id': '13'}]}
-p._write_snapshot(config, snapshot)
 calls = []
 def command(cmd):
     calls.append(cmd)
     return cmd[0] == 'open' or cmd[-1] == '/notifications/threads/12'
 p.run_cmd = command
-payload = {'kind': 'open', 'url': 'https://example.test', 'notification_ids': ['12', '13'], 'snapshot_key': key}
-print(p.act('o', payload), calls, [x['notification_id'] for x in p._read_snapshot(config)['notification_items']])
+payload = {'kind': 'open', 'url': 'https://example.test', 'notification_ids': ['12', '13']}
+print(p.act('o', payload), calls)
 calls.clear()
-print(p.act('d', {'kind': 'dismiss_notification', 'notification_ids': ['13'], 'snapshot_key': key}), calls, [x['notification_id'] for x in p._read_snapshot(config)['notification_items']])
+print(p.act('d', {'kind': 'dismiss_notification', 'notification_ids': ['13']}), calls)
 " )"
-  check "successful actions mark only successful notification PATCHes and retain failed local threads" \
-    "$(sed -n 1p <<<"$out")" "True [['open', 'https://example.test'], ['gh', 'api', '--method', 'PATCH', '/notifications/threads/12'], ['gh', 'api', '--method', 'PATCH', '/notifications/threads/13']] ['13']"
-  check "dismiss marks a notification without running the primary action and preserves it when PATCH fails" \
-    "$(sed -n 2p <<<"$out")" "False [['gh', 'api', '--method', 'PATCH', '/notifications/threads/13']] ['13']"
+  check "successful actions mark only successful notification PATCHes"     "$(sed -n 1p <<<"$out")" "True [['open', 'https://example.test'], ['gh', 'api', '--method', 'PATCH', '/notifications/threads/12'], ['gh', 'api', '--method', 'PATCH', '/notifications/threads/13']]"
+  check "dismiss returns false when its notification PATCH fails"     "$(sed -n 2p <<<"$out")" "False [['gh', 'api', '--method', 'PATCH', '/notifications/threads/13']]"
 }
 test_github_notification_actions
 echo
@@ -1115,7 +1072,7 @@ config = {
         ]
     }
 }
-p._fetch_cached_raw = lambda cfg: [{'number': 42, 'title': 'Fix bug', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/42', 'type': 'review_request'}]
+p._fetch_raw = lambda cfg: [{'number': 42, 'title': 'Fix bug', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/42', 'type': 'review_request'}]
 items = p.fetch(config)
 print(json.dumps([a['key'] for a in items[0]['actions']]))
 print(json.dumps(items[0]['actions'][5]['payload']['command']))
@@ -2139,7 +2096,7 @@ test_fetch_shows_review_requested_status_on_authored_and_tracked_prs() {
   out="$(python3 -c "
 $(load_plugin_py github)
 import json
-p._fetch_cached_raw = lambda cfg: [
+p._fetch_raw = lambda cfg: [
     {'number': 1, 'title': 'Authored waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/1', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
     {'number': 2, 'title': 'Authored no reviewer yet', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/2', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': False},
     {'number': 3, 'title': 'Tracked waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/3', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
@@ -2219,7 +2176,7 @@ test_github_repository_index_is_process_local_and_code_dir_keyed() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-p._fetch_cached_raw = lambda config: [{'number': 1, 'title': 'x', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/issues/1', 'type': 'assigned_issue'}]
+p._fetch_raw = lambda config: [{'number': 1, 'title': 'x', 'repository': {'nameWithOwner': 'owner/repo'}, 'url': 'https://github.com/owner/repo/issues/1', 'type': 'assigned_issue'}]
 calls = []
 p._build_repo_dir_index = lambda code_dir: calls.append(code_dir) or {}
 p.fetch({'codeDir': '/tmp/attention-index'})
@@ -2302,7 +2259,7 @@ test_github_pull_requests_link_visible_stack_parents() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-p._fetch_cached_raw = lambda config: [
+p._fetch_raw = lambda config: [
     {'number': 10, 'title': 'Base', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'baseRefName': 'main', 'headRefName': 'feature/base'},
     {'number': 11, 'title': 'Child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'attention_reasons': ['Checks Failing'], 'baseRefName': 'feature/base', 'headRefName': 'feature/child'},
     {'number': 12, 'title': 'Draft child', 'repository': {'nameWithOwner': 'owner/repo'}, 'type': 'authored_attention', 'attention_reasons': ['Changes Requested'], 'isDraft': True, 'baseRefName': 'feature/base', 'headRefName': 'feature/draft'},
