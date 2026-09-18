@@ -17,24 +17,17 @@ reviewer GitHub's GraphQL API reports as a Bot actor.
 """
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
-import fcntl
-import hashlib
-import math
 import json
 import os
 import re
 import subprocess
-import sys
-import tempfile
 import threading
-import time
 from pathlib import Path
 
 from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
 
 _MAX_WORKERS = 8
 _MAX_PR_DETAIL_WORKERS = 32
-_SNAPSHOT_TTL_SECONDS = 60
 _NOTIFICATION_REASONS = {
     "mention", "team_mention", "author", "comment", "manual", "subscribed",
 }
@@ -252,7 +245,7 @@ def _gh_json(args, *, required=False):
     """Run `gh <args...>` and parse JSON.
 
     Tolerant callers receive [] on failure. Required callers raise so a
-    failed refresh cannot replace a last-good snapshot.
+    failed request cannot replace a prior result.
     """
     try:
         res = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=30)
@@ -273,159 +266,8 @@ def _required_gh_json(args):
         return _gh_json(args)
 
 
-def _snapshot_config(config):
-    github = config.get("github", {}) if isinstance(config, dict) else {}
-    track_authors = github.get("trackAuthors", []) if isinstance(github, dict) else []
-    allowlist = github.get("botReviewAllowlist", []) if isinstance(github, dict) else []
-    return {
-        "GH_HOST": os.environ.get("GH_HOST", "github.com"),
-        "botReviewAllowlist": sorted(
-            {str(login).casefold() for login in allowlist if isinstance(login, str)}
-        ),
-        "trackAuthors": list(track_authors) if isinstance(track_authors, list) else [],
-    }
-
-
-def _snapshot_key(config):
-    canonical = json.dumps(
-        _snapshot_config(config), sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()[:16]
-
-
-def _snapshot_cache_dir():
-    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    directory = root / "attention"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        directory.chmod(0o700)
-    except OSError:
-        pass
-    return directory
-
-
-def _snapshot_path_for_key(key):
-    return _snapshot_cache_dir() / f"github-snapshot-v1-{key}.json"
-
-
-def _snapshot_path(config):
-    return _snapshot_path_for_key(_snapshot_key(config))
-
-
-def _refresh_lock_path(key):
-    return _snapshot_cache_dir() / f"github-refresh-v1-{key}.lock"
-
-
-def _snapshot_timestamp(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    value = float(value)
-    return value if math.isfinite(value) else None
-
-
-def _valid_notification_cursor(value):
-    timestamp = _parse_github_timestamp(value)
-    return timestamp is not None and timestamp.utcoffset() == timedelta(0)
-
-
-def _read_snapshot(config):
-    try:
-        with _snapshot_path(config).open(encoding="utf-8") as source:
-            snapshot = json.load(source)
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
-        return None
-    if _snapshot_timestamp(snapshot.get("refreshed_at")) is None:
-        return None
-    if not _valid_notification_cursor(snapshot.get("notification_cursor")):
-        return None
-    for name in ("search_items", "notification_items"):
-        if not isinstance(snapshot.get(name), list):
-            return None
-        if not all(isinstance(item, dict) for item in snapshot[name]):
-            return None
-    return snapshot
-
-
-def _write_snapshot(config, snapshot):
-    directory = _snapshot_cache_dir()
-    target = _snapshot_path(config)
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=directory,
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as output:
-            json.dump(snapshot, output, sort_keys=True, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, target)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-
-
-def _snapshot_config_from_environment():
-    try:
-        value = json.loads(os.environ["ATTENTION_GITHUB_REFRESH_CONFIG"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise GitHubFetchError("invalid refresh configuration") from exc
-    if not isinstance(value, dict):
-        raise GitHubFetchError("invalid refresh configuration")
-    expected = {"GH_HOST", "botReviewAllowlist", "trackAuthors"}
-    if set(value) != expected:
-        raise GitHubFetchError("invalid refresh configuration")
-    if (
-        not isinstance(value["GH_HOST"], str)
-        or not isinstance(value["trackAuthors"], list)
-        or not isinstance(value["botReviewAllowlist"], list)
-        or not all(isinstance(author, str) for author in value["trackAuthors"])
-        or not all(isinstance(login, str) for login in value["botReviewAllowlist"])
-    ):
-        raise GitHubFetchError("invalid refresh configuration")
-    os.environ["GH_HOST"] = value["GH_HOST"]
-    return {
-        "github": {
-            "trackAuthors": value["trackAuthors"],
-            "botReviewAllowlist": value["botReviewAllowlist"],
-        },
-    }
-
-
-def _spawn_snapshot_refresh(config):
-    key = _snapshot_key(config)
-    descriptor = os.open(_refresh_lock_path(key), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(descriptor)
-        return False
-    try:
-        refresh_config = json.dumps(
-            _snapshot_config(config), sort_keys=True, separators=(",", ":"),
-        )
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--refresh-snapshot"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            pass_fds=(descriptor,),
-            env={**os.environ, "ATTENTION_GITHUB_REFRESH_CONFIG": refresh_config},
-        )
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(descriptor)
-
-
 def _compose_raw(search_items, notification_items):
-    """Combine the two snapshot streams with search as the display winner."""
+    """Combine the search and notification streams with search as the display winner."""
     combined = [dict(item) for item in search_items]
     by_subject = {}
     for item in combined:
@@ -454,38 +296,7 @@ def _compose_raw(search_items, notification_items):
     return combined
 
 
-def _merge_notification_delta(previous_items, delta_items):
-    """Update the persistent notification queue without dropping absent rows."""
-    merged = []
-    indexes = {}
-    for item in previous_items:
-        thread_id = str(item.get("notification_id", ""))
-        if thread_id and thread_id not in indexes:
-            indexes[thread_id] = len(merged)
-            merged.append(dict(item))
-    removed = set()
-    for item in delta_items:
-        thread_id = str(item.get("notification_id", ""))
-        if not thread_id:
-            continue
-        if item.get("_remove"):
-            removed.add(thread_id)
-            continue
-        if thread_id in indexes:
-            merged[indexes[thread_id]] = dict(item)
-        else:
-            indexes[thread_id] = len(merged)
-            merged.append(dict(item))
-    return [
-        item for item in merged
-        if str(item.get("notification_id", "")) not in removed
-    ]
-
-
-def _refresh_snapshot(config):
-    previous = _read_snapshot(config) or {}
-    previous_notifications = previous.get("notification_items", [])
-    cursor = previous.get("notification_cursor")
+def _fetch_raw(config):
     github = config.get("github", {}) if isinstance(config, dict) else {}
     allowlist = frozenset(
         login.casefold()
@@ -496,32 +307,11 @@ def _refresh_snapshot(config):
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         search_future = pool.submit(_fetch_search_items, config, current_login, allowlist)
         notification_future = pool.submit(
-            _fetch_notification_delta, current_login, allowlist, cursor,
+            _fetch_notification_delta, current_login, allowlist,
         )
         search_items = search_future.result()
-        delta_items, next_cursor = notification_future.result()
-    snapshot = {
-        "version": 1,
-        "refreshed_at": time.time(),
-        "notification_cursor": next_cursor,
-        "search_items": search_items,
-        "notification_items": _merge_notification_delta(
-            previous_notifications, delta_items,
-        ),
-    }
-    _write_snapshot(config, snapshot)
-    return _compose_raw(snapshot["search_items"], snapshot["notification_items"])
-
-
-def _fetch_cached_raw(config):
-    snapshot = _read_snapshot(config)
-    if snapshot is not None:
-        if time.time() - snapshot["refreshed_at"] >= _SNAPSHOT_TTL_SECONDS:
-            _spawn_snapshot_refresh(config)
-        return _compose_raw(
-            snapshot["search_items"], snapshot["notification_items"],
-        )
-    return _refresh_snapshot(config)
+        notification_items, _ = notification_future.result()
+    return _compose_raw(search_items, notification_items)
 
 
 def _get_gh_login():
@@ -1309,10 +1099,9 @@ def _session_prompt(gtype, reasons):
 
 
 def fetch(config):
-    raw = _fetch_cached_raw(config)
+    raw = _fetch_raw(config)
     if not raw:
         return []
-    snapshot_key = _snapshot_key(config)
 
     code_dir = config.get("codeDir", str(Path.home() / "code"))
     # Match each repo's actual `git remote origin` against local
@@ -1427,7 +1216,6 @@ def fetch(config):
         if notification_ids:
             acknowledgement = {
                 "notification_ids": notification_ids,
-                "snapshot_key": snapshot_key,
             }
             for action in actions:
                 action["payload"].update(acknowledgement)
@@ -1507,57 +1295,8 @@ def _mark_notification_threads_read(thread_ids):
     return marked
 
 
-def _drop_notification_threads(snapshot_key, thread_ids):
-    if not isinstance(snapshot_key, str) or not re.fullmatch(r"[0-9a-f]{16}", snapshot_key):
-        return
-    thread_ids = {str(thread_id) for thread_id in thread_ids if str(thread_id).isdigit()}
-    if not thread_ids:
-        return
-    descriptor = os.open(_refresh_lock_path(snapshot_key), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        target = _snapshot_path_for_key(snapshot_key)
-        try:
-            with target.open(encoding="utf-8") as source:
-                snapshot = json.load(source)
-        except (OSError, ValueError, TypeError):
-            return
-        if (
-            not isinstance(snapshot, dict)
-            or snapshot.get("version") != 1
-            or not isinstance(snapshot.get("notification_items"), list)
-        ):
-            return
-        snapshot["notification_items"] = [
-            item for item in snapshot["notification_items"]
-            if not isinstance(item, dict)
-            or str(item.get("notification_id", "")) not in thread_ids
-        ]
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
-        )
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(snapshot, output, sort_keys=True, separators=(",", ":"))
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, target)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
-    finally:
-        os.close(descriptor)
-
-
 def _acknowledge_notifications(payload):
-    marked = _mark_notification_threads_read(payload.get("notification_ids", []))
-    if marked:
-        _drop_notification_threads(payload.get("snapshot_key"), marked)
-    return bool(marked)
+    return bool(_mark_notification_threads_read(payload.get("notification_ids", [])))
 
 
 def act(key, payload):
@@ -1616,10 +1355,3 @@ def act(key, payload):
     if succeeded:
         _acknowledge_notifications(payload)
     return succeeded
-
-
-if __name__ == "__main__" and sys.argv[1:] == ["--refresh-snapshot"]:
-    try:
-        _refresh_snapshot(_snapshot_config_from_environment())
-    except Exception:
-        raise SystemExit(1)
