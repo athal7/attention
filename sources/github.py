@@ -275,6 +275,9 @@ def _compose_raw(search_items, notification_items):
         if key is not None:
             by_subject[key] = item
     for notification in notification_items:
+        # Deltas also contain removals for read, filtered, or closed threads.
+        if notification.get("_remove"):
+            continue
         notification = dict(notification)
         notification_id = notification.get("notification_id")
         ids = [str(thread_id) for thread_id in notification.get("notification_ids", [])]
@@ -294,24 +297,6 @@ def _compose_raw(search_items, notification_items):
         if target_ids and "notification_id" not in winner:
             winner["notification_id"] = target_ids[0]
     return combined
-
-
-def _fetch_raw(config):
-    github = config.get("github", {}) if isinstance(config, dict) else {}
-    allowlist = frozenset(
-        login.casefold()
-        for login in github.get("botReviewAllowlist", [])
-        if isinstance(login, str)
-    )
-    current_login = _get_gh_login()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        search_future = pool.submit(_fetch_search_items, config, current_login, allowlist)
-        notification_future = pool.submit(
-            _fetch_notification_delta, current_login, allowlist,
-        )
-        search_items = search_future.result()
-        notification_items, _ = notification_future.result()
-    return _compose_raw(search_items, notification_items)
 
 
 def _get_gh_login():
@@ -1051,6 +1036,7 @@ def _fetch_raw(config):
     search_items = _fetch_search_items(config, current_login, allowlist)
     notification_items, _ = _fetch_notification_delta(current_login, allowlist)
     return _compose_raw(search_items, notification_items)
+
 
 def get_repo_from_url(url):
     # e.g., https://github.com/athal7/kb/pull/40 -> athal7/kb
