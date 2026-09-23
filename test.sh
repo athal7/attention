@@ -678,6 +678,48 @@ print(state)
 }
 test_github_fetch_always_retrieves_live_state
 
+test_github_live_fetch_ignores_notification_tombstones() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+p = m.load_plugin('github')
+p._fetch_search_items = lambda *_: [
+    {'type': 'review_request', 'number': 42, 'title': 'Review me',
+     'repository': {'nameWithOwner': 'o/r'}, 'url': 'https://github.com/o/r/pull/42'},
+]
+repo = {'full_name': 'o/r', 'html_url': 'https://github.com/o/r'}
+p._required_gh_json = lambda args: [
+    {'id': str(i), 'unread': False, 'reason': 'mention',
+     'subject': {'type': 'Discussion', 'title': 'Read'}, 'repository': repo}
+    for i in range(12)
+] + [
+    {'id': 'live', 'unread': True, 'reason': 'mention',
+     'subject': {'type': 'Discussion', 'title': 'Actual update',
+                 'url': 'https://api.github.com/repos/o/r/discussions/1'},
+     'repository': repo},
+]
+p._gh_json = lambda args: (
+    {'archived': False} if args == ['api', 'repos/o/r']
+    else {'html_url': 'https://github.com/o/r/discussions/1'}
+)
+p._get_gh_login = lambda: 'me'
+p._repo_dir_index = lambda code_dir: {}
+items = p.fetch({'codeDir': '/tmp'})
+for item in items:
+    item['_plugin'] = 'github'
+rows = m.render_grouped_dashboard_rows(
+    m.build_snapshot({'github': items}), m.dashboard_groups({})[0],
+)
+print([(item['title'], item['kind']) for item in items])
+print([row.rpartition(chr(9))[2] for row in rows])
+")"
+  check "notification removals do not become untitled rows" \
+    "$(sed -n 1p <<<"$out")" "[('Review me', 'pull_request'), ('Actual update', 'notification')]"
+  check "live GitHub notification stays in Other without extra rows" \
+    "$(sed -n 2p <<<"$out")" "['Pull Requests', 'Other']"
+}
+test_github_live_fetch_ignores_notification_tombstones
+
 test_github_notifications_are_fetched_live() {
   local out
   out="$(python3 -c "

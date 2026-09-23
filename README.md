@@ -131,6 +131,9 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   mentions and comments on your work are included. Passive subscription state
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
+  Eligible unread notifications appear in the default Other group unless they
+  concern a pull request. Read threads, closed PR/issue threads, and threads
+  from archived repositories are omitted.
   Bot review comments are excluded unless the bot is in
   `github.botReviewAllowlist`. Items are de-duplicated by repository and number.
   Visible PRs that target another visible PR's head branch render as a tree,
