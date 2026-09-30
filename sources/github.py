@@ -10,10 +10,7 @@ on subscribed PRs, and CI failures on watched repos.
 
 Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
-checkout. botReviewAllowlist optionally re-admits specific bot logins
-(e.g. "coderabbitai[bot]", with or without the suffix) into the "needs
-attention" review-comment check, which otherwise ignores every
-reviewer GitHub's GraphQL API reports as a Bot actor.
+checkout.
 """
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
@@ -56,15 +53,11 @@ pullRequest(number: %d) {
   latestReviews(first: 50) {
     nodes {
       state
-      submittedAt
-      author { login __typename }
+      author { login }
     }
   }
   closingIssuesReferences(first: 50) {
     nodes { number repository { nameWithOwner } }
-  }
-  commits(last: 1) {
-    nodes { commit { committedDate } }
   }
   statusCheckRollup {
     contexts(first: 100) {
@@ -99,13 +92,6 @@ def _normalize_pr_detail(detail):
         else reviews_payload
     )
     reviews = [review for review in reviews if isinstance(review, dict)]
-    bot_flags = {}
-    for review in reviews:
-        author = review.get("author") or {}
-        login = (author.get("login") or "").casefold()
-        if login and author.get("__typename") in {"Bot", "User", "Organization"}:
-            bot_flags[login] = author["__typename"] == "Bot"
-
     check_payload = detail.get("statusCheckRollup") or []
     check_nodes = (
         check_payload.get("contexts", {}).get("nodes", [])
@@ -138,12 +124,6 @@ def _normalize_pr_detail(detail):
         if isinstance(closing_payload, dict)
         else closing_payload
     )
-    commit_payload = detail.get("commits") or []
-    commit_nodes = (
-        commit_payload.get("nodes", [])
-        if isinstance(commit_payload, dict)
-        else commit_payload
-    )
     return {
         "mergeable": detail.get("mergeable"),
         "reviewDecision": detail.get("reviewDecision"),
@@ -159,13 +139,7 @@ def _normalize_pr_detail(detail):
         "closingIssuesReferences": [
             node for node in closing_nodes if isinstance(node, dict)
         ],
-        "commits": [
-            {"committedDate": node.get("commit", node).get("committedDate")}
-            for node in commit_nodes
-            if isinstance(node, dict) and node.get("commit", node).get("committedDate")
-        ],
         "statusCheckRollup": checks,
-        "_bot_flags": bot_flags,
     }
 
 
@@ -222,10 +196,9 @@ def _fetch_pr_details(prs):
     return details
 
 
-def _fetch_pr_detail(repo, number, include_commits=False):
-    fields = _PR_DETAIL_FIELDS + (",commits" if include_commits else "")
+def _fetch_pr_detail(repo, number):
     detail = _gh_json([
-        "pr", "view", str(number), "-R", repo, "--json", fields,
+        "pr", "view", str(number), "-R", repo, "--json", _PR_DETAIL_FIELDS,
     ])
     return detail if isinstance(detail, dict) else None
 
@@ -309,75 +282,18 @@ def _get_gh_login():
     return ""
 
 
-def _is_bot_login(login):
-    # Fallback only, used when _fetch_review_bot_flags() can't be reached:
-    # GitHub's GraphQL `Bot` actor type never actually carries this
-    # suffix on its bare `login` (see _fetch_review_bot_flags), so this
-    # heuristic under-detects on its own.
-    return login.casefold().endswith("[bot]")
 
-
-def _fetch_review_bot_flags(repo, number):
-    """login (casefold) -> True if that PR review's author is a GraphQL
-    `Bot` actor. `gh pr view --json latestReviews` flattens each review's
-    author down to a bare `login`, dropping GraphQL's `__typename` -- and
-    a bot's `login` there never carries the "[bot]" suffix REST/UI
-    surfaces show (e.g. Copilot's code-review account is
-    "copilot-pull-request-reviewer", CodeRabbit's is "coderabbitai",
-    dependabot's is "dependabot"), so a suffix check alone silently lets
-    every bot review through as if a person wrote it. This raw GraphQL
-    query is the only way to recover the actor type.
-    """
-    owner, _, name = repo.partition("/")
-    if not owner or not name:
-        return {}
-    result = _gh_json([
-        "api", "graphql",
-        "-f", "query=query($owner:String!,$name:String!,$number:Int!){"
-              "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-              "latestReviews(first:50){nodes{author{__typename login}}}}}}",
-        "-f", f"owner={owner}",
-        "-f", f"name={name}",
-        "-F", f"number={number}",
-    ])
-    repository = ((result or {}).get("data") or {}).get("repository") or {}
-    pr = repository.get("pullRequest") or {}
-    nodes = (pr.get("latestReviews") or {}).get("nodes") or []
-    flags = {}
-    for node in nodes:
-        author = node.get("author") or {}
-        login = (author.get("login") or "").casefold()
-        if login:
-            flags[login] = author.get("__typename") == "Bot"
-    return flags
-
-
-def _parse_github_timestamp(value):
-    if not isinstance(value, str) or not value:
+def _parse_github_timestamp(value, *, require_timezone=False):
+    if not isinstance(value, str) or not value or (require_timezone and "T" not in value):
         return None
     try:
         timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if require_timezone and timestamp.tzinfo is None:
+        return None
     return timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
 
-
-def _latest_commit_at(detail):
-    timestamps = [
-        timestamp
-        for commit in detail.get("commits") or []
-        if (timestamp := _parse_github_timestamp(commit.get("committedDate"))) is not None
-    ]
-    return max(timestamps, default=None)
-
-
-def _review_is_superseded(review, latest_commit_at):
-    submitted_at = _parse_github_timestamp(review.get("submittedAt"))
-    return (
-        submitted_at is not None
-        and latest_commit_at is not None
-        and submitted_at <= latest_commit_at
-    )
 
 
 def _pr_indicators(detail, is_draft):
@@ -448,29 +364,16 @@ def _status_label(gtype, reasons, review_requested, is_draft):
     if gtype == "notification":
         return "Reply needed"
     return "Ready"
-def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
-    key = _pr_key(pr)
-    if key is None or detail is None:
+def _classify_pr_attention(pr, expected_author, detail):
+    if _pr_key(pr) is None or detail is None:
         return None
-    repo, number = pr["repository"]["nameWithOwner"], pr["number"]
     reasons = []
-    latest_review_states = set()
-    bot_flags = detail.get("_bot_flags")
-    for review in detail.get("latestReviews") or []:
-        reviewer = review.get("author", {}).get("login") or ""
-        if not reviewer or reviewer.casefold() == expected_author.casefold():
-            continue
-        reviewer_cf = reviewer.casefold()
-        if bot_flags is None:
-            bot_flags = _fetch_review_bot_flags(repo, number)
-        is_bot = bot_flags.get(reviewer_cf)
-        if is_bot is None:
-            is_bot = _is_bot_login(reviewer)
-        if is_bot:
-            canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
-            if canonical not in bot_review_allowlist and reviewer_cf not in bot_review_allowlist:
-                continue
-        latest_review_states.add(review.get("state"))
+    latest_review_states = {
+        review.get("state")
+        for review in detail.get("latestReviews") or []
+        if (review.get("author") or {}).get("login")
+        and review["author"]["login"].casefold() != expected_author.casefold()
+    }
     if "CHANGES_REQUESTED" in latest_review_states:
         reasons.append("Changes Requested")
     if "COMMENTED" in latest_review_states:
@@ -488,38 +391,9 @@ def _classify_pr_attention(pr, expected_author, bot_review_allowlist, detail):
     return pr
 
 
-def _should_suppress_bot_review_notification(
-    detail, repo, number, expected_author, bot_review_allowlist,
-):
-    latest_commit_at = _latest_commit_at(detail)
-    bot_flags = detail.get("_bot_flags")
-    if bot_flags is None:
-        bot_flags = _fetch_review_bot_flags(repo, number)
-    suppress = False
-    for review in detail.get("latestReviews") or []:
-        if review.get("state") != "COMMENTED":
-            continue
-        reviewer = review.get("author", {}).get("login") or ""
-        if not reviewer or reviewer.casefold() == expected_author.casefold():
-            continue
-        reviewer_cf = reviewer.casefold()
-        is_bot = bot_flags.get(reviewer_cf)
-        if is_bot is None:
-            is_bot = _is_bot_login(reviewer)
-        if not is_bot:
-            return False
-        canonical = reviewer_cf if reviewer_cf.endswith("[bot]") else f"{reviewer_cf}[bot]"
-        if canonical in bot_review_allowlist or reviewer_cf in bot_review_allowlist:
-            if not _review_is_superseded(review, latest_commit_at):
-                return False
-        suppress = True
-    return suppress
-
-
 
 def _fetch_pr_attention(
-    author, detail_pool, bot_review_allowlist=frozenset(),
-    current_login=None, detail_lookup=None,
+    author, detail_pool, current_login=None, detail_lookup=None,
 ):
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
@@ -544,7 +418,7 @@ def _fetch_pr_attention(
     return [
         result for pr in prs
         if (result := _classify_pr_attention(
-            pr, expected_author, bot_review_allowlist, detail_for(pr),
+            pr, expected_author, detail_for(pr),
         )) is not None
     ]
 
@@ -684,9 +558,84 @@ def _notification_item(notification, subject_state=None, subject_info=None):
     return item
 
 
-def _fetch_notification_delta(
-    current_login=None, bot_review_allowlist=frozenset(), since=None,
-):
+def _only_bot_timeline_comments_since_read(notification, repo, number):
+    # The last comment URL only limits which threads need a timeline lookup;
+    # it does not identify the event that made the thread unread.
+    comment_url = notification["subject"].get("latest_comment_url")
+    if not isinstance(comment_url, str) or not re.fullmatch(
+        rf"https://api\.github\.com/repos/{re.escape(repo)}/issues/comments/\d+",
+        comment_url, re.IGNORECASE,
+    ) or repo.count("/") != 1:
+        return False
+    cutoff = _parse_github_timestamp(notification.get("last_read_at"), require_timezone=True)
+    if cutoff is None:
+        return False
+
+    # REST timeline commits lack an event timestamp. GraphQL's server-side
+    # 'since' filter excludes old commits and includes unread ones as distinct
+    # PullRequestCommit nodes, so they cannot be mistaken for issue comments.
+    owner, name = repo.split("/", 1)
+    query = """query($owner: String!, $name: String!, $number: Int!,
+                    $since: DateTime!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          timelineItems(first: 100, since: $since, after: $endCursor) {
+            nodes {
+              __typename
+              ... on IssueComment {
+                createdAt
+                author { __typename }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }"""
+    try:
+        pages = _required_gh_json([
+            "api", "graphql", "--paginate", "--slurp",
+            "-f", f"owner={owner}", "-f", f"name={name}",
+            "-F", f"number={number}",
+            "-f", f"since={cutoff.isoformat().replace('+00:00', 'Z')}",
+            "-f", f"query={query}",
+        ])
+    except Exception:
+        return False
+    if not isinstance(pages, list) or not pages:
+        return False
+
+    saw_unread_comment = False
+    for index, page in enumerate(pages):
+        if not isinstance(page, dict) or page.get("errors"):
+            return False
+        data = page.get("data")
+        repository = data.get("repository") if isinstance(data, dict) else None
+        pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+        timeline = pull_request.get("timelineItems") if isinstance(pull_request, dict) else None
+        if not isinstance(timeline, dict):
+            return False
+        nodes = timeline.get("nodes")
+        page_info = timeline.get("pageInfo")
+        if (not isinstance(nodes, list) or not nodes or len(nodes) > 100
+                or not isinstance(page_info, dict)
+                or page_info.get("hasNextPage") is not (index < len(pages) - 1)
+                or (page_info["hasNextPage"] and (
+                    not isinstance(page_info.get("endCursor"), str)
+                    or not page_info["endCursor"]))):
+            return False
+        for event in nodes:
+            if not isinstance(event, dict) or event.get("__typename") != "IssueComment":
+                return False
+            event_time = _parse_github_timestamp(event.get("createdAt"), require_timezone=True)
+            author = event.get("author")
+            if (event_time is None or event_time <= cutoff
+                    or not isinstance(author, dict) or author.get("__typename") != "Bot"):
+                return False
+            saw_unread_comment = True
+    return saw_unread_comment
+
+def _fetch_notification_delta(since=None):
     """Fetch and validate a durable delta of unread notification threads."""
     poll_started = datetime.now(timezone.utc)
     args = ["api", "/notifications", "--method", "GET", "--paginate", "-f", "per_page=50"]
@@ -789,19 +738,11 @@ def _fetch_notification_delta(
                 return {"notification_id": thread_id, "_remove": True}
             if (
                 subject_type == "PullRequest"
-                and not subject.get("latest_comment_url")
                 and notification.get("reason") == "author"
+                and state_key is not None
+                and _only_bot_timeline_comments_since_read(notification, repo_name, state_key[2])
             ):
-                number = _notification_state_key(notification)[2]
-                detail = _fetch_pr_detail(repo_name, number, include_commits=True)
-                if (
-                    detail is not None
-                    and _should_suppress_bot_review_notification(
-                        detail, repo_name, number, current_login or "",
-                        bot_review_allowlist,
-                    )
-                ):
-                    return {"notification_id": thread_id, "_remove": True}
+                return {"notification_id": thread_id, "_remove": True}
             return _notification_item(notification, state)
         subject_url = subject.get("url") or ""
         if subject_url:
@@ -874,17 +815,11 @@ def _repo_dir_index(code_dir):
 
 
 
-def _fetch_search_items(config, current_login=None, bot_review_allowlist=None):
+def _fetch_search_items(config, current_login=None):
     github = config.get("github", {}) if isinstance(config, dict) else {}
     track_authors = github.get("trackAuthors", [])
     if not isinstance(track_authors, list):
         track_authors = []
-    if bot_review_allowlist is None:
-        bot_review_allowlist = frozenset(
-            login.casefold()
-            for login in github.get("botReviewAllowlist", [])
-            if isinstance(login, str)
-        )
     if current_login is None:
         current_login = _get_gh_login()
 
@@ -957,7 +892,6 @@ def _fetch_search_items(config, current_login=None, bot_review_allowlist=None):
                 _classify_pr_attention,
                 candidate,
                 current_login,
-                bot_review_allowlist,
                 detail_for(candidate),
             )
             for candidate in authored_candidates
@@ -970,7 +904,6 @@ def _fetch_search_items(config, current_login=None, bot_review_allowlist=None):
                         _classify_pr_attention,
                         candidate,
                         author,
-                        bot_review_allowlist,
                         detail_for(candidate),
                     )
                     for candidate in candidates
@@ -1026,15 +959,9 @@ def _fetch_search_items(config, current_login=None, bot_review_allowlist=None):
 
 def _fetch_raw(config):
     """Live retrieval seam retained for focused tests and manual refreshes."""
-    github = config.get("github", {}) if isinstance(config, dict) else {}
-    allowlist = frozenset(
-        login.casefold()
-        for login in github.get("botReviewAllowlist", [])
-        if isinstance(login, str)
-    )
     current_login = _get_gh_login()
-    search_items = _fetch_search_items(config, current_login, allowlist)
-    notification_items, _ = _fetch_notification_delta(current_login, allowlist)
+    search_items = _fetch_search_items(config, current_login)
+    notification_items, _ = _fetch_notification_delta()
     return _compose_raw(search_items, notification_items)
 
 
