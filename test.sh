@@ -576,90 +576,143 @@ print(next(args for args in calls if args[:2] == ['api', '/notifications']))
 }
 test_github_notification_batch_normalizes_graphql_state
 
-test_github_review_notification_respects_current_review_state() {
+test_github_notification_timeline_only_suppresses_unread_bot_comments() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-notifications = [
-    {'id': 'stale-bot', 'unread': True, 'reason': 'author',
-     'subject': {'type': 'PullRequest', 'title': 'Stale bot review',
-                 'url': 'https://api.github.com/repos/o/r/pulls/1',
-                 'latest_comment_url': None},
-     'repository': {'full_name': 'o/r'}},
-    {'id': 'human-review', 'unread': True, 'reason': 'author',
-     'subject': {'type': 'PullRequest', 'title': 'Human review',
-                 'url': 'https://api.github.com/repos/o/r/pulls/2',
-                 'latest_comment_url': None},
-     'repository': {'full_name': 'o/r'}},
-    {'id': 'current-bot', 'unread': True, 'reason': 'author',
-     'subject': {'type': 'PullRequest', 'title': 'Current bot review',
-                 'url': 'https://api.github.com/repos/o/r/pulls/3',
-                 'latest_comment_url': None},
-     'repository': {'full_name': 'o/r'}},
-]
-details = {
-    '1': {
-        'latestReviews': [
-            {'author': {'login': 'copilot-pull-request-reviewer'}, 'state': 'COMMENTED',
-             'submittedAt': '2026-09-15T00:40:52Z'},
-        ],
-        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
-    },
-    '2': {
-        'latestReviews': [
-            {'author': {'login': 'human-reviewer'}, 'state': 'COMMENTED',
-             'submittedAt': '2026-09-15T03:00:00Z'},
-        ],
-        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
-    },
-    '3': {
-        'latestReviews': [
-            {'author': {'login': 'copilot-pull-request-reviewer'}, 'state': 'COMMENTED',
-             'submittedAt': '2026-09-15T03:00:00Z'},
-        ],
-        'commits': [{'committedDate': '2026-09-15T02:05:42Z'}],
-    },
-}
+base = 'https://api.github.com/repos/o/r/'
+cutoff = '2026-09-30T10:00:00Z'
+before = '2026-09-30T09:00:00Z'
+after = '2026-09-30T11:00:00Z'
 
+def comment_url(number):
+    return base + 'issues/comments/' + str(number)
+
+def note(name, number, last_read_at=cutoff, latest_comment_url=None):
+    return {
+        'id': name, 'unread': True, 'reason': 'author',
+        'last_read_at': last_read_at,
+        'subject': {
+            'type': 'PullRequest', 'title': name,
+            'url': base + 'pulls/' + str(number),
+            'latest_comment_url': comment_url(number) if latest_comment_url is None else latest_comment_url,
+        },
+        'repository': {'full_name': 'o/r'},
+    }
+
+def comment(at=after, actor_type='Bot'):
+    return {'__typename': 'IssueComment', 'createdAt': at,
+            'author': {'__typename': actor_type}}
+
+notifications = [
+    note('bot-only', 1),
+    note('bot-then-review', 2),
+    note('human-comment', 3),
+    note('mixed-history', 4),
+    note('unknown-event', 5),
+    note('unknown-author', 6),
+    note('equal-boundary', 7),
+    note('missing-time', 8),
+    note('incomplete-page', 9),
+    note('full-final-page', 10),
+    note('multipage-bot-only', 11),
+    note('missing-cutoff', 12, last_read_at=None),
+    note('bot-review', 13, latest_comment_url=''),
+    note('review-comment', 14, latest_comment_url=base + 'pulls/comments/88'),
+    note('failed-page', 15),
+    note('invalid-cutoff', 16, last_read_at='not-a-date'),
+    note('empty-timeline', 17),
+    note('old-only', 18),
+    note('review-line-comment', 19),
+    note('date-only-cutoff', 21, last_read_at='2026-09-30'),
+    note('naive-cutoff', 22, last_read_at='2026-09-30T10:00:00'),
+    note('naive-event', 23),
+    note('date-only-event', 24),
+    note('commit-before-read', 25),
+    note('post-read-commit', 26),
+    note('graphql-errors', 27),
+    note('malformed-page', 28),
+    note('truncated-page', 29),
+]
+# GraphQL's since filter omits the preceding REST committed event on PR 25.
+timelines = {
+    1: [[comment(), comment('2026-09-30T12:00:00Z')]],
+    2: [[comment(), {'__typename': 'PullRequestReview'}]],
+    3: [[comment(actor_type='User')]],
+    4: [[comment(), comment('2026-09-30T12:00:00Z', 'User')]],
+    5: [[comment(), {'__typename': 'LabeledEvent'}]],
+    6: [[dict(comment(), author=None)]],
+    7: [[comment(cutoff), comment()]],
+    8: [[dict(comment(), createdAt=None)]],
+    9: [[comment()], None],
+    10: [[comment()] * 100],
+    11: [[comment()] * 100, [comment()]],
+    17: [[]],
+    18: [[comment(before)]],
+    19: [[dict(comment(), __typename='PullRequestReviewComment')]],
+    23: [[comment('2026-09-30T11:00:00')]],
+    24: [[comment('2026-09-30')]],
+    25: [[comment()]],
+    26: [[comment(), {'__typename': 'PullRequestCommit'}]],
+    27: [[comment()]],
+    28: [[comment()]],
+    29: [[comment()]],
+}
 def gh_json(args):
     if args[:2] == ['api', '/notifications']:
         return notifications
     if args[:2] == ['api', 'repos/o/r']:
         return {'archived': False}
-    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/1']:
+    if args[0] == 'api' and args[1].startswith(base + 'pulls/'):
         return {'state': 'open'}
-    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/2']:
-        return {'state': 'open'}
-    if args[:2] == ['api', 'https://api.github.com/repos/o/r/pulls/3']:
-        return {'state': 'open'}
-    if args[:2] == ['pr', 'view']:
-        return details[args[2]]
-    return []
+    if args[:4] == ['api', 'graphql', '--paginate', '--slurp']:
+        number = int(next(arg.split('=', 1)[1] for arg in args if arg.startswith('number=')))
+        if number == 15:
+            raise p.GitHubFetchError('incomplete timeline pagination')
+        events = timelines[number]
+        pages = []
+        for index, nodes in enumerate(events):
+            if nodes is None:
+                pages.append(None)
+                continue
+            pages.append({'data': {'repository': {'pullRequest': {'timelineItems': {
+                'nodes': nodes, 'pageInfo': {
+                    'hasNextPage': index < len(events) - 1,
+                    'endCursor': 'next' if index < len(events) - 1 else None,
+                },
+            }}}}})
+        if number == 27:
+            pages[0]['errors'] = [{'message': 'partial timeline'}]
+        if number == 28:
+            pages[0]['data'] = [1]
+        if number == 29:
+            page_info = pages[0]['data']['repository']['pullRequest']['timelineItems']['pageInfo']
+            page_info.update(hasNextPage=True, endCursor='missing-page')
+        return pages
+    raise AssertionError(args)
+
 
 p._gh_json = gh_json
-p._fetch_review_bot_flags = lambda repo, number: {
-    'copilot-pull-request-reviewer': True,
-    'human-reviewer': False,
-}
-default_result, _ = p._fetch_notification_delta('author')
-allowlisted_result, _ = p._fetch_notification_delta(
-    'author', frozenset(['copilot-pull-request-reviewer[bot]']),
-)
-print([item['notification_id'] for item in default_result if not item.get('_remove')])
-print([item['notification_id'] for item in allowlisted_result if not item.get('_remove')])
+p._fetch_notification_state = lambda notifications: None
+result, _ = p._fetch_notification_delta()
+print([item['notification_id'] for item in result if item.get('_remove')])
+print([item['notification_id'] for item in result if not item.get('_remove')])
+p._fetch_raw = lambda config: p._compose_raw([], result)
+p._build_repo_dir_index = lambda code_dir: {}
+print([(item['title'], item['status']) for item in p.fetch({'codeDir': '/tmp'})
+       if item['title'] in {'bot-then-review', 'human-comment', 'missing-cutoff', 'incomplete-page', 'bot-review'}])
 ")"
-  check "a bot review superseded by a newer commit is not Reply needed, while a human review after that commit remains" \
-    "$(sed -n 1p <<<"$out")" "['human-review']"
-  check "an allowlisted current bot review remains visible" \
-    "$(sed -n 2p <<<"$out")" "['human-review', 'current-bot']"
+  check "only complete strictly post-read bot timeline comments are suppressed, including across pages and after old commits" "$(sed -n 1p <<<"$out")" "['bot-only', 'full-final-page', 'multipage-bot-only', 'commit-before-read']"
+  check "reviews, human/mixed/unknown activity, missing or equal timestamps, and incomplete timelines remain" "$(sed -n 2p <<<"$out")" "['bot-then-review', 'human-comment', 'mixed-history', 'unknown-event', 'unknown-author', 'equal-boundary', 'missing-time', 'incomplete-page', 'missing-cutoff', 'bot-review', 'review-comment', 'failed-page', 'invalid-cutoff', 'empty-timeline', 'old-only', 'review-line-comment', 'date-only-cutoff', 'naive-cutoff', 'naive-event', 'date-only-event', 'post-read-commit', 'graphql-errors', 'malformed-page', 'truncated-page']"
+  check "human comments and bot reviews still render while bot-only comments do not" "$(sed -n 3p <<<"$out")" "[('bot-then-review', 'COMMENTED'), ('human-comment', 'COMMENTED'), ('incomplete-page', 'COMMENTED'), ('missing-cutoff', 'COMMENTED'), ('bot-review', 'COMMENTED')]"
 }
-test_github_review_notification_respects_current_review_state
+test_github_notification_timeline_only_suppresses_unread_bot_comments
 
 test_github_fetch_always_retrieves_live_state() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
-config = {'github': {'trackAuthors': ['alice'], 'botReviewAllowlist': ['bot']}}
+config = {'github': {'trackAuthors': ['alice']}}
 state = {'search': 0, 'delta': 0}
 def search(cfg, *_):
     state['search'] += 1
@@ -1869,7 +1922,7 @@ print(combined)
 }
 test_pr_detail_aggregate_concurrency_capped_at_32_across_authors
 
-test_pr_attention_classification_uses_batched_bot_metadata() {
+test_pr_attention_classification_uses_batched_reviews() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
@@ -1878,7 +1931,7 @@ def detail():
     return {
         'mergeable': 'MERGEABLE', 'reviewDecision': None,
         'statusCheckRollup': [],
-        'latestReviews': [{'author': {'login': 'reviewer', '__typename': 'User'}, 'state': 'COMMENTED'}],
+        'latestReviews': [{'author': {'login': 'coderabbitai', '__typename': 'Bot'}, 'state': 'COMMENTED'}],
     }
 def fake_gh_json(args):
     if args[:2] == ['search', 'prs'] and '--author=@me' in args:
@@ -1899,14 +1952,16 @@ p._gh_json = fake_gh_json
 p._get_gh_login = lambda: 'me'
 result = p._fetch_raw({'github': {'trackAuthors': ['alice']}})
 print(state['graphql'])
-print([(pr['type'], pr['number']) for pr in result])
+print([(pr['type'], pr['number'], pr['attention_reasons']) for pr in result])
+p._fetch_raw = lambda config: result
+p._build_repo_dir_index = lambda code_dir: {}
+print([(item['id'], item['status'], item['indicators']['state']) for item in p.fetch({'codeDir': '/tmp'})])
 ")"
-  check "all candidate PR details and bot actor types use one GraphQL request" \
-    "$(sed -n 1p <<<"$out")" "1"
-  check "batched detail metadata preserves tracked-before-authored classification order" \
-    "$(sed -n 2p <<<"$out")" "[('tracked_attention', 3), ('tracked_attention', 4), ('authored_attention', 1), ('authored_attention', 2)]"
+  check "candidate PR details use one GraphQL request" "$(sed -n 1p <<<"$out")" "1"
+  check "batched bot reviews flag tracked and authored PRs in existing precedence order" "$(sed -n 2p <<<"$out")" "[('tracked_attention', 3, ['Review Commented']), ('tracked_attention', 4, ['Review Commented']), ('authored_attention', 1, ['Review Commented']), ('authored_attention', 2, ['Review Commented'])]"
+  check "bot reviews render tracked and authored PRs as needing attention" "$(sed -n 3p <<<"$out")" "[('3', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('4', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('1', 'NEEDS ATTENTION', 'Reply needed'), ('2', 'NEEDS ATTENTION', 'Reply needed')]"
 }
-test_pr_attention_classification_uses_batched_bot_metadata
+test_pr_attention_classification_uses_batched_reviews
 
 test_batched_pr_detail_normalizes_legacy_status_contexts() {
   local out
@@ -1950,10 +2005,6 @@ def fake_gh_json(args):
         }
     if args[:2] == ['api', '/notifications']:
         return []
-    if args[:2] == ['api', 'graphql']:
-        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
-            {'author': {'__typename': 'User', 'login': 'reviewer'}}
-        ]}}}}}
     raise AssertionError(args)
 
 
@@ -1979,7 +2030,6 @@ prs = [
     {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
     {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
 ]
-requested_detail_fields = []
 
 
 
@@ -1987,13 +2037,12 @@ def fake_gh_json(args):
     if args[:2] == ['search', 'prs']:
         return prs
     if args[:2] == ['pr', 'view']:
-        requested_detail_fields.append(args[-1])
 
         if args[2] == '1':
             return {
                 'mergeable': 'MERGEABLE', 'reviewDecision': None,
                 'statusCheckRollup': [],
-                'comments': [{'author': {'login': 'reviewer'}}],
+                'comments': [{'author': {'login': 'visual-diff[bot]'}}],
                 'latestReviews': [],
             }
         if args[2] == '3':
@@ -2012,10 +2061,6 @@ def fake_gh_json(args):
         }
     if args[:2] == ['api', '/notifications']:
         return []
-    if args[:2] == ['api', 'graphql']:
-        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
-            {'author': {'__typename': 'User', 'login': 'reviewer'}}
-        ]}}}}}
     raise AssertionError(args)
 
 
@@ -2024,74 +2069,73 @@ p._get_gh_login = lambda: 'author'
 with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
     result = p._fetch_pr_attention('@me', detail_pool)
 print([(r['number'], r['attention_reasons']) for r in result])
-print(all('latestReviews' in fields.split(',') for fields in requested_detail_fields))
 
 ")"
-  check "ordinary comments do not flag authored PRs while non-author COMMENTED latest reviews do" \
-    "$(sed -n 1p <<<"$out")" "[(2, ['Review Commented'])]"
-  check "PR attention requests each reviewer's latest review" \
-    "$(sed -n 2p <<<"$out")" "True"
+  check "ordinary bot PR timeline comments do not flag authored PRs while COMMENTED latest reviews do" "$(sed -n 1p <<<"$out")" "[(2, ['Review Commented'])]"
 }
 test_pr_attention_uses_reviews_not_timeline_comments
 
-test_pr_attention_ignores_bot_review_comments_unless_allowlisted() {
+test_pr_attention_includes_bot_reviews_not_bot_timeline_comments() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
 import concurrent.futures
 
 prs = [
-    {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}},
-    {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}},
-    {'number': 3, 'repository': {'nameWithOwner': 'owner/repo'}},
-    {'number': 4, 'repository': {'nameWithOwner': 'owner/repo'}},
+    {'number': number, 'repository': {'nameWithOwner': 'owner/repo'}}
+    for number in range(1, 7)
 ]
-
-# Real \`gh pr view --json latestReviews\` never exposes __typename, and a
-# Bot actor's bare login there never carries a \"[bot]\" suffix (verified
-# against live PRs reviewed by Copilot/CodeRabbit/dependabot) -- only the
-# separate \`api graphql\` lookup in _fetch_review_bot_flags() can tell a
-# bot review from a human one.
-reviewer_by_number = {'1': 'dependabot', '2': 'coderabbitai', '3': 'human-reviewer', '4': 'legacy-bot[bot]'}
-typename_by_number = {'1': 'Bot', '2': 'Bot', '3': 'User'}
-
+details = {
+    '1': {
+        'mergeable': 'CONFLICTING',
+        'statusCheckRollup': [{'conclusion': 'FAILURE'}],
+        'latestReviews': [{'author': {'login': 'coderabbitai'}, 'state': 'COMMENTED'}],
+    },
+    '2': {
+        'mergeable': 'MERGEABLE', 'statusCheckRollup': [],
+        'latestReviews': [
+            {'author': {'login': 'copilot-pull-request-reviewer'}, 'state': 'CHANGES_REQUESTED'},
+            {'author': {'login': 'reviewer'}, 'state': 'COMMENTED'},
+        ],
+    },
+    '3': {
+        'mergeable': 'MERGEABLE', 'statusCheckRollup': [],
+        'latestReviews': [{'author': {'login': 'dependabot'}, 'state': 'APPROVED'}],
+    },
+    '4': {
+        'mergeable': 'MERGEABLE', 'statusCheckRollup': [],
+        'comments': [{'author': {'login': 'visual-diff[bot]'}, 'body': 'Visual diff'}],
+        'latestReviews': [],
+    },
+    '5': {
+        'mergeable': 'MERGEABLE', 'statusCheckRollup': [],
+        'latestReviews': [{'author': {'login': 'author'}, 'state': 'COMMENTED'}],
+    },
+    '6': {
+        'mergeable': 'MERGEABLE',
+        'statusCheckRollup': [{'conclusion': 'FAILURE'}],
+        'latestReviews': [{'author': {'login': 'dependabot'}, 'state': 'APPROVED'}],
+    },
+}
 
 def fake_gh_json(args):
     if args[:2] == ['search', 'prs']:
         return prs
     if args[:2] == ['pr', 'view']:
-        reviewer = reviewer_by_number[args[2]]
-        return {
-            'mergeable': 'MERGEABLE', 'reviewDecision': None,
-            'statusCheckRollup': [],
-            'latestReviews': [{'author': {'login': reviewer}, 'state': 'COMMENTED'}],
-        }
-    if args[:2] == ['api', '/notifications']:
-        return []
-    if args[:2] == ['api', 'graphql']:
-        number = next(a.split('=', 1)[1] for a in args if a.startswith('number='))
-        if number == '4':
-            return []  # simulate the graphql lookup itself being unreachable
-        return {'data': {'repository': {'pullRequest': {'latestReviews': {'nodes': [
-            {'author': {'__typename': typename_by_number[number], 'login': reviewer_by_number[number]}}
-        ]}}}}}
+        return details[args[2]]
     raise AssertionError(args)
-
 
 p._gh_json = fake_gh_json
 p._get_gh_login = lambda: 'author'
 with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
-    default_result = p._fetch_pr_attention('@me', detail_pool)
-    allowlisted_result = p._fetch_pr_attention('@me', detail_pool, frozenset(['coderabbitai[bot]']))
-print([(r['number'], r['attention_reasons']) for r in default_result])
-print([(r['number'], r['attention_reasons']) for r in allowlisted_result])
+    result = p._fetch_pr_attention('@me', detail_pool)
+print([(r['number'], r['attention_reasons']) for r in result])
+print([p._status_label('authored_attention', r['attention_reasons'], False, False) for r in result])
 ")"
-  check "unlisted bots (bare GraphQL Bot login, no [bot] suffix) never flag a PR by default -- only the human reviewer does" \
-    "$(sed -n 1p <<<"$out")" "[(3, ['Review Commented'])]"
-  check "allowlisting a bot login (with the [bot] suffix, as documented) admits its bare-login review too" \
-    "$(sed -n 2p <<<"$out")" "[(2, ['Review Commented']), (3, ['Review Commented'])]"
+  check "bot COMMENTED reviews retain merge and CI reasons; bot CHANGES_REQUESTED wins over COMMENTED; approvals, own reviews, and bot timeline comments do not flag PRs" "$(sed -n 1p <<<"$out")" "[(1, ['Review Commented', 'Merge Conflict', 'Checks Failing']), (2, ['Changes Requested', 'Review Commented']), (6, ['Checks Failing'])]"
+  check "merge conflict, changes requested, and CI failure retain status precedence" "$(sed -n 2p <<<"$out")" "['Merge conflict', 'Changes requested', 'CI failing']"
 }
-test_pr_attention_ignores_bot_review_comments_unless_allowlisted
+test_pr_attention_includes_bot_reviews_not_bot_timeline_comments
 
 test_pr_attention_flags_review_requested_from_pending_requests() {
   local out
