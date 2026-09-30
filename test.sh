@@ -2186,6 +2186,8 @@ p._fetch_raw = lambda cfg: [
     {'number': 1, 'title': 'Authored waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/1', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
     {'number': 2, 'title': 'Authored no reviewer yet', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/2', 'type': 'authored_attention', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': False},
     {'number': 3, 'title': 'Tracked waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/3', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
+    {'number': 4, 'title': 'Authored review comment with pending request', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/4', 'type': 'authored_attention', 'attention_reasons': ['Review Commented'], 'reviewRequested': True},
+    {'number': 5, 'title': 'Tracked changes requested with pending request', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/5', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Changes Requested'], 'reviewRequested': True},
 ]
 items = p.fetch({'codeDir': '/tmp/nonexistent'})
 print(json.dumps({i['title']: i['status'] for i in items}))
@@ -2196,6 +2198,10 @@ print(json.dumps({i['title']: i['status'] for i in items}))
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored no reviewer yet'])" <<<"$out")" "NEEDS ATTENTION"
   check "tracked PR with a pending review request keeps the author prefix" \
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Tracked waiting on review'])" <<<"$out")" "TEAMMATE: REVIEW REQUESTED"
+  check "authored review comment outranks a pending review request" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored review comment with pending request'])" <<<"$out")" "NEEDS ATTENTION"
+  check "tracked changes-requested review outranks a pending review request" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Tracked changes requested with pending request'])" <<<"$out")" "TEAMMATE: NEEDS ATTENTION"
 }
 test_fetch_shows_review_requested_status_on_authored_and_tracked_prs
 
