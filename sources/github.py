@@ -1039,14 +1039,16 @@ def fetch(config):
         details = ""
         if gtype == "review_request":
             weight, status = 90, "REVIEW REQUESTED"
-        elif gtype == "authored_attention":
-            weight, status = 88, "NEEDS ATTENTION"
-            if g.get("reviewRequested"):
-                status = "REVIEW REQUESTED"
-        elif gtype == "tracked_attention":
-            weight, status = 85, f"{g.get('tracked_author', '').upper()}: NEEDS ATTENTION"
-            if g.get("reviewRequested"):
-                status = f"{g.get('tracked_author', '').upper()}: REVIEW REQUESTED"
+        elif gtype in {"authored_attention", "tracked_attention"}:
+            tracked = gtype == "tracked_attention"
+            weight = 85 if tracked else 88
+            pending_request_only = g.get("reviewRequested") and not any(
+                reason in ("Changes Requested", "Review Commented")
+                for reason in g.get("attention_reasons", ())
+            )
+            status = "REVIEW REQUESTED" if pending_request_only else "NEEDS ATTENTION"
+            if tracked:
+                status = f"{g.get('tracked_author', '').upper()}: {status}"
         elif gtype == "assigned_issue":
             weight, status = 75, "ASSIGNED"
         elif gtype == "notification":

@@ -141,7 +141,10 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   candidates for this check, not the event that triggered the notification.
   COMMENTED and CHANGES_REQUESTED reviews count regardless of reviewer type,
   including bots; APPROVED reviews do not. Ordinary PR timeline comments are
-  not reviews. Items are de-duplicated by repository and number.
+  not reviews. Submitted review feedback keeps the NEEDS ATTENTION row status
+  even if another review request remains pending; a pending request without
+  review feedback can still show REVIEW REQUESTED. Items are de-duplicated by
+  repository and number.
   Visible PRs that target another visible PR's head branch render as a tree,
   with the target PR above its child.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate
