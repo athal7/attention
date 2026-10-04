@@ -31,9 +31,10 @@ class PanePayloadTests(unittest.TestCase):
         payload = worker.pane_payload(items)
         rows = [block for block in payload["blocks"] if block["kind"] == "row"]
         self.assertEqual([block["label"] for block in rows], ["urgent · repo · Fix", "later · calendar · Plan"])
-        huge = [{"status": "x", "context": "", "title": str(i), "details": "z" * 500} for i in range(500)]
-        encoded = json.dumps(worker.pane_payload(huge), ensure_ascii=False).encode()
-        self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
+        for details in ("z" * 500, "界" * 500):
+            huge = [{"status": "x", "context": "", "title": str(i), "details": details} for i in range(500)]
+            encoded = json.dumps(worker.pane_payload(huge), separators=(",", ":")).encode("utf-8")
+            self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
 
     def test_trimming_keeps_largest_ordered_prefix_with_duplicate_rows(self):
         first = {"status": "now", "context": "repo", "title": "Ship", "details": "x" * 500}
@@ -47,13 +48,14 @@ class PanePayloadTests(unittest.TestCase):
             if block["kind"] == "row"
         ]
         expected = {"title": "Attention", "default_location": "right", "blocks": [heading, *expected_rows, omission, refresh]}
-        limit = len(json.dumps(expected, ensure_ascii=False).encode("utf-8"))
+        limit = len(json.dumps(expected, separators=(",", ":")).encode("utf-8"))
         with patch.object(worker, "MAX_PANE_BYTES", limit):
             payload = worker.pane_payload([first, middle, last])
         rows = [block for block in payload["blocks"] if block["kind"] == "row"]
         self.assertEqual(rows, expected_rows)
         self.assertIn(omission, payload["blocks"])
-        self.assertLessEqual(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), limit)
+        self.assertIn(refresh, payload["blocks"])
+        self.assertLessEqual(len(json.dumps(payload, separators=(",", ":")).encode("utf-8")), limit)
 
 
 class AttentionSourceTests(unittest.TestCase):

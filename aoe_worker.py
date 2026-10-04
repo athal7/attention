@@ -85,15 +85,15 @@ def pane_payload(items):
     blocks.extend(rows)
     blocks.append(refresh)
     payload = {"title": "Attention", "default_location": "right", "blocks": blocks}
-    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_PANE_BYTES or not rows:
+    if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) <= MAX_PANE_BYTES or not rows:
         return payload
 
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     payload["blocks"] = [heading, omission, refresh]
-    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     kept = 0
     for row in rows:
-        row_size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + 2
+        row_size = len(json.dumps(row, separators=(",", ":")).encode("utf-8")) + 1
         if size + row_size > MAX_PANE_BYTES:
             break
         size += row_size
