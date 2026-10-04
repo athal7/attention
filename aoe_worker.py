@@ -42,6 +42,8 @@ def rpc(method, params=None):
     send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
     while True:
         message = read_message()
+        if not isinstance(message, dict):
+            continue
         if "method" in message:
             dispatch(message)
             continue
@@ -75,23 +77,31 @@ def pane_payload(items):
         }
         for item in items
     ]
-    blocks = [{"kind": "heading", "text": "Prioritized items"}]
+    heading = {"kind": "heading", "text": "Prioritized items"}
+    refresh = {"kind": "action", "label": "Refresh", "method": "attention.refresh"}
+    blocks = [heading]
     if not rows:
         blocks.append({"kind": "note", "text": "No attention items."})
     blocks.extend(rows)
-    refresh = {"kind": "action", "label": "Refresh", "method": "attention.refresh"}
     blocks.append(refresh)
     payload = {"title": "Attention", "default_location": "right", "blocks": blocks}
-    omitted = False
-    while len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_PANE_BYTES and rows:
-        blocks.remove(rows.pop())
-        omitted = True
-    if omitted:
-        note = {"kind": "note", "text": "Additional items omitted to fit the pane."}
-        blocks.insert(-1, note)
-        while len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_PANE_BYTES and rows:
-            blocks.remove(rows.pop())
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_PANE_BYTES or not rows:
+        return payload
+
+    omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
+    payload["blocks"] = [heading, omission, refresh]
+    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    kept = 0
+    for row in rows:
+        row_size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + 2
+        if size + row_size > MAX_PANE_BYTES:
+            break
+        size += row_size
+        kept += 1
+    payload["blocks"] = [heading, *rows[:kept], omission, refresh]
     return payload
+
+
 def publish_snapshot():
     result = rpc("sessions.list")
     sessions = result.get("sessions", []) if isinstance(result, dict) else []
@@ -145,6 +155,8 @@ def main():
                 message = read_message(deadline - time.monotonic())
                 if message is None:
                     break
+                if not isinstance(message, dict):
+                    continue
                 if "method" in message:
                     dispatch(message)
         except EOFError:

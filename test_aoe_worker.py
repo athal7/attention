@@ -35,6 +35,26 @@ class PanePayloadTests(unittest.TestCase):
         encoded = json.dumps(worker.pane_payload(huge), ensure_ascii=False).encode()
         self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
 
+    def test_trimming_keeps_largest_ordered_prefix_with_duplicate_rows(self):
+        first = {"status": "now", "context": "repo", "title": "Ship", "details": "x" * 500}
+        middle = {"status": "later", "context": "calendar", "title": "Plan", "details": "middle"}
+        last = dict(first)
+        heading = {"kind": "heading", "text": "Prioritized items"}
+        omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
+        refresh = {"kind": "action", "label": "Refresh", "method": "attention.refresh"}
+        expected_rows = [
+            block for block in worker.pane_payload([first, middle])["blocks"]
+            if block["kind"] == "row"
+        ]
+        expected = {"title": "Attention", "default_location": "right", "blocks": [heading, *expected_rows, omission, refresh]}
+        limit = len(json.dumps(expected, ensure_ascii=False).encode("utf-8"))
+        with patch.object(worker, "MAX_PANE_BYTES", limit):
+            payload = worker.pane_payload([first, middle, last])
+        rows = [block for block in payload["blocks"] if block["kind"] == "row"]
+        self.assertEqual(rows, expected_rows)
+        self.assertIn(omission, payload["blocks"])
+        self.assertLessEqual(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), limit)
+
 
 class AttentionSourceTests(unittest.TestCase):
     def test_real_attention_module_reads_config_without_stale_module_cache(self):

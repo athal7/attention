@@ -11,4 +11,4 @@ id = "attention"
 
 [runtime]
 kind = "command"
-command = ["aoe_worker.py"]
+command = ["./aoe_worker.py"]
