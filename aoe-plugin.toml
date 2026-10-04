@@ -1,0 +1,14 @@
+id = "athal7.attention"
+name = "Attention"
+version = "1.0.0"
+api_version = 3
+description = "Prioritized attention items in each Agent of Empires session pane."
+capabilities = ["runtime.worker", "session.read", "net"]
+
+[[ui]]
+slot = "pane"
+id = "attention"
+
+[runtime]
+kind = "command"
+command = ["aoe_worker.py"]
