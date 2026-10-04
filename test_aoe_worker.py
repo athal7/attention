@@ -71,6 +71,16 @@ class AttentionSourceTests(unittest.TestCase):
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_rpc_ignores_non_object_messages_before_host_response(self):
+        request_id = worker.rpc.next_id
+        with patch.object(worker, "send") as send, patch.object(
+            worker, "read_message",
+            side_effect=[None, [], "unexpected", {"id": request_id, "result": {"sessions": []}}],
+        ):
+            result = worker.rpc("sessions.list")
+        self.assertEqual(result, {"sessions": []})
+        send.assert_called_once()
+
     def test_refresh_publishes_live_session_and_removes_stale_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             attention = Path(tmp) / "attention"
