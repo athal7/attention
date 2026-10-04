@@ -4378,5 +4378,8 @@ check "attention --help mentions Usage" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "== Agent of Empires pane worker =="
+python3 -m unittest -v "$REPO_ROOT/test_aoe_worker.py"
+
 echo "== summary: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

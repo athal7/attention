@@ -178,3 +178,12 @@ just point `config["plugins"]` at it.
 - [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
 - [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
 
+
+## Agent of Empires web dashboard
+
+This repository also provides an Agent of Empires community plugin that
+publishes the prioritized attention list in each session’s right-hand pane.
+Install from the repository root with `aoe plugin install .`, then enable it
+with `aoe plugin enable athal7.attention`. The worker refreshes every minute;
+select **Refresh** in the pane to fetch immediately. It reads the same
+`attention` configuration and source integrations as the terminal dashboard.
