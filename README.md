@@ -184,6 +184,8 @@ just point `config["plugins"]` at it.
 This repository also provides an Agent of Empires community plugin that
 publishes the prioritized attention list in each session’s right-hand pane.
 Install from the repository root with `aoe plugin install .`, then enable it
-with `aoe plugin enable athal7.attention`. The worker refreshes every minute;
-select **Refresh** in the pane to fetch immediately. It reads the same
-`attention` configuration and source integrations as the terminal dashboard.
+with `aoe plugin enable athal7.attention`. Items appear as status-colored cards
+with source icons, context, details, and signals. Available no-prompt actions are
+buttons on each card; actions that require interactive input remain in the
+terminal dashboard. The worker refreshes every minute; select **Refresh** to
+fetch immediately. It uses the same `attention` configuration and integrations.
