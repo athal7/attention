@@ -75,9 +75,9 @@ def attention_items():
 
 def _tone_for_status(status):
     value = status.lower()
-    if any(word in value for word in ("overdue", "blocked", "failed", "failure", "error", "conflict", "changes requested")):
+    if any(word in value for word in ("overdue", "blocked", "failed", "failing", "failure", "error", "conflict", "changes requested")):
         return "danger"
-    if any(word in value for word in ("urgent", "review", "due", "pending", "requested")):
+    if any(word in value for word in ("urgent", "review", "due", "pending", "requested", "attention")):
         return "warn"
     if any(word in value for word in ("approved", "complete", "resolved", "merged", "passing", "healthy", "done")):
         return "success"
@@ -102,6 +102,8 @@ def _status_icon(tone):
 
 def _action_icon(label):
     value = label.lower()
+    if "lumen" in value or "terminal" in value:
+        return "square-terminal"
     if "open" in value or "view" in value:
         return "external-link"
     if "approve" in value or "complete" in value or "done" in value:
@@ -129,7 +131,16 @@ def _web_actions(item, token_actions, token_factory):
         if str(payload.get("kind", "")).lower() in interactive.get(plugin, set()):
             continue
         token = token_factory()
-        token_actions[token] = dict(action)
+        dispatch_action = action
+        command = payload.get("command")
+        if (isinstance(command, list) and len(command) > 1
+                and Path(str(command[0])).name.casefold() == "lumen"
+                and command[1] == "diff"):
+            dispatch_action = dict(action)
+            dispatch_payload = dict(payload)
+            dispatch_payload["terminal"] = True
+            dispatch_action["payload"] = dispatch_payload
+        token_actions[token] = dispatch_action
         blocks.append({
             "kind": "action",
             "label": action.get("label", "Action")[:80],
@@ -147,39 +158,62 @@ def _item_card(item, token_actions, token_factory):
     title = str(item.get("title", "Attention item"))[:240]
     details = str(item.get("details", ""))[:600]
     plugin = str(item.get("_plugin", ""))
-    tone = _tone_for_status(status)
+    indicators = item.get("indicators")
+    state = indicators.get("state", "") if isinstance(indicators, dict) else ""
+    reason = str(item.get("attention_reason") or state or status or "Included in the prioritized Attention list.")[:400]
+    tone = _tone_for_status(status or reason)
     children = [{
-        "kind": "row",
-        "label": status or "Needs attention",
-        "value": context,
-        "icon": _status_icon(tone),
-        "tone": tone,
+        "kind": "row", "label": "Status", "value": status or "Unknown",
+        "icon": _status_icon(tone), "tone": tone,
     }]
+    if context:
+        children.append({"kind": "row", "label": "Context", "value": context, "icon": _source_icon(plugin)})
+    children.append({
+        "kind": "callout", "title": "Why this is recommended", "detail": reason,
+        "icon": _status_icon(_tone_for_status(reason)), "tone": _tone_for_status(reason),
+    })
     if details:
         children.append({"kind": "row", "label": "Details", "value": details, "icon": "align-left"})
-    indicators = item.get("indicators")
-    if isinstance(indicators, dict) and indicators:
-        value = " · ".join(f"{key}: {text}" for key, text in indicators.items())[:300]
-        children.append({"kind": "row", "label": "Signals", "value": value, "icon": "activity"})
-    children.extend(_web_actions(item, token_actions, token_factory))
+    if isinstance(indicators, dict):
+        signals = {key: value for key, value in indicators.items() if key != "state"}
+        if signals:
+            value = " · ".join(f"{key}: {text}" for key, text in signals.items())[:300]
+            children.append({"kind": "row", "label": "Signals", "value": value, "icon": "activity"})
+    actions = _web_actions(item, token_actions, token_factory)
+    if actions:
+        children.append({"kind": "columns", "children": actions})
     return {
-        "kind": "section",
-        "title": title,
-        "icon": _source_icon(plugin),
-        "tone": tone,
-        "boxed": True,
-        "children": children,
+        "kind": "section", "title": title, "icon": _source_icon(plugin),
+        "tone": tone, "boxed": True, "children": children,
     }
 
 
+def _walk_blocks(blocks):
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        yield block
+        yield from _walk_blocks(block.get("children", []))
+
+
 def _tokens_in_payload(payload):
-    tokens = set()
-    for block in payload.get("blocks", []):
-        for child in block.get("children", []):
-            params = child.get("params", {})
-            if child.get("method") == "attention.action" and isinstance(params.get("token"), str):
-                tokens.add(params["token"])
-    return tokens
+    return {
+        block.get("params", {}).get("token")
+        for block in _walk_blocks(payload.get("blocks", []))
+        if block.get("method") == "attention.action"
+        and isinstance(block.get("params", {}).get("token"), str)
+    }
+
+
+def _pane_toolbar():
+    return {
+        "kind": "columns",
+        "children": [{
+            "kind": "action", "label": "Refresh",
+            "method": "attention.refresh", "icon": "refresh-cw",
+            "variant": "secondary",
+        }],
+    }
 
 
 def build_pane(items, token_factory=None):
@@ -187,20 +221,21 @@ def build_pane(items, token_factory=None):
     token_actions = {}
     cards = [_item_card(item, token_actions, token_factory) for item in items]
     heading = {"kind": "heading", "text": "Prioritized items"}
-    refresh = {"kind": "action", "label": "Refresh", "method": "attention.refresh", "icon": "refresh-cw"}
+    session_note = {"kind": "note", "text": "Create sessions with AoE's built-in New session flow."}
+    toolbar = _pane_toolbar()
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     base = {"title": "Attention", "default_location": "right"}
-    blocks = [heading]
+    blocks = [heading, session_note]
     if not cards:
         blocks.append({"kind": "note", "text": "No attention items."})
     blocks.extend(cards)
-    blocks.append(refresh)
+    blocks.append(toolbar)
     payload = {**base, "blocks": blocks}
     if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) <= MAX_PANE_BYTES:
         return payload, token_actions
 
     kept = []
-    blocks = [heading, omission, refresh]
+    blocks = [heading, session_note, omission, toolbar]
     size = len(json.dumps({**base, "blocks": blocks}, separators=(",", ":")).encode("utf-8"))
     for card in cards:
         card_size = len(json.dumps(card, separators=(",", ":")).encode("utf-8")) + 1
@@ -208,14 +243,13 @@ def build_pane(items, token_factory=None):
             break
         kept.append(card)
         size += card_size
-    payload = {**base, "blocks": [heading, *kept, omission, refresh]}
+    payload = {**base, "blocks": [heading, session_note, *kept, omission, toolbar]}
     visible_tokens = _tokens_in_payload(payload)
     return payload, {token: action for token, action in token_actions.items() if token in visible_tokens}
 
 
 def pane_payload(items):
     return build_pane(items)[0]
-
 
 
 def live_sessions():
@@ -236,30 +270,33 @@ def status_payload(text):
         "blocks": [
             {"kind": "heading", "text": "Prioritized items"},
             {"kind": "note", "text": text},
-            {"kind": "action", "label": "Refresh", "method": "attention.refresh", "icon": "refresh-cw"},
+            {"kind": "note", "text": "Create sessions with AoE's built-in New session flow."},
+            _pane_toolbar(),
         ],
     }
 
 
 def _payload_action_tokens(payload):
-    return {
-        child.get("params", {}).get("token")
-        for block in payload.get("blocks", [])
-        for child in block.get("children", [])
-        if child.get("method") == "attention.action"
-        and isinstance(child.get("params", {}).get("token"), str)
-    }
+    return _tokens_in_payload(payload)
+
+
+def _remove_action_token(blocks, token):
+    cleaned = []
+    for block in blocks:
+        params = block.get("params", {})
+        if block.get("method") == "attention.action" and params.get("token") == token:
+            continue
+        copy = dict(block)
+        if isinstance(copy.get("children"), list):
+            copy["children"] = _remove_action_token(copy["children"], token)
+        cleaned.append(copy)
+    return cleaned
 
 
 def payload_with_notice(base_payload, text, consumed_token=None):
     payload = json.loads(json.dumps(base_payload))
-    for block in payload["blocks"]:
-        children = block.get("children")
-        if isinstance(children, list):
-            block["children"] = [
-                child for child in children
-                if not (child.get("method") == "attention.action" and child.get("params", {}).get("token") == consumed_token)
-            ]
+    if consumed_token is not None:
+        payload["blocks"] = _remove_action_token(payload["blocks"], consumed_token)
     blocks = payload["blocks"]
     blocks.insert(1, {"kind": "note", "text": text[:200]})
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
@@ -269,8 +306,12 @@ def payload_with_notice(base_payload, text, consumed_token=None):
             break
         blocks.pop(card_index)
         if omission not in blocks:
-            refresh_index = next((i for i, block in enumerate(blocks) if block.get("method") == "attention.refresh"), len(blocks))
-            blocks.insert(refresh_index, omission)
+            toolbar_index = next((i for i, block in enumerate(blocks)
+                                  if block.get("kind") == "columns" and any(
+                                      child.get("method") == "attention.refresh"
+                                      for child in block.get("children", [])
+                                  )), len(blocks))
+            blocks.insert(toolbar_index, omission)
     return payload
 
 def publish_payload(sessions, payload, only_new=False):
@@ -348,7 +389,10 @@ def dispatch(message):
     if request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
+
+
 def main():
+
     global published_ids, refresh_requested, action_tokens, live_session_ids
     global action_requests, active_action
     published_ids = set()
@@ -416,7 +460,7 @@ def main():
                 action_in_flight = False
                 active_action = None
                 message_text = f"Completed: {finished_label}" if completed else f"Action failed: {finished_label}"
-                payload = payload_with_notice(base_payload, message_text)
+                payload = payload_with_notice(base_payload, message_text, finished_token)
                 action_tokens = {
                     token: action for token, action in action_tokens.items()
                     if token in _payload_action_tokens(payload)

@@ -6,7 +6,10 @@ plugins), but nothing requires it.
 """
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -52,6 +55,51 @@ def dispatch_background(cmd):
         except Exception as e:
             print(f"Failed to dispatch: {e}")
             return False
+
+
+def run_terminal(cmd):
+    """Run an interactive configured action in a separate terminal window."""
+    if sys.platform == "darwin":
+        command = shlex.join(cmd).replace("\\", "\\\\").replace("\"", "\\\"")
+        script = f'tell application "Terminal" to do script "{command}"'
+        try:
+            subprocess.run(["osascript", "-e", script], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            return True
+        except Exception as exc:
+            print(f"Could not open Terminal: {exc}")
+            return False
+    if sys.platform.startswith("linux"):
+        configured = os.environ.get("TERMINAL")
+        candidates = [(shlex.split(configured), "-e")] if configured else [
+            ([path], mode) for name, mode in (("x-terminal-emulator", "-e"),
+                                                ("gnome-terminal", "--"),
+                                                ("konsole", "-e"), ("xterm", "-e"))
+            if (path := shutil.which(name))
+        ]
+        if not candidates:
+            print("Set TERMINAL to run this interactive action in a terminal window.")
+            return False
+        terminal, mode = candidates[0]
+        try:
+            subprocess.Popen([*terminal, mode, *cmd], start_new_session=True)
+            return True
+        except Exception as exc:
+            print(f"Could not open terminal: {exc}")
+            return False
+    if sys.platform == "win32":
+        terminal = shutil.which("wt.exe") or shutil.which("wt")
+        if terminal is None:
+            print("Install Windows Terminal to run this interactive action.")
+            return False
+        try:
+            subprocess.Popen([terminal, "new-tab", "--", *cmd])
+            return True
+        except Exception as exc:
+            print(f"Could not open Windows Terminal: {exc}")
+            return False
+    print("Interactive actions are unsupported on this platform.")
+    return False
 
 
 def copy_to_clipboard(text):
@@ -219,11 +267,7 @@ def prompt_for_input(spec):
 
 
 def run_configured_action(payload):
-    """Run a configured action's command. Returns True when the command
-    actually ran (or was dispatched in the background), and False when it
-    could not run -- no command, a canceled input prompt, or a failed
-    command -- so callers can tell a completed action from a canceled one.
-    """
+    """Run a configured action and report whether it completed."""
     command = payload.get("command")
     if not command:
         print("No command configured.")
@@ -247,6 +291,8 @@ def run_configured_action(payload):
             return tok
 
         command = [_fill(tok) for tok in command]
+    if payload.get("terminal"):
+        return run_terminal(command)
     if payload.get("background"):
         return dispatch_background(command)
     return run_cmd(command)

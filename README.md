@@ -182,10 +182,14 @@ just point `config["plugins"]` at it.
 ## Agent of Empires web dashboard
 
 This repository also provides an Agent of Empires community plugin that
-publishes the prioritized attention list in each session’s right-hand pane.
+publishes prioritized Attention items in each session's right-hand pane.
 Install from the repository root with `aoe plugin install .`, then enable it
-with `aoe plugin enable athal7.attention`. Items appear as status-colored cards
-with source icons, context, details, and signals. Available no-prompt actions are
-buttons on each card; actions that require interactive input remain in the
-terminal dashboard. The worker refreshes every minute; select **Refresh** to
-fetch immediately. It uses the same `attention` configuration and integrations.
+with `aoe plugin enable athal7.attention`. Cards show source, current status,
+why Attention recommended the item, details, and signals; available actions
+are grouped horizontally. Use AoE's built-in **New session** flow to create
+sessions; the pane does not create sessions or request unattended session
+creation. The configured Lumen diff action opens in a separate terminal window
+because Lumen's diff viewer requires an interactive TTY. Actions needing
+prompted input remain in the terminal dashboard. The worker refreshes every
+minute; select **Refresh** to fetch immediately. It uses the same `attention`
+configuration and integrations.

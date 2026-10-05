@@ -1,7 +1,8 @@
 id = "athal7.attention"
 name = "Attention"
 version = "1.0.0"
-api_version = 3
+api_version = 12
+aoe_version = ">=1.14.0, <2.0.0"
 description = "Prioritized attention items in each Agent of Empires session pane."
 capabilities = ["runtime.worker", "session.read", "net"]
 

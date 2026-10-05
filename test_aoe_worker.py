@@ -19,45 +19,64 @@ SPEC.loader.exec_module(worker)
 
 
 class PanePayloadTests(unittest.TestCase):
-    def test_empty_items_have_explicit_empty_state_and_refresh(self):
+    def test_empty_items_have_explicit_empty_state_and_native_session_note(self):
         payload = worker.pane_payload([])
         self.assertEqual(payload["default_location"], "right")
         self.assertIn({"kind": "note", "text": "No attention items."}, payload["blocks"])
-        self.assertEqual(payload["blocks"][-1]["method"], "attention.refresh")
+        self.assertIn({"kind": "note", "text": "Create sessions with AoE's built-in New session flow."}, payload["blocks"])
+        toolbar = next(block for block in payload["blocks"] if block.get("kind") == "columns")
+        self.assertEqual([action["label"] for action in toolbar["children"]], ["Refresh"])
+        self.assertEqual(toolbar["children"][0]["method"], "attention.refresh")
 
-    def test_cards_show_status_source_details_and_only_safe_tokenized_actions(self):
+    def test_cards_show_status_reason_and_horizontally_grouped_safe_actions(self):
         item = {
-            "_plugin": "github", "status": "OVERDUE", "context": "private-repo",
+            "_plugin": "github", "status": "NEEDS ATTENTION", "context": "private-repo",
             "title": "Ship release", "details": "Review required", "weight": 99,
-            "indicators": {"CI": "passing"},
+            "indicators": {"state": "CI failing", "CI": "failed"},
             "actions": [
                 {"_plugin": "github", "key": "o", "label": "Open", "primary": True,
                  "payload": {"kind": "open", "url": "https://private.example/issue", "token": "secret-token"}},
                 {"_plugin": "github", "key": "m", "label": "Merge", "payload": {"kind": "merge", "command": "secret-merge"}},
                 {"_plugin": "github", "key": "c", "label": "Comment", "payload": {"kind": "comment"}},
-                {"_plugin": "generic", "key": "1", "label": "Run", "payload": {"command": ["echo", "secret-command"]}},
                 {"_plugin": "generic", "key": "2", "label": "Prompt", "payload": {"command": ["echo"], "inputs": [{"prompt": "secret-prompt"}]}},
+                {"_plugin": "generic", "key": "3", "label": "Run", "payload": {"command": ["echo", "secret-command"]}},
+                {"_plugin": "github", "key": "l", "label": "Lumen",
+                 "payload": {"command": ["/opt/homebrew/bin/lumen", "diff", "https://private.example/issue"]}},
             ],
         }
-        tokens = iter(["opaque-open", "opaque-run"])
+        tokens = iter(["opaque-open", "opaque-run", "opaque-lumen"])
         payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
+        self.assertIn({"kind": "note", "text": "Create sessions with AoE's built-in New session flow."}, payload["blocks"])
+        self.assertNotIn("session.create", json.dumps(payload))
         cards = [block for block in payload["blocks"] if block["kind"] == "section"]
-        self.assertEqual(len(cards), 1)
         card = cards[0]
         self.assertEqual((card["title"], card["icon"], card["tone"], card["boxed"]),
-                         ("Ship release", "github", "danger", True))
-        self.assertTrue(any(child.get("label") == "OVERDUE" and child.get("tone") == "danger"
-                            for child in card["children"]))
-        self.assertTrue(any(child.get("label") == "Details" and child.get("value") == "Review required"
-                            for child in card["children"]))
-        buttons = [child for child in card["children"] if child.get("method") == "attention.action"]
-        self.assertEqual([button["label"] for button in buttons], ["Open", "Run"])
-        self.assertEqual([button["params"] for button in buttons],
-                         [{"token": "opaque-open"}, {"token": "opaque-run"}])
-        self.assertEqual(set(actions), {"opaque-open", "opaque-run"})
+                         ("Ship release", "github", "warn", True))
+        rows = [child for child in card["children"] if child["kind"] == "row"]
+        self.assertEqual(next(row for row in rows if row["label"] == "Status")["value"], "NEEDS ATTENTION")
+        self.assertEqual(next(row for row in rows if row["label"] == "Details")["value"], "Review required")
+        self.assertEqual(next(row for row in rows if row["label"] == "Signals")["value"], "CI: failed")
+        reason = next(child for child in card["children"] if child["kind"] == "callout")
+        self.assertEqual((reason["title"], reason["detail"]), ("Why this is recommended", "CI failing"))
+        self.assertEqual(reason["tone"], "danger")
+        button_group = next(child for child in card["children"] if child["kind"] == "columns")
+        buttons = button_group["children"]
+        self.assertEqual([button["label"] for button in buttons], ["Open", "Run", "Lumen"])
+        self.assertEqual([button["params"] for button in buttons], [
+            {"token": "opaque-open"}, {"token": "opaque-run"}, {"token": "opaque-lumen"},
+        ])
+        self.assertEqual(set(actions), {"opaque-open", "opaque-run", "opaque-lumen"})
+        self.assertTrue(actions["opaque-lumen"]["payload"]["terminal"])
+        self.assertEqual(actions["opaque-lumen"]["payload"]["command"][1], "diff")
         rendered = json.dumps(payload)
         for secret in ("private.example", "secret-token", "secret-merge", "secret-command", "secret-prompt"):
             self.assertNotIn(secret, rendered)
+
+    def test_reason_falls_back_to_current_status_when_no_specific_state_exists(self):
+        payload = worker.pane_payload([{"status": "OVERDUE", "title": "Pay invoice"}])
+        card = next(block for block in payload["blocks"] if block["kind"] == "section")
+        reason = next(child for child in card["children"] if child["kind"] == "callout")
+        self.assertEqual(reason["detail"], "OVERDUE")
 
     def test_trimming_keeps_priority_prefix_prunes_tokens_and_obeys_host_limit(self):
         items = [{
@@ -86,8 +105,6 @@ class PanePayloadTests(unittest.TestCase):
             encoded = json.dumps(worker.pane_payload(huge), separators=(",", ":")).encode("utf-8")
         self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
 
-
-
 class AttentionSourceTests(unittest.TestCase):
     def test_real_attention_module_reads_config_without_stale_module_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +115,52 @@ class AttentionSourceTests(unittest.TestCase):
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": str(state)}):
                 with patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
                     self.assertEqual(worker.attention_items(), [])
+
+
+class InteractiveActionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader("attention_util_test", str(ROOT / "sources" / "_util.py"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.util = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.util)
+
+    def test_configured_terminal_action_uses_the_shared_action_runner(self):
+        command = ["lumen", "diff", "https://example.com/compare/main; touch /tmp/marker"]
+        with patch.object(self.util, "run_terminal", return_value=True) as run_terminal, \
+             patch.object(self.util, "run_cmd") as run_cmd:
+            self.assertTrue(self.util.run_configured_action({"command": command, "terminal": True}))
+        run_terminal.assert_called_once_with(command)
+        run_cmd.assert_not_called()
+
+    def test_macos_terminal_shell_quotes_configured_arguments(self):
+        url = "https://example.com/compare/main; touch /tmp/marker"
+        with patch.object(self.util.sys, "platform", "darwin"), \
+             patch.object(self.util.subprocess, "run") as run:
+            self.assertTrue(self.util.run_terminal(["lumen", "diff", url]))
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["osascript", "-e"])
+        self.assertIn("lumen diff 'https://example.com/compare/main; touch /tmp/marker'", args[2])
+        run.assert_called_once()
+
+
+    def test_linux_terminal_passes_argv_without_shell_reparsing(self):
+        command = ["lumen", "diff", "https://example.com/change; touch /tmp/marker"]
+        with patch.object(self.util.sys, "platform", "linux"), \
+             patch.dict(os.environ, {"TERMINAL": "custom-term --window"}), \
+             patch.object(self.util.subprocess, "Popen") as popen:
+            self.assertTrue(self.util.run_terminal(command))
+        popen.assert_called_once_with(
+            ["custom-term", "--window", "-e", *command], start_new_session=True,
+        )
+
+    def test_windows_terminal_receives_argv_without_a_shell(self):
+        command = ["lumen", "diff", "https://example.com/change; touch marker"]
+        with patch.object(self.util.sys, "platform", "win32"), \
+             patch.object(self.util.shutil, "which", return_value="C:/Windows/wt.exe"), \
+             patch.object(self.util.subprocess, "Popen") as popen:
+            self.assertTrue(self.util.run_terminal(command))
+        popen.assert_called_once_with(["C:/Windows/wt.exe", "new-tab", "--", *command])
 
 
 class WorkerProtocolTests(unittest.TestCase):
@@ -317,7 +380,9 @@ class WorkerProtocolTests(unittest.TestCase):
                     params = pushed["params"]
                     self.assertEqual((params["session_id"], params["slot"], params["id"]), ("s1", "pane", "attention"))
                     self.assertEqual(next(block for block in params["payload"]["blocks"] if block["kind"] == "section")["title"], "Ship")
-                    self.assertEqual(params["payload"]["blocks"][-1]["method"], "attention.refresh")
+                    toolbar = params["payload"]["blocks"][-1]
+                    self.assertEqual(toolbar["kind"], "columns")
+                    self.assertEqual(toolbar["children"][-1]["method"], "attention.refresh")
                     reply(pushed)
                     break
 
@@ -352,12 +417,12 @@ class AttentionActionDispatchTests(unittest.TestCase):
 
         plugin = Plugin()
         action = {"_plugin": "generic", "_original_key": "o", "key": "1",
-                  "payload": {"url": "private"}, "wip": True, "_wip_id": "generic:item"}
+                  "payload": {"url": "private", "terminal": True}, "wip": True, "_wip_id": "generic:item"}
         with patch.object(self.core, "load_plugin", return_value=plugin), \
              patch.object(self.core, "mark_wip_item") as mark, \
              patch.object(self.core, "unmark_wip_item") as unmark:
             self.assertTrue(self.core.dispatch_item_action(action))
-            self.assertEqual(plugin.calls, [("o", {"url": "private"})])
+            self.assertEqual(plugin.calls, [("o", {"url": "private", "terminal": True})])
             mark.assert_called_once_with("generic:item")
             unmark.assert_not_called()
             action["wip"] = "clear"
@@ -459,7 +524,8 @@ class WorkerActionProtocolTests(unittest.TestCase):
                     first = receive()
                 payload = first["params"]["payload"]
                 card = next(block for block in payload["blocks"] if block["kind"] == "section")
-                button = next(child for child in card["children"] if child.get("method") == "attention.action")
+                button_group = next(child for child in card["children"] if child.get("kind") == "columns")
+                button = next(child for child in button_group["children"] if child.get("method") == "attention.action")
                 token = button["params"]["token"]
                 self.assertNotIn("private-command", json.dumps(payload))
                 reply(first)
