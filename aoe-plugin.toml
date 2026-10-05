@@ -1,14 +1,21 @@
 id = "athal7.attention"
 name = "Attention"
-version = "1.0.0"
+version = "1.1.0"
 api_version = 12
 aoe_version = ">=1.14.0, <2.0.0"
 description = "Prioritized attention items in each Agent of Empires session pane."
-capabilities = ["runtime.worker", "session.read", "net"]
+capabilities = ["runtime.worker", "session.read", "session.create", "net"]
 
 [[ui]]
 slot = "pane"
 id = "attention"
+
+[[settings]]
+key = "agent_id"
+label = "New session agent"
+description = "ACP agent to use for sessions created from Attention items."
+type = "dynamic_select"
+option_source = "acp.agents"
 
 [runtime]
 kind = "command"

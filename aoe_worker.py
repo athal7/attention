@@ -18,6 +18,7 @@ MAX_PANE_BYTES = 64 * 1024
 ACTION_TIMEOUT_SECONDS = 120
 _input_buffer = bytearray()
 _source_lock = threading.Lock()
+live_sessions_by_id = {}
 
 
 def send(message):
@@ -128,27 +129,37 @@ def _web_actions(item, token_actions, token_factory):
         payload = action.get("payload")
         if not isinstance(payload, dict) or payload.get("inputs"):
             continue
-        if str(payload.get("kind", "")).lower() in interactive.get(plugin, set()):
-            continue
-        token = token_factory()
-        dispatch_action = action
         command = payload.get("command")
         if (isinstance(command, list) and len(command) > 1
                 and Path(str(command[0])).name.casefold() == "lumen"
                 and command[1] == "diff"):
-            dispatch_action = dict(action)
-            dispatch_payload = dict(payload)
-            dispatch_payload["terminal"] = True
-            dispatch_action["payload"] = dispatch_payload
-        token_actions[token] = dispatch_action
+            continue
+        if str(payload.get("kind", "")).lower() in interactive.get(plugin, set()):
+            continue
+        token = token_factory()
+        token_actions[token] = action
+        label = str(action.get("label") or "Action").strip()[:80]
+        label = label[:1].upper() + label[1:]
         blocks.append({
             "kind": "action",
-            "label": action.get("label", "Action")[:80],
+            "label": label,
             "method": "attention.action",
             "params": {"token": token},
             "icon": _action_icon(action.get("label", "")),
             "variant": "primary" if action.get("primary") else "secondary",
         })
+
+    token = token_factory()
+    title = str(item.get("title") or "Follow-up").strip()[:120]
+    token_actions[token] = {"_aoe_operation": "new_session", "title": f"Attention: {title}"}
+    blocks.append({
+        "kind": "action",
+        "label": "New session",
+        "method": "attention.new_session",
+        "params": {"token": token},
+        "icon": "plus",
+        "variant": "secondary",
+    })
     return blocks
 
 
@@ -200,7 +211,7 @@ def _tokens_in_payload(payload):
     return {
         block.get("params", {}).get("token")
         for block in _walk_blocks(payload.get("blocks", []))
-        if block.get("method") == "attention.action"
+        if block.get("method") in {"attention.action", "attention.new_session"}
         and isinstance(block.get("params", {}).get("token"), str)
     }
 
@@ -221,7 +232,7 @@ def build_pane(items, token_factory=None):
     token_actions = {}
     cards = [_item_card(item, token_actions, token_factory) for item in items]
     heading = {"kind": "heading", "text": "Prioritized items"}
-    session_note = {"kind": "note", "text": "Create sessions with AoE's built-in New session flow."}
+    session_note = {"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."}
     toolbar = _pane_toolbar()
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     base = {"title": "Attention", "default_location": "right"}
@@ -263,6 +274,29 @@ def live_sessions():
     return sessions
 
 
+def create_session(request):
+    settings = rpc("config.get", {"key": "agent_id"})
+    agent_id = settings.get("value") if isinstance(settings, dict) else None
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise RuntimeError("Choose an ACP agent in Attention plugin settings before creating a session.")
+    session = live_sessions_by_id.get(request["session_id"])
+    if session is None:
+        raise RuntimeError("This session is no longer available.")
+    params = {
+        "agent_id": agent_id.strip(),
+        "title": request["action"]["title"],
+        "idempotency_key": request["token"],
+    }
+    project_path = session.get("project_path")
+    if isinstance(project_path, str) and project_path:
+        params["project_path"] = project_path
+    result = rpc("sessions.create", params)
+    session_id = result.get("session_id") if isinstance(result, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("AoE did not return the created session id.")
+    return session_id
+
+
 def status_payload(text):
     return {
         "title": "Attention",
@@ -270,7 +304,7 @@ def status_payload(text):
         "blocks": [
             {"kind": "heading", "text": "Prioritized items"},
             {"kind": "note", "text": text},
-            {"kind": "note", "text": "Create sessions with AoE's built-in New session flow."},
+            {"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."},
             _pane_toolbar(),
         ],
     }
@@ -284,7 +318,7 @@ def _remove_action_token(blocks, token):
     cleaned = []
     for block in blocks:
         params = block.get("params", {})
-        if block.get("method") == "attention.action" and params.get("token") == token:
+        if block.get("method") in {"attention.action", "attention.new_session"} and params.get("token") == token:
             continue
         copy = dict(block)
         if isinstance(copy.get("children"), list):
@@ -360,7 +394,7 @@ def start_action(token, action, label, results):
 
 
 def dispatch(message):
-    global refresh_requested, active_action
+    global refresh_requested, active_action, active_session_create
     method = message.get("method", "")
     request_id = message.get("id")
     params = message.get("params")
@@ -369,20 +403,28 @@ def dispatch(message):
     if method == "attention.refresh":
         refresh_requested = True
         result = {"ok": True}
-    elif method == "attention.action":
+    elif method in {"attention.action", "attention.new_session"}:
         token = params.get("token")
         session_id = params.get("session_id")
         if session_id not in live_session_ids:
             result = {"ok": False, "error": "Unknown session."}
-        elif active_action is not None:
+        elif active_action is not None or active_session_create is not None:
             result = {"ok": False, "error": "Another action is already running."}
         else:
-            action = action_tokens.pop(token, None) if isinstance(token, str) else None
-            if action is None:
+            action = action_tokens.get(token) if isinstance(token, str) else None
+            is_new_session = method == "attention.new_session"
+            valid = isinstance(action, dict) and (action.get("_aoe_operation") == "new_session") == is_new_session
+            if not valid:
                 result = {"ok": False, "error": "This action expired. Refresh the pane and try again."}
             else:
-                active_action = {"token": token, "action": action, "session_id": session_id}
-                action_requests.put(active_action)
+                action_tokens.pop(token, None)
+                request = {"token": token, "action": action, "session_id": session_id}
+                if is_new_session:
+                    active_session_create = request
+                    session_create_requests.put(request)
+                else:
+                    active_action = request
+                    action_requests.put(request)
                 result = {"ok": True}
     else:
         result = {"ok": False, "error": f"Unsupported method: {method}"}
@@ -394,14 +436,18 @@ def dispatch(message):
 def main():
 
     global published_ids, refresh_requested, action_tokens, live_session_ids
-    global action_requests, active_action
+    global action_requests, action_results, active_action
+    global session_create_requests, active_session_create, live_sessions_by_id
     published_ids = set()
     refresh_requested = False
     action_tokens = {}
     live_session_ids = set()
+    live_sessions_by_id.clear()
     action_requests = queue.Queue()
     action_results = queue.Queue()
+    session_create_requests = queue.Queue()
     active_action = None
+    active_session_create = None
     results = queue.Queue(maxsize=1)
     base_payload = status_payload("Loading attention items…")
     payload = base_payload
@@ -426,6 +472,8 @@ def main():
             if now >= next_sessions:
                 sessions = live_sessions()
                 live_session_ids = {session["id"] for session in sessions}
+                live_sessions_by_id.clear()
+                live_sessions_by_id.update({session["id"]: session for session in sessions})
                 if not initialized:
                     publish_payload(sessions, payload)
                     initialized = True
@@ -467,6 +515,34 @@ def main():
                 }
                 publish_payload(sessions, payload)
                 refresh_requested = True
+
+            try:
+                session_request = session_create_requests.get_nowait()
+            except queue.Empty:
+                session_request = None
+            if session_request is not None:
+                token = session_request["token"]
+                title = session_request["action"]["title"]
+                payload = payload_with_notice(base_payload, f"Creating session: {title}", token)
+                action_tokens = {
+                    token: action for token, action in action_tokens.items()
+                    if token in _payload_action_tokens(payload)
+                }
+                publish_payload(sessions, payload)
+                try:
+                    created_id = create_session(session_request)
+                    message_text = f"Created session: {created_id}"
+                except Exception as exc:
+                    message_text = f"Session creation failed: {str(exc)[:160]}"
+                payload = payload_with_notice(base_payload, message_text, token)
+                action_tokens = {
+                    token: action for token, action in action_tokens.items()
+                    if token in _payload_action_tokens(payload)
+                }
+                publish_payload(sessions, payload)
+                active_session_create = None
+                refresh_requested = True
+                next_sessions = time.monotonic()
 
             if initialized and now >= next_refresh:
                 refresh_requested = True
