@@ -2031,6 +2031,62 @@ print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tm
 }
 test_pr_attention_distinguishes_pending_review_feedback
 
+test_pr_attention_uses_detail_author_when_login_is_unavailable() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+pr = {'number': 42, 'repository': {'nameWithOwner': 'owner/repo'}}
+thread = {
+    'isResolved': False,
+    'firstComment': {'nodes': [{'pullRequestReview': {'id': 'self-comment'}}]},
+    'lastComment': {'nodes': [{'author': {'login': 'actual-author'}}]},
+}
+own_reviews = [
+    {'id': 'self-change', 'state': 'CHANGES_REQUESTED',
+     'author': {'login': 'actual-author'}},
+    {'id': 'self-comment', 'state': 'COMMENTED', 'body': '',
+     'author': {'login': 'actual-author'}},
+]
+def graphql_detail(reviews):
+    return p._normalize_pr_detail({
+        'author': {'login': 'actual-author'},
+        'mergeable': 'MERGEABLE',
+        'latestReviews': {'pageInfo': {'hasNextPage': False}, 'nodes': reviews},
+        'reviewThreads': {'pageInfo': {'hasNextPage': False}, 'nodes': [thread]},
+    })
+self_result = p._classify_pr_attention(pr, '', graphql_detail(own_reviews))
+external_result = p._classify_pr_attention(pr, '', graphql_detail([
+    {'id': 'other-change', 'state': 'CHANGES_REQUESTED',
+     'author': {'login': 'other-reviewer'}},
+]))
+print(self_result is None)
+print(external_result['attention_reasons'] if external_result else None)
+state = {}
+def fake_gh_json(args):
+    fields = args[args.index('--json') + 1].split(',')
+    state['author_requested'] = 'author' in fields
+    detail = {
+        'author': {'login': 'actual-author'},
+        'mergeable': 'MERGEABLE',
+        'latestReviews': own_reviews,
+    }
+    return {key: value for key, value in detail.items() if key in fields}
+p._gh_json = fake_gh_json
+fallback = p._fetch_pr_detail('owner/repo', 42)
+print(p._classify_pr_attention(pr, '', fallback) is None)
+print(state['author_requested'])
+")"
+  check "a missing current login does not classify the PR author's own changes or reply as external" \
+    "$(sed -n 1p <<<"$out")" "True"
+  check "other reviewers' changes requested remain actionable without a current login" \
+    "$(sed -n 2p <<<"$out")" "['Changes Requested']"
+  check "fallback PR details use the PR author when current-login lookup fails" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "fallback PR details request the author needed for classification" \
+    "$(sed -n 4p <<<"$out")" "True"
+}
+test_pr_attention_uses_detail_author_when_login_is_unavailable
+
 test_unread_notification_does_not_assert_reply_needed() {
   local out
   out="$(python3 -c "

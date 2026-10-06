@@ -145,7 +145,9 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   APPROVED reviews do not. For COMMENTED reviews with complete detail, an
   unresolved review thread needs a reply only when its last commenter is not
   the PR author. Resolved threads and threads last answered by the author do
-  not. Body-only feedback with no thread history still counts. A review body
+  not. These comparisons use the PR author from detail, falling back to the
+  current GitHub login only if that detail is unavailable. Body-only feedback
+  with no thread history still counts. A review body
   not associated with the PR's other threads remains visible as REVIEW UPDATE
   without asserting that a reply is due. Missing or incomplete review detail
   also stays visible as REVIEW UPDATE rather than claiming a reply is needed.

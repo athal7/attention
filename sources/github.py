@@ -30,11 +30,12 @@ _NOTIFICATION_REASONS = {
 }
 
 _PR_DETAIL_FIELDS = (
-    "mergeable,reviewDecision,statusCheckRollup,latestReviews,"
+    "author,mergeable,reviewDecision,statusCheckRollup,latestReviews,"
     "closingIssuesReferences,isDraft,reviewRequests,baseRefName,headRefName"
 )
 _PR_GRAPHQL_SELECTION = """
 pullRequest(number: %d) {
+  author { login }
   mergeable
   reviewDecision
   isDraft
@@ -140,6 +141,7 @@ def _normalize_pr_detail(detail):
         else closing_payload
     )
     return {
+        "author": detail.get("author"),
         "mergeable": detail.get("mergeable"),
         "reviewDecision": detail.get("reviewDecision"),
         "isDraft": detail.get("isDraft", False),
@@ -452,11 +454,16 @@ def _review_comment_attention(reviews, expected_author, detail):
 def _classify_pr_attention(pr, expected_author, detail):
     if _pr_key(pr) is None or detail is None:
         return None
+    detail_author = detail.get("author")
+    detail_author = detail_author.get("login") if isinstance(detail_author, dict) else None
+    if isinstance(detail_author, str) and detail_author:
+        expected_author = detail_author
+    expected_author = expected_author.casefold() if isinstance(expected_author, str) else ""
     reasons = []
     external_reviews = [
         review for review in detail.get("latestReviews") or []
         if (review.get("author") or {}).get("login")
-        and review["author"]["login"].casefold() != expected_author.casefold()
+        and review["author"]["login"].casefold() != expected_author
     ]
     if any(review.get("state") == "CHANGES_REQUESTED" for review in external_reviews):
         reasons.append("Changes Requested")
