@@ -89,7 +89,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `codeDir` | Parent directory of your local repo clones (default `~/code`). Used by the `github` plugin, which resolves each item's local checkout by matching each subdirectory's own `git remote origin` against the item's repo -- not by name, so a repo cloned under a shorthand directory name still resolves. |
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
-| `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag when they need attention (failing checks, changes requested, a merge conflict, or a new review comment) -- same check as your own authored PRs. Missing/empty = no extra queries. |
+| `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, optional `"wip": true` to mark or `"wip": "clear"` to unmark the item when it runs successfully, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
@@ -131,20 +131,30 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
   Eligible unread notifications appear in the default Other group unless they
-  concern a pull request. Read threads, closed PR/issue threads, and threads
-  from archived repositories are omitted. For an unread authored PR, an
-  ordinary bot timeline comment is filtered only when `last_read_at` is a valid
+  concern a pull request. Author notifications use NOTIFIED rather than claiming
+  a reply is needed: the unread event can be your own or a bot's activity. Read
+  threads, closed PR/issue threads, and threads from archived repositories are
+  omitted. For an unread authored PR, an ordinary bot timeline comment is
+  filtered only when `last_read_at` is a valid
   timezone-aware timestamp and the complete paginated PR timeline since that
   time contains at least one later event, all ordinary bot-authored comments.
   Reviews, commits, unknown activity, missing/equal comment timestamps, and
   failed or incomplete timelines remain visible. `latest_comment_url` selects
   candidates for this check, not the event that triggered the notification.
-  COMMENTED and CHANGES_REQUESTED reviews count regardless of reviewer type,
-  including bots; APPROVED reviews do not. Ordinary PR timeline comments are
-  not reviews. Submitted review feedback keeps the NEEDS ATTENTION row status
-  even if another review request remains pending; a pending request without
-  review feedback can still show REVIEW REQUESTED. Items are de-duplicated by
-  repository and number.
+  CHANGES_REQUESTED reviews count regardless of reviewer type, including bots;
+  APPROVED reviews do not. For COMMENTED reviews with complete detail, an
+  unresolved review thread needs a reply only when its last commenter is not
+  the PR author. Resolved threads and threads last answered by the author do
+  not. These comparisons use the PR author from detail, falling back to the
+  current GitHub login only if that detail is unavailable. Body-only feedback
+  with no thread history still counts. A review body
+  not associated with the PR's other threads remains visible as REVIEW UPDATE
+  without asserting that a reply is due. Missing or incomplete review detail
+  also stays visible as REVIEW UPDATE rather than claiming a reply is needed.
+  Ordinary PR timeline comments are not reviews. Confirmed review feedback
+  keeps NEEDS ATTENTION even when another review request is pending; a pending
+  request without such feedback can show REVIEW REQUESTED. Items are
+  de-duplicated by repository and number.
   Visible PRs that target another visible PR's head branch render as a tree,
   with the target PR above its child.
 - **linear**: your assigned issues, not in a completed/canceled/duplicate

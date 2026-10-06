@@ -697,14 +697,9 @@ p._fetch_notification_state = lambda notifications: None
 result, _ = p._fetch_notification_delta()
 print([item['notification_id'] for item in result if item.get('_remove')])
 print([item['notification_id'] for item in result if not item.get('_remove')])
-p._fetch_raw = lambda config: p._compose_raw([], result)
-p._build_repo_dir_index = lambda code_dir: {}
-print([(item['title'], item['status']) for item in p.fetch({'codeDir': '/tmp'})
-       if item['title'] in {'bot-then-review', 'human-comment', 'missing-cutoff', 'incomplete-page', 'bot-review'}])
 ")"
   check "only complete strictly post-read bot timeline comments are suppressed, including across pages and after old commits" "$(sed -n 1p <<<"$out")" "['bot-only', 'full-final-page', 'multipage-bot-only', 'commit-before-read']"
   check "reviews, human/mixed/unknown activity, missing or equal timestamps, and incomplete timelines remain" "$(sed -n 2p <<<"$out")" "['bot-then-review', 'human-comment', 'mixed-history', 'unknown-event', 'unknown-author', 'equal-boundary', 'missing-time', 'incomplete-page', 'missing-cutoff', 'bot-review', 'review-comment', 'failed-page', 'invalid-cutoff', 'empty-timeline', 'old-only', 'review-line-comment', 'date-only-cutoff', 'naive-cutoff', 'naive-event', 'date-only-event', 'post-read-commit', 'graphql-errors', 'malformed-page', 'truncated-page']"
-  check "human comments and bot reviews still render while bot-only comments do not" "$(sed -n 3p <<<"$out")" "[('bot-then-review', 'COMMENTED'), ('human-comment', 'COMMENTED'), ('incomplete-page', 'COMMENTED'), ('missing-cutoff', 'COMMENTED'), ('bot-review', 'COMMENTED')]"
 }
 test_github_notification_timeline_only_suppresses_unread_bot_comments
 
@@ -1931,7 +1926,15 @@ def detail():
     return {
         'mergeable': 'MERGEABLE', 'reviewDecision': None,
         'statusCheckRollup': [],
-        'latestReviews': [{'author': {'login': 'coderabbitai', '__typename': 'Bot'}, 'state': 'COMMENTED'}],
+        'latestReviews': {'pageInfo': {'hasNextPage': False}, 'nodes': [
+            {'author': {'login': 'coderabbitai', '__typename': 'Bot'},
+             'state': 'COMMENTED', 'body': ''},
+        ]},
+        'reviewThreads': {'pageInfo': {'hasNextPage': False}, 'nodes': [
+            {'isResolved': False, 'lastComment': {'nodes': [
+                {'author': {'login': 'coderabbitai'}},
+            ]}},
+        ]},
     }
 def fake_gh_json(args):
     if args[:2] == ['search', 'prs'] and '--author=@me' in args:
@@ -1962,6 +1965,147 @@ print([(item['id'], item['status'], item['indicators']['state']) for item in p.f
   check "bot reviews render tracked and authored PRs as needing attention" "$(sed -n 3p <<<"$out")" "[('3', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('4', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('1', 'NEEDS ATTENTION', 'Reply needed'), ('2', 'NEEDS ATTENTION', 'Reply needed')]"
 }
 test_pr_attention_classification_uses_batched_reviews
+test_pr_attention_distinguishes_pending_review_feedback() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+pr = {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}}
+review = {'author': {'login': 'reviewer'}, 'state': 'COMMENTED', 'body': ''}
+def classify(threads, reviews=None):
+    detail = p._normalize_pr_detail({
+        'mergeable': 'MERGEABLE', 'statusCheckRollup': {'contexts': {'nodes': []}},
+        'latestReviews': {'pageInfo': {'hasNextPage': False},
+                          'nodes': reviews if reviews is not None else [review]},
+        'reviewThreads': threads,
+    })
+    result = p._classify_pr_attention(pr, 'author', detail)
+    return result['attention_reasons'] if result else []
+def thread(resolved, last_author, review_id='R1'):
+    return {'isResolved': resolved,
+            'firstComment': {'nodes': [{'pullRequestReview': {'id': review_id}}]},
+            'lastComment': {'nodes': [
+                {'author': {'login': last_author} if last_author else None},
+            ]}}
+def complete(*threads):
+    return {'pageInfo': {'hasNextPage': False}, 'nodes': list(threads)}
+print(classify(complete(thread(True, 'reviewer'))))
+print(classify(complete(thread(False, 'author'))))
+print(classify(complete(thread(False, 'reviewer'))))
+print(classify(complete(), [dict(review, body='Please change the error handling')]))
+print(classify(None))
+print(classify({'pageInfo': {'hasNextPage': True}, 'nodes': [thread(True, 'reviewer')]}))
+print(classify(complete(thread(False, None))))
+print(classify(complete(thread(True, 'reviewer')), [
+    {'author': {'login': 'reviewer'}, 'state': 'CHANGES_REQUESTED'},
+]))
+print(classify(complete(thread(True, 'reviewer')),
+               [dict(review, id='R1', body='Summary of inline feedback')]))
+print(classify(complete(thread(True, 'reviewer')),
+               [dict(review, id='R2', body='Please update the docs')]))
+print(classify(complete(thread(False, 'author')),
+               [dict(review, id='R2', body='Review overview after author reply')]))
+detail = p._normalize_pr_detail({
+    'mergeable': 'MERGEABLE', 'statusCheckRollup': {'contexts': {'nodes': []}},
+    'latestReviews': {'pageInfo': {'hasNextPage': False},
+                      'nodes': [dict(review, id='R2', body='Review summary')]},
+    'reviewThreads': complete(thread(True, 'reviewer')),
+})
+item = p._classify_pr_attention(dict(pr, title='Review summary'), 'author', detail)
+item['type'] = 'authored_attention'
+p._fetch_raw = lambda _: [item]
+p._build_repo_dir_index = lambda _: {}
+print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tmp'})])
+")"
+  check "resolved review threads no longer demand replies" "$(sed -n 1p <<<"$out")" "[]"
+  check "the author's last reply clears a thread's reply-needed state" "$(sed -n 2p <<<"$out")" "[]"
+  check "an unanswered review thread still demands a reply" "$(sed -n 3p <<<"$out")" "['Review Commented']"
+  check "body-only review feedback remains actionable" "$(sed -n 4p <<<"$out")" "['Review Commented']"
+  check "missing review threads remain visible without asserting a reply" "$(sed -n 5p <<<"$out")" "['Review Update']"
+  check "incomplete thread pages remain visible without asserting a reply" "$(sed -n 6p <<<"$out")" "['Review Update']"
+  check "an unknown last commenter remains visible without asserting a reply" "$(sed -n 7p <<<"$out")" "['Review Update']"
+  check "changes requested remain actionable despite resolved threads" "$(sed -n 8p <<<"$out")" "['Changes Requested']"
+  check "review summaries attached to resolved threads do not demand replies" "$(sed -n 9p <<<"$out")" "[]"
+  check "body-only feedback alongside other threads stays visible without asserting a reply" "$(sed -n 10p <<<"$out")" "['Review Update']"
+  check "a review summary after the author's last thread reply is not a reply demand" "$(sed -n 11p <<<"$out")" "['Review Update']"
+  check "a review update renders neutrally rather than as reply needed" "$(sed -n 12p <<<"$out")" "[('REVIEW UPDATE', 'Review update')]"
+}
+test_pr_attention_distinguishes_pending_review_feedback
+
+test_pr_attention_uses_detail_author_when_login_is_unavailable() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+pr = {'number': 42, 'repository': {'nameWithOwner': 'owner/repo'}}
+thread = {
+    'isResolved': False,
+    'firstComment': {'nodes': [{'pullRequestReview': {'id': 'self-comment'}}]},
+    'lastComment': {'nodes': [{'author': {'login': 'actual-author'}}]},
+}
+own_reviews = [
+    {'id': 'self-change', 'state': 'CHANGES_REQUESTED',
+     'author': {'login': 'actual-author'}},
+    {'id': 'self-comment', 'state': 'COMMENTED', 'body': '',
+     'author': {'login': 'actual-author'}},
+]
+def graphql_detail(reviews):
+    return p._normalize_pr_detail({
+        'author': {'login': 'actual-author'},
+        'mergeable': 'MERGEABLE',
+        'latestReviews': {'pageInfo': {'hasNextPage': False}, 'nodes': reviews},
+        'reviewThreads': {'pageInfo': {'hasNextPage': False}, 'nodes': [thread]},
+    })
+self_result = p._classify_pr_attention(pr, '', graphql_detail(own_reviews))
+external_result = p._classify_pr_attention(pr, '', graphql_detail([
+    {'id': 'other-change', 'state': 'CHANGES_REQUESTED',
+     'author': {'login': 'other-reviewer'}},
+]))
+print(self_result is None)
+print(external_result['attention_reasons'] if external_result else None)
+state = {}
+def fake_gh_json(args):
+    fields = args[args.index('--json') + 1].split(',')
+    state['author_requested'] = 'author' in fields
+    detail = {
+        'author': {'login': 'actual-author'},
+        'mergeable': 'MERGEABLE',
+        'latestReviews': own_reviews,
+    }
+    return {key: value for key, value in detail.items() if key in fields}
+p._gh_json = fake_gh_json
+fallback = p._fetch_pr_detail('owner/repo', 42)
+print(p._classify_pr_attention(pr, '', fallback) is None)
+print(state['author_requested'])
+")"
+  check "a missing current login does not classify the PR author's own changes or reply as external" \
+    "$(sed -n 1p <<<"$out")" "True"
+  check "other reviewers' changes requested remain actionable without a current login" \
+    "$(sed -n 2p <<<"$out")" "['Changes Requested']"
+  check "fallback PR details use the PR author when current-login lookup fails" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "fallback PR details request the author needed for classification" \
+    "$(sed -n 4p <<<"$out")" "True"
+}
+test_pr_attention_uses_detail_author_when_login_is_unavailable
+
+test_unread_notification_does_not_assert_reply_needed() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+p._fetch_raw = lambda _: [
+    {'number': 77, 'title': 'Own PR update', 'repository': {'nameWithOwner': 'owner/repo'},
+     'url': 'https://github.com/owner/repo/pull/77', 'type': 'notification',
+     'subject_type': 'PullRequest', 'notification_reason': 'author'},
+    {'number': 78, 'title': 'Mention', 'repository': {'nameWithOwner': 'owner/repo'},
+     'url': 'https://github.com/owner/repo/issues/78', 'type': 'notification',
+     'subject_type': 'Issue', 'notification_reason': 'mention'},
+]
+p._build_repo_dir_index = lambda _: {}
+print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tmp'})])
+")"
+  check "unread notifications remain visible without claiming a reply is needed" \
+    "$out" "[('NOTIFIED', 'Notified'), ('MENTIONED', 'Notified')]"
+}
+test_unread_notification_does_not_assert_reply_needed
 
 test_batched_pr_detail_normalizes_legacy_status_contexts() {
   local out
@@ -2069,9 +2213,13 @@ p._get_gh_login = lambda: 'author'
 with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
     result = p._fetch_pr_attention('@me', detail_pool)
 print([(r['number'], r['attention_reasons']) for r in result])
+p._fetch_raw = lambda _: [dict(result[0], title='Uncertain review', type='authored_attention')]
+p._build_repo_dir_index = lambda _: {}
+print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tmp'})])
 
 ")"
-  check "ordinary bot PR timeline comments do not flag authored PRs while COMMENTED latest reviews do" "$(sed -n 1p <<<"$out")" "[(2, ['Review Commented'])]"
+  check "ordinary timeline comments do not flag a PR, while reviews without thread evidence stay visible" "$(sed -n 1p <<<"$out")" "[(2, ['Review Update'])]"
+  check "a fallback review displays as an update rather than a reply demand" "$(sed -n 2p <<<"$out")" "[('REVIEW UPDATE', 'Review update')]"
 }
 test_pr_attention_uses_reviews_not_timeline_comments
 
@@ -2132,7 +2280,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=32) as detail_pool:
 print([(r['number'], r['attention_reasons']) for r in result])
 print([p._status_label('authored_attention', r['attention_reasons'], False, False) for r in result])
 ")"
-  check "bot COMMENTED reviews retain merge and CI reasons; bot CHANGES_REQUESTED wins over COMMENTED; approvals, own reviews, and bot timeline comments do not flag PRs" "$(sed -n 1p <<<"$out")" "[(1, ['Review Commented', 'Merge Conflict', 'Checks Failing']), (2, ['Changes Requested', 'Review Commented']), (6, ['Checks Failing'])]"
+  check "bot reviews retain merge and CI reasons; requested changes win; approvals, own reviews, and bot timeline comments do not flag PRs" "$(sed -n 1p <<<"$out")" "[(1, ['Review Update', 'Merge Conflict', 'Checks Failing']), (2, ['Changes Requested', 'Review Update']), (6, ['Checks Failing'])]"
   check "merge conflict, changes requested, and CI failure retain status precedence" "$(sed -n 2p <<<"$out")" "['Merge conflict', 'Changes requested', 'CI failing']"
 }
 test_pr_attention_includes_bot_reviews_not_bot_timeline_comments
@@ -2188,6 +2336,7 @@ p._fetch_raw = lambda cfg: [
     {'number': 3, 'title': 'Tracked waiting on review', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/3', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Merge Conflict'], 'reviewRequested': True},
     {'number': 4, 'title': 'Authored review comment with pending request', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/4', 'type': 'authored_attention', 'attention_reasons': ['Review Commented'], 'reviewRequested': True},
     {'number': 5, 'title': 'Tracked changes requested with pending request', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/5', 'type': 'tracked_attention', 'tracked_author': 'teammate', 'attention_reasons': ['Changes Requested'], 'reviewRequested': True},
+    {'number': 6, 'title': 'Authored review update with pending request', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/6', 'type': 'authored_attention', 'attention_reasons': ['Review Update'], 'reviewRequested': True},
 ]
 items = p.fetch({'codeDir': '/tmp/nonexistent'})
 print(json.dumps({i['title']: i['status'] for i in items}))
@@ -2202,6 +2351,8 @@ print(json.dumps({i['title']: i['status'] for i in items}))
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored review comment with pending request'])" <<<"$out")" "NEEDS ATTENTION"
   check "tracked changes-requested review outranks a pending review request" \
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Tracked changes requested with pending request'])" <<<"$out")" "TEAMMATE: NEEDS ATTENTION"
+  check "authored review update stays visible ahead of a pending request" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored review update with pending request'])" <<<"$out")" "REVIEW UPDATE"
 }
 test_fetch_shows_review_requested_status_on_authored_and_tracked_prs
 
