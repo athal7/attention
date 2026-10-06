@@ -51,9 +51,24 @@ pullRequest(number: %d) {
     }
   }
   latestReviews(first: 50) {
+    pageInfo { hasNextPage }
     nodes {
+      id
       state
+      body
       author { login }
+    }
+  }
+  reviewThreads(first: 100) {
+    pageInfo { hasNextPage }
+    nodes {
+      isResolved
+      firstComment: comments(first: 1) {
+        nodes { pullRequestReview { id } }
+      }
+      lastComment: comments(last: 1) {
+        nodes { author { login } }
+      }
     }
   }
   closingIssuesReferences(first: 50) {
@@ -136,6 +151,11 @@ def _normalize_pr_detail(detail):
             if isinstance(node, dict) and node.get("requestedReviewer", node)
         ],
         "latestReviews": reviews,
+        "latestReviewsComplete": (
+            isinstance(reviews_payload, dict)
+            and (reviews_payload.get("pageInfo") or {}).get("hasNextPage") is False
+        ),
+        "reviewThreads": detail.get("reviewThreads"),
         "closingIssuesReferences": [
             node for node in closing_nodes if isinstance(node, dict)
         ],
@@ -357,27 +377,95 @@ def _status_label(gtype, reasons, review_requested, is_draft):
         return "Reply needed"
     if gtype == "review_request" or review_requested:
         return "Review requested"
+    if "Review Update" in reasons:
+        return "Review update"
     if gtype == "assigned_issue":
         return "Assigned"
     if gtype == "repo_issue":
         return "Triage"
     if gtype == "notification":
-        return "Reply needed"
+        return "Notified"
     return "Ready"
+
+
+def _review_comment_attention(reviews, expected_author, detail):
+    if not reviews:
+        return None
+    threads = detail.get("reviewThreads")
+    page_info = threads.get("pageInfo") if isinstance(threads, dict) else None
+    if (
+        detail.get("latestReviewsComplete") is not True
+        or not isinstance(page_info, dict)
+        or page_info.get("hasNextPage") is not False
+        or not isinstance(threads.get("nodes"), list)
+    ):
+        # Without complete evidence, keep the review visible but do not demand a reply.
+        return "Review Update"
+
+    review_ids_with_threads = set()
+    association_unknown = False
+    for thread in threads["nodes"]:
+        if not isinstance(thread, dict):
+            return "Review Update"
+        first = thread.get("firstComment") or {}
+        first_nodes = first.get("nodes") if isinstance(first, dict) else None
+        first_review = (
+            (first_nodes[0] or {}).get("pullRequestReview")
+            if isinstance(first_nodes, list) and len(first_nodes) == 1
+            and isinstance(first_nodes[0], dict) else None
+        )
+        review_id = first_review.get("id") if isinstance(first_review, dict) else None
+        if review_id:
+            review_ids_with_threads.add(review_id)
+        else:
+            association_unknown = True
+
+        if thread.get("isResolved") is True:
+            continue
+        if thread.get("isResolved") is not False:
+            return "Review Update"
+        last = thread.get("lastComment") or {}
+        last_nodes = last.get("nodes") if isinstance(last, dict) else None
+        last_author = (
+            (last_nodes[0].get("author") or {}).get("login")
+            if isinstance(last_nodes, list) and len(last_nodes) == 1
+            and isinstance(last_nodes[0], dict) else None
+        )
+        if not isinstance(last_author, str):
+            return "Review Update"
+        if last_author.casefold() != expected_author.casefold():
+            return "Review Commented"
+
+    for review in reviews:
+        body = review.get("body")
+        if not isinstance(body, str):
+            return "Review Update"
+        if body.strip() and (
+            association_unknown or review.get("id") not in review_ids_with_threads
+        ):
+            # An unmatched body could be a new request or a routine summary of
+            # older threads. Keep it visible, but do not assert that a reply is due.
+            return "Review Update" if threads["nodes"] else "Review Commented"
+    return None
+
+
 def _classify_pr_attention(pr, expected_author, detail):
     if _pr_key(pr) is None or detail is None:
         return None
     reasons = []
-    latest_review_states = {
-        review.get("state")
-        for review in detail.get("latestReviews") or []
+    external_reviews = [
+        review for review in detail.get("latestReviews") or []
         if (review.get("author") or {}).get("login")
         and review["author"]["login"].casefold() != expected_author.casefold()
-    }
-    if "CHANGES_REQUESTED" in latest_review_states:
+    ]
+    if any(review.get("state") == "CHANGES_REQUESTED" for review in external_reviews):
         reasons.append("Changes Requested")
-    if "COMMENTED" in latest_review_states:
-        reasons.append("Review Commented")
+    commented_reviews = [
+        review for review in external_reviews if review.get("state") == "COMMENTED"
+    ]
+    review_attention = _review_comment_attention(commented_reviews, expected_author, detail)
+    if review_attention:
+        reasons.append(review_attention)
     if detail.get("mergeable") == "CONFLICTING":
         reasons.append("Merge Conflict")
     checks = detail.get("statusCheckRollup") or []
@@ -984,6 +1072,7 @@ def _session_prompt(gtype, reasons):
     - Failing CI: fix the CI.
     - Merge conflict: resolve it.
     - Review comments only: respond to them.
+    - Review update only: inspect the feedback before deciding what to do.
 
     Not my work:
     - A PR someone asked me to review: review it.
@@ -1003,6 +1092,8 @@ def _session_prompt(gtype, reasons):
             return "Resolve the merge conflict."
         if "Review Commented" in reasons:
             return "Respond to the review comments."
+        if "Review Update" in reasons:
+            return "Check the latest review update."
         return "Review it."
     if gtype == "tracked_attention":
         return "Follow up with the author."
@@ -1043,10 +1134,12 @@ def fetch(config):
             tracked = gtype == "tracked_attention"
             weight = 85 if tracked else 88
             pending_request_only = g.get("reviewRequested") and not any(
-                reason in ("Changes Requested", "Review Commented")
+                reason in ("Changes Requested", "Review Commented", "Review Update")
                 for reason in g.get("attention_reasons", ())
             )
             status = "REVIEW REQUESTED" if pending_request_only else "NEEDS ATTENTION"
+            if not pending_request_only and g.get("attention_reasons") == ["Review Update"]:
+                status = "REVIEW UPDATE"
             if tracked:
                 status = f"{g.get('tracked_author', '').upper()}: {status}"
         elif gtype == "assigned_issue":
@@ -1061,7 +1154,7 @@ def fetch(config):
             elif reason == "mention":
                 weight, status = 82, "MENTIONED"
             elif reason == "author":
-                weight, status = 82, "COMMENTED"
+                weight, status = 82, "NOTIFIED"
             elif reason == "state_change":
                 weight, status = 78, "SUBSCRIBED"
             else:
