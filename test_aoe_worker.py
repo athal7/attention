@@ -17,25 +17,49 @@ SPEC = importlib.util.spec_from_file_location("aoe_worker", ROOT / "aoe_worker.p
 worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
 
+def _receive_json_line(stream, buffer, timeout, timeout_message):
+    deadline = time.monotonic() + timeout
+    while True:
+        newline = buffer.find(b"\n")
+        if newline >= 0:
+            line = bytes(buffer[:newline])
+            del buffer[:newline + 1]
+            return json.loads(line)
+        remaining = deadline - time.monotonic()
+        ready, _, _ = select.select([stream.fileno()], [], [], max(0, remaining))
+        if not ready:
+            raise AssertionError(timeout_message)
+        chunk = os.read(stream.fileno(), 4096)
+        if not chunk:
+            raise AssertionError("worker exited before replying")
+        buffer.extend(chunk)
+
 
 class PanePayloadTests(unittest.TestCase):
-    def test_empty_items_have_explicit_empty_state_and_session_creation_guidance(self):
+    def test_empty_items_have_explicit_empty_state_and_refresh(self):
         payload = worker.pane_payload([])
         self.assertEqual(payload["default_location"], "right")
-        self.assertIn({"kind": "note", "text": "No attention items."}, payload["blocks"])
-        self.assertIn({"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."}, payload["blocks"])
-        toolbar = next(block for block in payload["blocks"] if block.get("kind") == "columns")
+        self.assertEqual(payload["blocks"][0], {"kind": "note", "text": "No attention items."})
+        self.assertEqual([block["kind"] for block in payload["blocks"]], ["note", "columns"])
+        toolbar = payload["blocks"][1]
         self.assertEqual([action["label"] for action in toolbar["children"]], ["Refresh"])
         self.assertEqual(toolbar["children"][0]["method"], "attention.refresh")
 
-    def test_cards_show_status_reason_and_safe_two_column_actions(self):
+    def test_status_notice_precedes_cards_without_repeating_the_pane_heading(self):
+        payload = worker.status_payload("Source refresh failed; showing cached items.")
+        self.assertEqual(payload["blocks"][0], {
+            "kind": "note", "text": "Source refresh failed; showing cached items."
+        })
+        self.assertEqual([block["kind"] for block in payload["blocks"]], ["note", "columns"])
+
+    def test_cards_are_compact_and_the_primary_row_opens_the_source(self):
         item = {
             "_plugin": "github", "status": "NEEDS ATTENTION", "context": "private-repo",
             "title": "Ship release", "details": "Review required", "weight": 99,
             "indicators": {"state": "CI failing", "CI": "failed"},
             "actions": [
                 {"_plugin": "github", "key": "o", "label": "open", "primary": True,
-                 "payload": {"kind": "open", "url": "https://private.example/issue", "token": "secret-token"}},
+                 "payload": {"kind": "open", "url": "https://example.com/issue", "token": "secret-token"}},
                 {"_plugin": "github", "key": "m", "label": "Merge", "payload": {"kind": "merge", "command": "secret-merge"}},
                 {"_plugin": "github", "key": "c", "label": "Comment", "payload": {"kind": "comment"}},
                 {"_plugin": "generic", "key": "2", "label": "Prompt", "payload": {"command": ["echo"], "inputs": [{"prompt": "secret-prompt"}]}},
@@ -44,53 +68,110 @@ class PanePayloadTests(unittest.TestCase):
                  "payload": {"command": ["/opt/homebrew/bin/lumen", "diff", "https://private.example/issue"]}},
             ],
         }
-        tokens = iter(["opaque-open", "opaque-run", "opaque-session"])
+        tokens = iter(["opaque-run", "opaque-session"])
         payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
-        self.assertIn({"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."}, payload["blocks"])
         card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        self.assertEqual((card["title"], card["icon"], card["tone"], card["boxed"]),
-                         ("Ship release", "github", "warn", True))
-        rows = [child for child in card["children"] if child["kind"] == "row"]
-        self.assertEqual(next(row for row in rows if row["label"] == "Status")["value"], "NEEDS ATTENTION")
-        self.assertEqual(next(row for row in rows if row["label"] == "Details")["value"], "Review required")
-        self.assertEqual(next(row for row in rows if row["label"] == "Signals")["value"], "CI: failed")
-        reason = next(child for child in card["children"] if child["kind"] == "callout")
-        self.assertEqual((reason["title"], reason["detail"]), ("Why this is recommended", "CI failing"))
-        self.assertEqual(reason["tone"], "danger")
-        button_group = next(child for child in card["children"] if child["kind"] == "columns")
+        self.assertEqual(set(card), {"kind", "boxed", "children"})
+        self.assertTrue(card["boxed"])
+        row = card["children"][0]
+        self.assertEqual(row, {
+            "kind": "row", "label": "Ship release",
+            "sublabel": "NEEDS ATTENTION · private-repo · CI failing",
+            "href": "https://example.com/issue",
+        })
+        button_group = card["children"][1]
         buttons = button_group["children"]
-        self.assertEqual([button["label"] for button in buttons], ["Open", "Run", "New session"])
+        self.assertEqual([button["label"] for button in buttons], ["Run", "New session"])
         self.assertEqual([button["params"] for button in buttons], [
-            {"token": "opaque-open"}, {"token": "opaque-run"}, {"token": "opaque-session"},
+            {"token": "opaque-run"}, {"token": "opaque-session"},
         ])
         self.assertEqual(buttons[-1]["method"], "attention.new_session")
-        self.assertEqual(set(actions), {"opaque-open", "opaque-run", "opaque-session"})
+        self.assertEqual(set(actions), {"opaque-run", "opaque-session"})
+        self.assertEqual(actions["opaque-run"], item["actions"][4])
         self.assertEqual(actions["opaque-session"], {
             "_aoe_operation": "new_session", "title": "Attention: Ship release",
         })
         rendered = json.dumps(payload)
-        for secret in ("private.example", "secret-token", "secret-merge", "secret-command", "secret-prompt"):
+        for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
 
-    def test_reason_falls_back_to_current_status_when_no_specific_state_exists(self):
-        payload = worker.pane_payload([{"status": "OVERDUE", "title": "Pay invoice"}])
+    def test_own_pull_request_hides_approve_and_keeps_another_supported_action(self):
+        item = {
+            "_plugin": "github", "title": "Fix release",
+            "actions": [
+                {"_plugin": "github", "label": "approve", "_is_own_pr": True, "payload": {"kind": "approve"}},
+                {"_plugin": "generic", "label": "Run check", "payload": {"command": ["echo", "check"]}},
+            ],
+        }
+        tokens = iter(["run-token", "session-token"])
+        payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
         card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        reason = next(child for child in card["children"] if child["kind"] == "callout")
-        self.assertEqual(reason["detail"], "OVERDUE")
+        buttons = card["children"][1]["children"]
+        self.assertEqual([button["label"] for button in buttons], ["Run check", "New session"])
+        self.assertNotIn("approve", json.dumps(payload).casefold())
+        self.assertEqual(set(actions), {"run-token", "session-token"})
+
+    def test_each_item_shows_at_most_one_source_action_plus_new_session(self):
+        item = {
+            "title": "Build",
+            "actions": [
+                {"label": label, "payload": {"command": ["echo", label]}}
+                for label in ("First", "Second", "Third")
+            ],
+        }
+        tokens = iter(["first-token", "session-token"])
+        payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
+        card = next(block for block in payload["blocks"] if block["kind"] == "section")
+        buttons = card["children"][1]["children"]
+        self.assertEqual([button["label"] for button in buttons], ["First", "New session"])
+        self.assertLessEqual(len(buttons), 2)
+        self.assertEqual(set(actions), {"first-token", "session-token"})
+
+    def test_command_based_open_uses_the_linked_row_without_an_open_button(self):
+        open_action = {
+            "_plugin": "generic", "key": "open", "label": "Open",
+            "payload": {"command": ["open", "https://example.com/build"]},
+        }
+        tokens = iter(["open-token", "session-token"])
+        payload, actions = worker.build_pane(
+            [{"title": "Build failed", "actions": [open_action]}],
+            token_factory=lambda: next(tokens),
+        )
+        card = next(block for block in payload["blocks"] if block["kind"] == "section")
+        row = card["children"][0]
+        self.assertEqual(row["method"], "attention.action")
+        self.assertEqual(row["params"], {"token": "open-token"})
+        buttons = card["children"][1]["children"]
+        self.assertEqual([button["label"] for button in buttons], ["New session"])
+        self.assertEqual(actions["open-token"], open_action)
+
+    def test_unsafe_source_urls_are_not_rendered_as_links(self):
+        payload = worker.pane_payload([{"title": "Unsafe", "url": "javascript:alert(1)"}])
+        row = next(block for block in payload["blocks"] if block["kind"] == "section")["children"][0]
+        self.assertNotIn("href", row)
+
+    def test_summary_deduplicates_status_context_and_reason(self):
+        payload = worker.pane_payload([{
+            "status": "OVERDUE", "context": "Accounting", "title": "Pay invoice",
+            "attention_reason": " overdue ", "details": "OVERDUE",
+        }])
+        card = next(block for block in payload["blocks"] if block["kind"] == "section")
+        self.assertEqual(card["children"][0]["sublabel"], "OVERDUE · Accounting")
+        self.assertNotIn("Details", json.dumps(card))
 
     def test_trimming_keeps_priority_prefix_prunes_tokens_and_obeys_host_limit(self):
         items = [{
             "_plugin": "generic", "status": "NOW", "context": "repo",
             "title": f"Item {index}", "details": "x" * 500, "weight": 100 - index,
             "actions": [{"_plugin": "generic", "key": "o", "label": "Open",
-                         "payload": {"url": f"private-{index}"}}],
+                         "payload": {"url": f"https://example.com/{index}"}}],
         } for index in range(12)]
         token_number = iter(range(24))
         token_factory = lambda: f"token-{next(token_number)}"
         with patch.object(worker, "MAX_PANE_BYTES", 2400):
             payload, actions = worker.build_pane(items, token_factory=token_factory)
         cards = [block for block in payload["blocks"] if block["kind"] == "section"]
-        titles = [card["title"] for card in cards]
+        titles = [card["children"][0]["label"] for card in cards]
         self.assertLess(len(titles), len(items))
         self.assertEqual(titles, [f"Item {index}" for index in range(len(titles))])
         self.assertIn("Additional items omitted", json.dumps(payload))
@@ -106,6 +187,13 @@ class PanePayloadTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
 
 class SessionCreationTests(unittest.TestCase):
+    def test_manifest_requests_unattended_session_creation(self):
+        import tomllib
+
+        manifest = tomllib.loads((ROOT / "aoe-plugin.toml").read_text())
+        self.assertIn("session.create", manifest["capabilities"])
+        self.assertIn("session.unattended", manifest["capabilities"])
+
     def test_missing_agent_setting_does_not_request_session_creation(self):
         request = {
             "token": "single-use-token",
@@ -177,6 +265,94 @@ class InteractiveActionTests(unittest.TestCase):
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_new_session_action_creates_and_confirms_a_host_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attention = root / "attention"
+            attention.write_text(
+                "def load_config(): return {}\n"
+                "def build_prioritized_items(config):\n"
+                "    return [{'status':'now','context':'repo','title':'Fix regression','details':'ready'}]\n"
+            )
+            source = (ROOT / "aoe_worker.py").read_text().replace(
+                'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
+                f'ATTENTION_PATH = Path({str(attention)!r})',
+            )
+            worker_path = root / "aoe_worker.py"
+            worker_path.write_text(source)
+            proc = subprocess.Popen(
+                [sys.executable, str(worker_path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            stdout_buffer = bytearray()
+
+            def receive(timeout=3):
+                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not complete session creation")
+
+            def reply(request, result=None):
+                proc.stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result or {},
+                }) + "\n").encode())
+                proc.stdin.flush()
+
+            try:
+                listing = receive()
+                self.assertEqual(listing["method"], "sessions.list")
+                reply(listing, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
+
+                loading = receive()
+                self.assertEqual(loading["method"], "ui.state.set")
+                reply(loading)
+
+                snapshot = receive()
+                self.assertEqual(snapshot["method"], "ui.state.set")
+                payload = snapshot["params"]["payload"]
+                button = next(
+                    block for block in worker._walk_blocks(payload["blocks"])
+                    if block.get("label") == "New session"
+                )
+                self.assertEqual(button["method"], "attention.new_session")
+                reply(snapshot)
+
+                action_id = "create-session-action"
+                proc.stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": action_id, "method": button["method"],
+                    "params": {**button["params"], "session_id": "s1"},
+                }) + "\n").encode())
+                proc.stdin.flush()
+                accepted = receive()
+                self.assertEqual(accepted["id"], action_id)
+                self.assertTrue(accepted["result"]["ok"])
+
+                creating = receive()
+                self.assertEqual(creating["method"], "ui.state.set")
+                self.assertIn("Creating session: Attention: Fix regression", json.dumps(creating["params"]["payload"]))
+                reply(creating)
+
+                settings = receive()
+                self.assertEqual((settings["method"], settings["params"]), ("config.get", {"key": "agent_id"}))
+                reply(settings, {"value": "omp"})
+
+                create = receive()
+                self.assertEqual(create["method"], "sessions.create")
+                self.assertEqual(create["params"]["agent_id"], "omp")
+                self.assertEqual(create["params"]["title"], "Attention: Fix regression")
+                self.assertEqual(create["params"]["project_path"], "/repo")
+                self.assertEqual(create["params"]["idempotency_key"], button["params"]["token"])
+                reply(create, {"session_id": "created-session", "created": True})
+
+                completed = receive()
+                self.assertEqual(completed["method"], "ui.state.set")
+                self.assertIn("Created session: created-session", json.dumps(completed["params"]["payload"]))
+                self.assertEqual(completed["params"]["session_id"], "s1")
+                reply(completed)
+            finally:
+                proc.kill()
+                proc.wait(timeout=5)
+                proc.stdin.close()
+                proc.stdout.close()
+                proc.stderr.close()
+
     def test_blocked_source_fetch_does_not_block_loading_or_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -207,12 +383,10 @@ class WorkerProtocolTests(unittest.TestCase):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             )
 
+            stdout_buffer = bytearray()
+
             def receive(timeout=3):
-                ready, _, _ = select.select([proc.stdout], [], [], timeout)
-                self.assertTrue(ready, "worker did not respond before timeout")
-                line = proc.stdout.readline()
-                self.assertTrue(line, "worker exited before responding")
-                return json.loads(line)
+                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not respond before timeout")
 
             def reply(request, result=None):
                 proc.stdin.write(json.dumps({
@@ -249,7 +423,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 (gates / "release-1").touch()
                 first_result = receive()
                 self.assertEqual(first_result["method"], "ui.state.set")
-                self.assertEqual(next(block for block in first_result["params"]["payload"]["blocks"] if block["kind"] == "section")["title"], "Fetch 1")
+                self.assertEqual(next(block for block in first_result["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Fetch 1")
                 reply(first_result)
 
                 deadline = time.monotonic() + 3
@@ -262,7 +436,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 (gates / "release-2").touch()
                 second_result = receive()
                 self.assertEqual(second_result["method"], "ui.state.set")
-                self.assertEqual(next(block for block in second_result["params"]["payload"]["blocks"] if block["kind"] == "section")["title"], "Fetch 2")
+                self.assertEqual(next(block for block in second_result["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Fetch 2")
                 reply(second_result)
             finally:
                 proc.kill()
@@ -285,12 +459,10 @@ class WorkerProtocolTests(unittest.TestCase):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
 
+            stdout_buffer = bytearray()
+
             def receive(timeout=3):
-                ready, _, _ = select.select([proc.stdout], [], [], timeout)
-                self.assertTrue(ready, "worker did not retry or publish before timeout")
-                line = proc.stdout.readline()
-                self.assertTrue(line, "worker exited after a transient host error")
-                return json.loads(line)
+                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not retry or publish before timeout")
 
             def reply(request, result=None, error=None):
                 response = {"jsonrpc": "2.0", "id": request["id"]}
@@ -334,7 +506,7 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(published, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(published["method"], "ui.state.set")
-                    self.assertEqual(next(block for block in published["params"]["payload"]["blocks"] if block["kind"] == "section")["title"], "Recovered")
+                    self.assertEqual(next(block for block in published["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Recovered")
                     reply(published, {})
                     break
             finally:
@@ -366,10 +538,10 @@ class WorkerProtocolTests(unittest.TestCase):
             worker_path.write_text(source)
             proc = subprocess.Popen([sys.executable, str(worker_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
+            stdout_buffer = bytearray()
+
             def receive(timeout=3):
-                ready, _, _ = select.select([proc.stdout], [], [], timeout)
-                self.assertTrue(ready, "worker did not publish before timeout")
-                return json.loads(proc.stdout.readline())
+                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not publish before timeout")
 
             def reply(request, result=None):
                 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result or {}}) + "\n")
@@ -392,7 +564,7 @@ class WorkerProtocolTests(unittest.TestCase):
                     self.assertEqual(pushed["method"], "ui.state.set")
                     params = pushed["params"]
                     self.assertEqual((params["session_id"], params["slot"], params["id"]), ("s1", "pane", "attention"))
-                    self.assertEqual(next(block for block in params["payload"]["blocks"] if block["kind"] == "section")["title"], "Ship")
+                    self.assertEqual(next(block for block in params["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Ship")
                     toolbar = params["payload"]["blocks"][-1]
                     self.assertEqual(toolbar["kind"], "columns")
                     self.assertEqual(toolbar["children"][-1]["method"], "attention.refresh")
@@ -495,12 +667,10 @@ class WorkerActionProtocolTests(unittest.TestCase):
             proc = subprocess.Popen([sys.executable, str(worker_path)], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+            stdout_buffer = bytearray()
+
             def receive(timeout=3):
-                ready, _, _ = select.select([proc.stdout], [], [], timeout)
-                self.assertTrue(ready, "worker did not send a protocol message")
-                line = proc.stdout.readline()
-                self.assertTrue(line, "worker exited before replying")
-                return json.loads(line)
+                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not send a protocol message")
 
             def reply(request, result=None):
                 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request["id"],

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 REFRESH_SECONDS = 60
 MAX_PANE_BYTES = 64 * 1024
@@ -74,46 +75,84 @@ def attention_items():
         sys.modules.pop(name, None)
 
 
-def _tone_for_status(status):
-    value = status.lower()
-    if any(word in value for word in ("overdue", "blocked", "failed", "failing", "failure", "error", "conflict", "changes requested")):
-        return "danger"
-    if any(word in value for word in ("urgent", "review", "due", "pending", "requested", "attention")):
-        return "warn"
-    if any(word in value for word in ("approved", "complete", "resolved", "merged", "passing", "healthy", "done")):
-        return "success"
-    if any(word in value for word in ("open", "in progress", "running")):
-        return "info"
-    return "neutral"
+def _safe_source_url(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if (parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password):
+        return None
+    return value
 
 
-def _source_icon(plugin):
-    return {
-        "github": "github",
-        "linear": "circle-dot",
-        "calendar": "calendar-days",
-        "reminders": "square-check",
-        "generic": "square-terminal"
-    }.get(plugin, "circle-help")
+def _display_text(value, limit):
+    return " ".join(str(value).split())[:limit] if value is not None else ""
 
 
-def _status_icon(tone):
-    return {"danger": "circle-alert", "warn": "triangle-alert", "success": "circle-check", "info": "circle-dot"}.get(tone, "circle")
+def _is_open_action(action):
+    payload = action.get("payload")
+    label = str(action.get("label") or "").strip().casefold()
+    kind = str(payload.get("kind") or "").strip().casefold() if isinstance(payload, dict) else ""
+    return kind == "open" or label == "open" or label.startswith("open ")
 
 
-def _action_icon(label):
-    value = label.lower()
-    if "lumen" in value or "terminal" in value:
-        return "square-terminal"
-    if "open" in value or "view" in value:
-        return "external-link"
-    if "approve" in value or "complete" in value or "done" in value:
-        return "check"
-    if "copy" in value or "yank" in value:
-        return "copy"
-    if "dismiss" in value or "snooze" in value:
-        return "bell-off"
-    return "play"
+def _is_approve_action(action):
+    payload = action.get("payload")
+    label = str(action.get("label") or "").strip().casefold()
+    kind = str(payload.get("kind") or "").strip().casefold() if isinstance(payload, dict) else ""
+    return kind == "approve" or label == "approve"
+
+
+def _open_action(item):
+    for action in item.get("actions", []):
+        if not isinstance(action, dict) or not _is_open_action(action):
+            continue
+        payload = action.get("payload")
+        if isinstance(payload, dict) and not payload.get("inputs"):
+            return action
+    return None
+
+
+def _primary_row(item, token_actions, token_factory):
+    title = _display_text(item.get("title"), 240) or "Attention item"
+    status = _display_text(item.get("status"), 100)
+    context = _display_text(item.get("context"), 160)
+    indicators = item.get("indicators")
+    reason = item.get("attention_reason")
+    if not reason and isinstance(indicators, dict):
+        reason = indicators.get("state")
+    reason = _display_text(reason, 160)
+
+    summary = []
+    seen = {" ".join(title.casefold().split())}
+    for value in (status, context, reason):
+        key = " ".join(value.casefold().split())
+        if value and key not in seen:
+            seen.add(key)
+            summary.append(value)
+
+    row = {"kind": "row", "label": title}
+    if summary:
+        row["sublabel"] = " · ".join(summary)[:300]
+
+    open_action = _open_action(item)
+    action_payload = open_action.get("payload") if open_action else None
+    href = _safe_source_url(item.get("url"))
+    if not href and isinstance(action_payload, dict):
+        href = _safe_source_url(action_payload.get("url"))
+    if href:
+        row["href"] = href
+    elif open_action:
+        token = token_factory()
+        token_actions[token] = open_action
+        row.update({"method": "attention.action", "params": {"token": token}})
+    return row
 
 
 def _web_actions(item, token_actions, token_factory):
@@ -123,7 +162,9 @@ def _web_actions(item, token_actions, token_factory):
         "linear": {"comment", "transition"},
     }
     for action in item.get("actions", []):
-        if not isinstance(action, dict):
+        if not isinstance(action, dict) or _is_open_action(action):
+            continue
+        if (item.get("_is_own_pr") is True or action.get("_is_own_pr") is True) and _is_approve_action(action):
             continue
         plugin = action.get("_plugin") or item.get("_plugin", "")
         payload = action.get("payload")
@@ -145,58 +186,30 @@ def _web_actions(item, token_actions, token_factory):
             "label": label,
             "method": "attention.action",
             "params": {"token": token},
-            "icon": _action_icon(action.get("label", "")),
             "variant": "primary" if action.get("primary") else "secondary",
         })
-
+        # Reserve one pane-action slot for New session.
+        break
     token = token_factory()
-    title = str(item.get("title") or "Follow-up").strip()[:120]
+    title = _display_text(item.get("title"), 120) or "Follow-up"
     token_actions[token] = {"_aoe_operation": "new_session", "title": f"Attention: {title}"}
     blocks.append({
         "kind": "action",
         "label": "New session",
         "method": "attention.new_session",
         "params": {"token": token},
-        "icon": "plus",
         "variant": "secondary",
     })
     return blocks
 
 
 def _item_card(item, token_actions, token_factory):
-    status = str(item.get("status", ""))[:100]
-    context = str(item.get("context", ""))[:200]
-    title = str(item.get("title", "Attention item"))[:240]
-    details = str(item.get("details", ""))[:600]
-    plugin = str(item.get("_plugin", ""))
-    indicators = item.get("indicators")
-    state = indicators.get("state", "") if isinstance(indicators, dict) else ""
-    reason = str(item.get("attention_reason") or state or status or "Included in the prioritized Attention list.")[:400]
-    tone = _tone_for_status(status or reason)
-    children = [{
-        "kind": "row", "label": "Status", "value": status or "Unknown",
-        "icon": _status_icon(tone), "tone": tone,
-    }]
-    if context:
-        children.append({"kind": "row", "label": "Context", "value": context, "icon": _source_icon(plugin)})
-    children.append({
-        "kind": "callout", "title": "Why this is recommended", "detail": reason,
-        "icon": _status_icon(_tone_for_status(reason)), "tone": _tone_for_status(reason),
-    })
-    if details:
-        children.append({"kind": "row", "label": "Details", "value": details, "icon": "align-left"})
-    if isinstance(indicators, dict):
-        signals = {key: value for key, value in indicators.items() if key != "state"}
-        if signals:
-            value = " · ".join(f"{key}: {text}" for key, text in signals.items())[:300]
-            children.append({"kind": "row", "label": "Signals", "value": value, "icon": "activity"})
+    row = _primary_row(item, token_actions, token_factory)
     actions = _web_actions(item, token_actions, token_factory)
+    children = [row]
     if actions:
         children.append({"kind": "columns", "children": actions})
-    return {
-        "kind": "section", "title": title, "icon": _source_icon(plugin),
-        "tone": tone, "boxed": True, "children": children,
-    }
+    return {"kind": "section", "boxed": True, "children": children}
 
 
 def _walk_blocks(blocks):
@@ -231,12 +244,10 @@ def build_pane(items, token_factory=None):
     token_factory = token_factory or (lambda: secrets.token_urlsafe(18))
     token_actions = {}
     cards = [_item_card(item, token_actions, token_factory) for item in items]
-    heading = {"kind": "heading", "text": "Prioritized items"}
-    session_note = {"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."}
     toolbar = _pane_toolbar()
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     base = {"title": "Attention", "default_location": "right"}
-    blocks = [heading, session_note]
+    blocks = []
     if not cards:
         blocks.append({"kind": "note", "text": "No attention items."})
     blocks.extend(cards)
@@ -246,7 +257,7 @@ def build_pane(items, token_factory=None):
         return payload, token_actions
 
     kept = []
-    blocks = [heading, session_note, omission, toolbar]
+    blocks = [omission, toolbar]
     size = len(json.dumps({**base, "blocks": blocks}, separators=(",", ":")).encode("utf-8"))
     for card in cards:
         card_size = len(json.dumps(card, separators=(",", ":")).encode("utf-8")) + 1
@@ -254,7 +265,7 @@ def build_pane(items, token_factory=None):
             break
         kept.append(card)
         size += card_size
-    payload = {**base, "blocks": [heading, session_note, *kept, omission, toolbar]}
+    payload = {**base, "blocks": [*kept, omission, toolbar]}
     visible_tokens = _tokens_in_payload(payload)
     return payload, {token: action for token, action in token_actions.items() if token in visible_tokens}
 
@@ -301,12 +312,7 @@ def status_payload(text):
     return {
         "title": "Attention",
         "default_location": "right",
-        "blocks": [
-            {"kind": "heading", "text": "Prioritized items"},
-            {"kind": "note", "text": text},
-            {"kind": "note", "text": "New session creates a structured AoE session in this project (or scratch space). Choose an ACP agent in Attention plugin settings first."},
-            _pane_toolbar(),
-        ],
+        "blocks": [{"kind": "note", "text": text}, _pane_toolbar()],
     }
 
 
@@ -332,7 +338,9 @@ def payload_with_notice(base_payload, text, consumed_token=None):
     if consumed_token is not None:
         payload["blocks"] = _remove_action_token(payload["blocks"], consumed_token)
     blocks = payload["blocks"]
-    blocks.insert(1, {"kind": "note", "text": text[:200]})
+    insert_at = next((i for i, block in enumerate(blocks)
+                      if block.get("kind") in {"section", "note"}), max(0, len(blocks) - 1))
+    blocks.insert(insert_at, {"kind": "note", "text": text[:200]})
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     while len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) > MAX_PANE_BYTES:
         card_index = next((i for i in range(len(blocks) - 1, 0, -1) if blocks[i].get("kind") == "section"), None)
