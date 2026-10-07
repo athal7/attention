@@ -712,7 +712,7 @@ state = {'search': 0, 'delta': 0}
 def search(cfg, *_):
     state['search'] += 1
     return []
-def delta(*_):
+def delta(*_, **__):
     state['delta'] += 1
     return ([], '2026-01-01T00:00:00Z')
 p._fetch_search_items = search
@@ -832,6 +832,29 @@ print(p.act('d', {'kind': 'dismiss_notification', 'notification_ids': ['13']}), 
   check "dismiss returns false when its notification PATCH fails"     "$(sed -n 2p <<<"$out")" "False [['gh', 'api', '--method', 'PATCH', '/notifications/threads/13']]"
 }
 test_github_notification_actions
+test_github_notification_own_pr_marker() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+notification = {
+    'id': '42',
+    'subject': {'type': 'PullRequest', 'title': 'Own PR', 'url': 'https://api.github.com/repos/o/r/pulls/42'},
+    'repository': {'full_name': 'o/r'},
+}
+def graphql(args):
+    query = args[-1]
+    assert 'author { login }' in query
+    return {'data': {'r0': {'isArchived': False, 's0_0': {
+        'state': 'OPEN', 'author': {'login': 'Me'},
+    }}}}
+p._gh_json = graphql
+_, states = p._fetch_notification_state([notification])
+state = states[('o/r', 'PullRequest', 42)]
+print(p._notification_item(notification, state, current_login='me').get('_is_own_pr'))
+" )"
+  check "unread PR notifications carry case-insensitive author identity" "$(sed -n 1p <<<"$out")" "True"
+}
+test_github_notification_own_pr_marker
 echo
 echo "-- repo_path resolves via git-remote auto-detection, not the repo's own name --"
 
@@ -1958,11 +1981,14 @@ print(state['graphql'])
 print([(pr['type'], pr['number'], pr['attention_reasons']) for pr in result])
 p._fetch_raw = lambda config: result
 p._build_repo_dir_index = lambda code_dir: {}
-print([(item['id'], item['status'], item['indicators']['state']) for item in p.fetch({'codeDir': '/tmp'})])
+items = p.fetch({'codeDir': '/tmp'})
+print([(item['id'], item['status'], item['indicators']['state']) for item in items])
+print([(item['id'], item.get('_is_own_pr'), any(action.get('_is_own_pr') is True for action in item['actions'])) for item in items])
 ")"
   check "candidate PR details use one GraphQL request" "$(sed -n 1p <<<"$out")" "1"
   check "batched bot reviews flag tracked and authored PRs in existing precedence order" "$(sed -n 2p <<<"$out")" "[('tracked_attention', 3, ['Review Commented']), ('tracked_attention', 4, ['Review Commented']), ('authored_attention', 1, ['Review Commented']), ('authored_attention', 2, ['Review Commented'])]"
   check "bot reviews render tracked and authored PRs as needing attention" "$(sed -n 3p <<<"$out")" "[('3', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('4', 'ALICE: NEEDS ATTENTION', 'Reply needed'), ('1', 'NEEDS ATTENTION', 'Reply needed'), ('2', 'NEEDS ATTENTION', 'Reply needed')]"
+  check "authored pull-request markers survive item projection and action merging" "$(sed -n 4p <<<"$out")" "[('3', False, False), ('4', False, False), ('1', True, True), ('2', True, True)]"
 }
 test_pr_attention_classification_uses_batched_reviews
 test_pr_attention_distinguishes_pending_review_feedback() {
@@ -4531,6 +4557,7 @@ check "attention --help mentions Usage" \
 echo
 echo "== Agent of Empires pane worker =="
 python3 -m unittest -v "$REPO_ROOT/test_aoe_worker.py"
+python3 -m unittest -v "$REPO_ROOT/test_source_fetch_timeouts.py"
 
 echo "== summary: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

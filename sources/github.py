@@ -561,7 +561,7 @@ def _fetch_notification_state(notifications):
             field = "pullRequest" if subject_type == "PullRequest" else "issue"
             query.append(
                 f"{alias}: {field}(number: {number}) {{ state "
-                + ("isDraft baseRefName headRefName " if subject_type == "PullRequest" else "")
+                + ("isDraft baseRefName headRefName author { login } " if subject_type == "PullRequest" else "")
                 + "}"
             )
             target_aliases[(repo, subject_type, number)] = alias
@@ -595,6 +595,7 @@ def _fetch_notification_state(notifications):
                 "draft": raw.get("isDraft"),
                 "base": {"ref": base_ref} if base_ref else {},
                 "head": {"ref": head_ref} if head_ref else {},
+                "author": raw.get("author") or {},
             }
     return repository_archived, subject_state
 
@@ -616,7 +617,7 @@ def _notification_browser_url(notification, subject_info):
     ) or repository.get("html_url", "")
 
 
-def _notification_item(notification, subject_state=None, subject_info=None):
+def _notification_item(notification, subject_state=None, subject_info=None, current_login=None):
     subject = notification.get("subject") or {}
     repository = notification.get("repository") or {}
     thread_id = str(notification.get("id", ""))
@@ -650,6 +651,14 @@ def _notification_item(notification, subject_state=None, subject_info=None):
         item["isDraft"] = bool(subject_state.get("draft"))
         item["baseRefName"] = (subject_state.get("base") or {}).get("ref", "")
         item["headRefName"] = (subject_state.get("head") or {}).get("ref", "")
+        author = subject_state.get("author") or subject_state.get("user") or {}
+        author_login = author.get("login") if isinstance(author, dict) else None
+        item["_is_own_pr"] = (
+            isinstance(current_login, str)
+            and bool(current_login)
+            and isinstance(author_login, str)
+            and author_login.casefold() == current_login.casefold()
+        )
     return item
 
 
@@ -730,7 +739,7 @@ def _only_bot_timeline_comments_since_read(notification, repo, number):
             saw_unread_comment = True
     return saw_unread_comment
 
-def _fetch_notification_delta(since=None):
+def _fetch_notification_delta(since=None, current_login=None):
     """Fetch and validate a durable delta of unread notification threads."""
     poll_started = datetime.now(timezone.utc)
     args = ["api", "/notifications", "--method", "GET", "--paginate", "-f", "per_page=50"]
@@ -838,11 +847,11 @@ def _fetch_notification_delta(since=None):
                 and _only_bot_timeline_comments_since_read(notification, repo_name, state_key[2])
             ):
                 return {"notification_id": thread_id, "_remove": True}
-            return _notification_item(notification, state)
+            return _notification_item(notification, state, current_login=current_login)
         subject_url = subject.get("url") or ""
         if subject_url:
             subject_info = _gh_json(["api", subject_url])
-        return _notification_item(notification, subject_info=subject_info)
+        return _notification_item(notification, subject_info=subject_info, current_login=current_login)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         for result in pool.map(validate_notification, accepted):
@@ -1020,9 +1029,14 @@ def _fetch_search_items(config, current_login=None):
 
     for pr in authored_prs:
         pr["type"] = "authored_attention"
+        pr["_is_own_pr"] = True
     for pr in tracked_prs:
         pr["type"] = "tracked_attention"
-
+        pr["_is_own_pr"] = (
+            isinstance(current_login, str)
+            and bool(current_login)
+            and str(pr.get("tracked_author", "")).casefold() == current_login.casefold()
+        )
     def detail_for(pr):
         key = _pr_key(pr)
         return details.get(key) if key is not None else None
@@ -1056,7 +1070,7 @@ def _fetch_raw(config):
     """Live retrieval seam retained for focused tests and manual refreshes."""
     current_login = _get_gh_login()
     search_items = _fetch_search_items(config, current_login)
-    notification_items, _ = _fetch_notification_delta()
+    notification_items, _ = _fetch_notification_delta(current_login=current_login)
     return _compose_raw(search_items, notification_items)
 
 
@@ -1224,6 +1238,9 @@ def fetch(config):
         ]
         configured_actions = config.get("github", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))
+        if g.get("_is_own_pr") is True:
+            for action in actions:
+                action["_is_own_pr"] = True
         notification_ids = [str(thread_id) for thread_id in g.get("notification_ids", [])]
         notification_id = str(g.get("notification_id", ""))
         if notification_id and notification_id not in notification_ids:
@@ -1254,6 +1271,7 @@ def fetch(config):
             "weight": weight,
             "id": number,
             "kind": kind,
+            "_is_own_pr": g.get("_is_own_pr") is True,
             "created_at": g.get("createdAt", ""),
             "absorb_note": f"{details}: {title}" if details else f"{status}: {title}",
             "identity_key": f"github:{repo_name.lower()}#{number}",

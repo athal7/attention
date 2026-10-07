@@ -950,10 +950,27 @@ def print_rows():
         print(row)
 
 
+def dispatch_item_action(action):
+    """Run a normalized source action and apply its WIP transition."""
+    plugin = action["_plugin"]
+    mod = load_plugin(plugin)
+    payload = action.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError(f"plugin '{plugin}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
+    completed = mod.act(action.get("_original_key", action.get("key", "")), payload)
+    if completed is False:
+        return False
+    if action.get("wip") == "clear":
+        unmark_wip_item(action.get("_wip_id"))
+    elif action.get("wip"):
+        mark_wip_item(action.get("_wip_id"))
+    return True
+
+
 def act(key, line):
     """Dispatch a single action against one dashboard row.
-    `key` is the literal action key, or "" when plain Enter selected the
-    row. `line` is the complete tab-delimited row text.
+    key is the literal action key, or empty when plain Enter selected the
+    row. line is the complete tab-delimited row text.
     """
     parts = line.split("\t", 1)
     if len(parts) < 2:
@@ -980,18 +997,7 @@ def act(key, line):
 
     action = next(a for a in actions if a["key"] == resolved_key)
     try:
-        mod = load_plugin(action["_plugin"])
-        payload = action.get("payload")
-        if not isinstance(payload, dict):
-            raise ValueError(f"plugin '{action['_plugin']}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
-        completed = mod.act(action.get("_original_key", resolved_key), payload)
-        if completed is not False:
-            if action.get("wip") == "clear":
-                unmark_wip_item(action.get("_wip_id"))
-            elif action.get("wip"):
-                mark_wip_item(action.get("_wip_id"))
-            return True
-        return False
+        return dispatch_item_action(action)
     except (KeyboardInterrupt, EOFError):
         print("\nCanceled.")
         return False
@@ -999,6 +1005,27 @@ def act(key, line):
         print(f"Action failed: {e}")
         return False
 
+
+def worker_action_cli():
+    """Internal JSON bridge for the isolated AoE worker action process."""
+    try:
+        action = json.load(sys.stdin)
+        previous_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            completed = dispatch_item_action(action)
+        finally:
+            sys.stdout = previous_stdout
+        result = {"ok": completed}
+        if not completed:
+            result["error"] = "Action did not complete."
+    except (KeyboardInterrupt, EOFError):
+        result = {"ok": False, "error": "Action canceled."}
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)[:400]}
+    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0 if result["ok"] else 1
 
 def acknowledge_action():
     try:
@@ -1076,7 +1103,9 @@ def run_dashboard(refresh_interval=60):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 3 and sys.argv[1] == "act":
+    if len(sys.argv) > 1 and sys.argv[1] == "__worker_action__":
+        sys.exit(worker_action_cli())
+    elif len(sys.argv) > 3 and sys.argv[1] == "act":
         act(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 1 and sys.argv[1] == "expect-keys":
         print(",".join(expect_keys_for(build_prioritized_items(load_config()))))

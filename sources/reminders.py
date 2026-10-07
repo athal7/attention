@@ -10,6 +10,7 @@ from datetime import date
 
 from _util import resolve_configured_actions, run_cmd, run_configured_action
 
+FETCH_TIMEOUT_SECONDS = 15
 
 
 def fetch(config):
@@ -18,7 +19,12 @@ def fetch(config):
         return []
 
     try:
-        res = subprocess.run(["remindctl", "show", "all", "--json"], capture_output=True, text=True)
+        res = subprocess.run(
+            ["remindctl", "show", "all", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=FETCH_TIMEOUT_SECONDS,
+        )
         if res.returncode != 0:
             return []
         raw = json.loads(res.stdout or "[]")

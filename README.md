@@ -192,8 +192,26 @@ just point `config["plugins"]` at it.
 ## Agent of Empires web dashboard
 
 This repository also provides an Agent of Empires community plugin that
-publishes the prioritized attention list in each session’s right-hand pane.
-Install from the repository root with `aoe plugin install .`, then enable it
-with `aoe plugin enable athal7.attention`. The worker refreshes every minute;
-select **Refresh** in the pane to fetch immediately. It reads the same
-`attention` configuration and source integrations as the terminal dashboard.
+publishes prioritized Attention items in each session's right-hand pane.
+Install from the repository root with `aoe plugin install .`, then enable it with
+`aoe plugin enable athal7.attention`.
+AoE requests the plugin's `session.create` and `session.unattended` capabilities.
+`session.create` enables **New session** for AoE-reviewed interactive agents.
+The plugin needs `session.unattended` for unattended defaults such as `omp`; this
+plugin-wide grant may let any configured agent bypass interactive approval.
+Grant it only if that behavior is acceptable; otherwise choose an AoE-reviewed
+interactive ACP agent in the **New session agent** setting.
+
+Each card's **New session** action creates a structured ACP session with the
+same project path as the current AoE session (or a scratch session if it has no
+project path). It names the session after the Attention item and sends no
+initial prompt. The card actions remain in AoE's existing two-column layout.
+
+The item title and summary open the source directly; no separate **Open** button
+is shown. Status, context, and recommendation are combined into one summary.
+Lumen diff actions and actions requiring prompted input are omitted from the
+web pane; they remain available in the terminal dashboard. The worker refreshes
+every minute; select **Refresh** to fetch immediately. It uses the same
+`attention` configuration and integrations. At most one source action plus
+**New session** is shown per item; **Approve** is hidden on pull requests authored
+by the current GitHub user.
