@@ -1056,17 +1056,8 @@ def acknowledge_action():
     except EOFError:
         pass
 
-def run_dashboard(refresh_interval=60):
-    """The interactive loop: fetch every configured plugin concurrently,
-    then republish a fresh recomputed snapshot to one long-lived curses
-    presenter as each plugin fetch completes. It dispatches the selected
-    row's action and repeats until Esc or the merged snapshot goes empty.
-
-    The progressive-fetch, single-in-flight-round, pending-visibility,
-    and selection-tracking behavior lives in
-    dashboard.DashboardController and dashboard.CursesPresenter. This
-    function supplies the config-bound callables that those classes need.
-    """
+def run_dashboard():
+    """Fetch once on open, then refresh only when the user presses r."""
     config = load_config()
     groups, group_error = dashboard_groups(config)
     if group_error:
@@ -1102,13 +1093,12 @@ def run_dashboard(refresh_interval=60):
         acknowledge_action=acknowledge_action,
     )
     try:
-        found_something = controller.run(refresh_interval)
+        found_something = controller.run()
     except (OSError, curses.error) as e:
         print(f"attention: could not start the interactive dashboard: {e}", file=sys.stderr)
         sys.exit(1)
     if not found_something:
         print("Nothing needs attention right now.")
-
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "__worker_action__":

@@ -29,7 +29,7 @@ attention act K LINE  # dispatch a single hotkey press against one dashboard row
 
 In the dashboard: `Enter` runs a row's primary action (open in browser for
 GitHub/Linear items); every other hotkey acts immediately on the highlighted
-row. Press Enter after an action to return to the dashboard. `Esc` quits.
+row. Press `r` to refresh explicitly. `Esc` quits.
 
 Press `/` to filter visible rows with lowercase letters or digits. Use Backspace
 to edit the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter`
@@ -100,8 +100,8 @@ The dashboard opens a curses overview with type groups by default. It shows
 pull requests, issues, reminders, events, and other item types separately.
 Use `dashboard.groups` to replace these defaults. Use Up/Down or `j`/`k` to
 select a group. Press Enter to open its scoped terminal list. Esc in a scoped
-list returns to the overview. An action or background refresh reopens the same
-group list.
+list returns to the overview. Press `r` in either view to refresh; opening the
+interactive dashboard performs one initial fetch, with no background refresh.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
@@ -218,7 +218,11 @@ is shown. Status, context, and recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
 web pane; they remain available in the terminal dashboard. Collector failures
 appear as named, sanitized notes alongside healthy items; exception messages
-are never shown. The worker refreshes every minute; select **Refresh** to fetch
-immediately. It uses the same `attention` configuration and integrations. At
-most one source action plus **New session** is shown per item; **Approve** is
-hidden on pull requests authored by the current GitHub user.
+are never shown. The pane never fetches automatically; select **Refresh** to
+load or update items. Each result is labelled with its UTC fetch time. Session
+enumeration and actions update pane state without fetching attention sources.
+The `attention` GitHub source does not persist a snapshot locally. It uses
+`gh search`; `gh api --cache` covers GET requests and does not cache those searches.
+No stale snapshot is shown as current. At most one source action plus **New
+session** is shown per item; **Approve** is hidden on pull requests authored by
+the current GitHub user.

@@ -407,7 +407,14 @@ class WorkerProtocolTests(unittest.TestCase):
 
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
+                self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
                 reply(loading)
+                proc.stdin.write((json.dumps({
+                    "jsonrpc": "2.0", "id": "initial-refresh",
+                    "method": "attention.refresh", "params": {"session_id": "s1"},
+                }) + "\n").encode())
+                proc.stdin.flush()
+                self.assertTrue(receive()["result"]["ok"])
 
                 snapshot = receive()
                 self.assertEqual(snapshot["method"], "ui.state.set")
@@ -480,7 +487,7 @@ class WorkerProtocolTests(unittest.TestCase):
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
                 f'ATTENTION_PATH = Path({str(attention)!r})',
-            )
+            ).replace("REFRESH_SECONDS = 60", "REFRESH_SECONDS = 0.05")
             worker_path = root / "aoe_worker.py"
             worker_path.write_text(source)
             proc = subprocess.Popen(
@@ -506,13 +513,20 @@ class WorkerProtocolTests(unittest.TestCase):
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
                 loading_payload = loading["params"]["payload"]
-                self.assertIn("Loading attention items", json.dumps(loading_payload))
+                self.assertIn("Select Refresh", json.dumps(loading_payload))
                 reply(loading)
-
+                time.sleep(0.15)
+                self.assertFalse(calls.exists(), "worker fetched during startup or elapsed timer")
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": "refresh",
+                    "method": "attention.refresh", "params": {"session_id": "s1"},
+                }) + "\n")
+                proc.stdin.flush()
+                self.assertEqual(receive()["id"], "refresh")
                 deadline = time.monotonic() + 3
                 while not calls.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
-                self.assertTrue(calls.exists(), "source fetch did not start")
+                self.assertTrue(calls.exists(), "explicit refresh did not start source fetch")
                 self.assertEqual(calls.read_text(), "1")
 
                 for request_id in ("refresh-1", "refresh-2", "refresh-3"):
@@ -521,28 +535,15 @@ class WorkerProtocolTests(unittest.TestCase):
                         "method": "attention.refresh", "params": {"session_id": "s1"},
                     }) + "\n")
                 proc.stdin.flush()
-                responses = [receive() for _ in range(3)]
-                self.assertEqual([response["id"] for response in responses], ["refresh-1", "refresh-2", "refresh-3"])
+                responses = []
+                while len(responses) < 3:
+                    response = receive()
+                    if response.get("method") == "sessions.list":
+                        reply(response, {"sessions": [{"id": "s1"}]})
+                        continue
+                    responses.append(response)
                 self.assertTrue(all(response["result"]["ok"] for response in responses))
 
-                (gates / "release-1").touch()
-                first_result = receive()
-                self.assertEqual(first_result["method"], "ui.state.set")
-                self.assertEqual(next(block for block in first_result["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Fetch 1")
-                reply(first_result)
-
-                deadline = time.monotonic() + 3
-                while calls.read_text() != "2" and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertEqual(calls.read_text(), "2", "coalesced refresh did not start one follow-up fetch")
-                time.sleep(0.1)
-                self.assertEqual(calls.read_text(), "2", "refresh requests started duplicate follow-up fetches")
-
-                (gates / "release-2").touch()
-                second_result = receive()
-                self.assertEqual(second_result["method"], "ui.state.set")
-                self.assertEqual(next(block for block in second_result["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Fetch 2")
-                reply(second_result)
             finally:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -556,7 +557,7 @@ class WorkerProtocolTests(unittest.TestCase):
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
                 f'ATTENTION_PATH = Path({str(attention)!r})',
-            ).replace("REFRESH_SECONDS = 60", "REFRESH_SECONDS = 0.2")
+            ).replace("SESSION_POLL_SECONDS = 60", "SESSION_POLL_SECONDS = 0.2")
             worker_path = Path(tmp) / "aoe_worker.py"
             worker_path.write_text(source)
             proc = subprocess.Popen(
@@ -600,8 +601,14 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(loading, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(loading["method"], "ui.state.set")
-                    self.assertIn("Loading attention items", json.dumps(loading["params"]["payload"]))
+                    self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
                     reply(loading, {})
+                    proc.stdin.write(json.dumps({
+                        "jsonrpc": "2.0", "id": "refresh",
+                        "method": "attention.refresh", "params": {"session_id": "s1"},
+                    }) + "\n")
+                    proc.stdin.flush()
+                    self.assertEqual(receive()["id"], "refresh")
                     break
 
                 deadline = time.monotonic() + 3
@@ -638,7 +645,7 @@ class WorkerProtocolTests(unittest.TestCase):
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
                 f'ATTENTION_PATH = Path({str(attention)!r})',
-            ).replace("REFRESH_SECONDS = 60", "REFRESH_SECONDS = 0.05")
+            ).replace("SESSION_POLL_SECONDS = 60", "SESSION_POLL_SECONDS = 0.05")
             worker_path = Path(tmp) / "aoe_worker.py"
             worker_path.write_text(source)
             proc = subprocess.Popen([sys.executable, str(worker_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -658,8 +665,14 @@ class WorkerProtocolTests(unittest.TestCase):
                 reply(listing, {"sessions": [{"id": "s1"}]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
-                self.assertIn("Loading attention items", json.dumps(loading["params"]["payload"]))
+                self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
                 reply(loading)
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": "refresh",
+                    "method": "attention.refresh", "params": {"session_id": "s1"},
+                }) + "\n")
+                proc.stdin.flush()
+                self.assertEqual(receive()["id"], "refresh")
 
                 while True:
                     pushed = receive()
@@ -742,7 +755,7 @@ class AttentionActionDispatchTests(unittest.TestCase):
 
 
 class WorkerActionProtocolTests(unittest.TestCase):
-    def test_action_is_session_scoped_single_use_and_refreshes_snapshot(self):
+    def test_action_is_session_scoped_single_use_without_implicit_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             attention = root / "attention"
@@ -811,6 +824,12 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
                 reply(loading)
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": "initial-refresh",
+                    "method": "attention.refresh", "params": {"session_id": "s1"},
+                }) + "\n")
+                proc.stdin.flush()
+                self.assertEqual(receive()["id"], "initial-refresh")
                 first = receive()
                 while first.get("method") != "ui.state.set":
                     self.assertEqual(first.get("method"), "sessions.list")
@@ -821,6 +840,9 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 button_group = next(child for child in card["children"] if child.get("kind") == "columns")
                 button = next(child for child in button_group["children"] if child.get("method") == "attention.action")
                 token = button["params"]["token"]
+                new_session = next(block for block in worker._walk_blocks(payload["blocks"])
+                                   if block.get("method") == "attention.new_session")
+                new_session_token = new_session["params"]["token"]
                 self.assertNotIn("private-command", json.dumps(payload))
                 reply(first)
 
@@ -838,28 +860,20 @@ class WorkerActionProtocolTests(unittest.TestCase):
 
                 deadline = time.monotonic() + 5
                 completed_seen = False
-                refreshed_seen = False
-                new_session_token = None
-                while time.monotonic() < deadline and not refreshed_seen:
+                while time.monotonic() < deadline and not completed_seen:
                     message = receive(max(0.01, deadline - time.monotonic()))
                     if message.get("method") == "sessions.list":
                         reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
                         continue
                     self.assertEqual(message.get("method"), "ui.state.set")
-                    payload = message["params"]["payload"]
-                    state = json.dumps(payload)
-                    completed_seen = completed_seen or "Completed: Run QA" in state
-                    if "Fetch 2" in state:
-                        refreshed_seen = True
-                        action = next(block for block in worker._walk_blocks(payload["blocks"])
-                                      if block.get("method") == "attention.new_session")
-                        new_session_token = action["params"]["token"]
+                    state = json.dumps(message["params"]["payload"])
+                    completed_seen = "Completed: Run QA" in state
                     reply(message)
                 self.assertTrue(dispatched.exists(), "source action child was not invoked")
                 self.assertEqual(json.loads(dispatched.read_text())["payload"]["command"],
                                  ["echo", "private-command"])
                 self.assertTrue(completed_seen, "pane omitted action completion feedback")
-                self.assertTrue(refreshed_seen, "successful action did not refresh the item snapshot")
+                self.assertEqual(fetches.read_text(), "1", "action completion fetched implicitly")
 
                 send_action("stale", token, "s1")
                 stale = wait_response("stale")
@@ -889,8 +903,9 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 self.assertTrue(created_notice_seen, "pane omitted session creation result")
                 self.assertEqual(created_params, [{
                     "agent_id": "omp", "project_path": "/repo",
-                    "title": "Attention: Fetch 2", "idempotency_key": new_session_token,
+                    "title": "Attention: Fetch 1", "idempotency_key": new_session_token,
                 }])
+                self.assertEqual(fetches.read_text(), "1", "session creation fetched implicitly")
                 send_action("duplicate-session", new_session_token, "s1", method="attention.new_session")
                 duplicate_session = wait_response("duplicate-session")
                 self.assertFalse(duplicate_session["result"]["ok"])

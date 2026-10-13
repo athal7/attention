@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Agent of Empires worker publishing attention items into session panes."""
+from datetime import datetime, timezone
 import importlib.machinery
 import importlib.util
 import json
@@ -14,7 +15,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
-REFRESH_SECONDS = 60
+SESSION_POLL_SECONDS = 60
 MAX_PANE_BYTES = 64 * 1024
 ACTION_TIMEOUT_SECONDS = 120
 _input_buffer = bytearray()
@@ -240,7 +241,7 @@ def _pane_toolbar():
     }
 
 
-def build_pane(items, token_factory=None):
+def build_pane(items, token_factory=None, fetched_at=None):
     token_factory = token_factory or (lambda: secrets.token_urlsafe(18))
     token_actions = {}
     failures = [item for item in items if item.get("_collector_failure")]
@@ -255,6 +256,8 @@ def build_pane(items, token_factory=None):
         {"kind": "note", "text": f"{item['context']} collector failed: {item['details']}"}
         for item in failures
     ]
+    notices = ([{"kind": "note", "text": f"Fetched at {fetched_at} · Refresh to update."}]
+               if fetched_at else []) + notices
     blocks = [*notices]
     if not cards and not failures:
         blocks.append({"kind": "note", "text": "No attention items."})
@@ -378,7 +381,9 @@ def publish_payload(sessions, payload, only_new=False):
 def fetch_snapshot(results):
     try:
         with _source_lock:
-            payload, actions = build_pane(attention_items())
+            items = attention_items()
+            fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            payload, actions = build_pane(items, fetched_at=fetched_at)
         results.put((payload, actions, None))
     except Exception as exc:
         results.put((None, {}, str(exc)[:400]))
@@ -465,22 +470,18 @@ def main():
     active_action = None
     active_session_create = None
     results = queue.Queue(maxsize=1)
-    base_payload = status_payload("Loading attention items…")
+    base_payload = status_payload("Select Refresh to load attention items.")
     payload = base_payload
     sessions = []
-    initialized = False
     fetch_in_flight = False
     action_in_flight = False
     refresh_pending = False
     retry_publish = True
-    now = time.monotonic()
-    next_refresh = now + REFRESH_SECONDS
-    next_sessions = now
+    next_sessions = time.monotonic()
 
     while True:
         try:
-            deadline = min(next_refresh, next_sessions)
-            message = read_message(max(0, min(0.25, deadline - time.monotonic())))
+            message = read_message(max(0, min(0.25, next_sessions - time.monotonic())))
             if isinstance(message, dict) and "method" in message:
                 dispatch(message)
 
@@ -490,16 +491,9 @@ def main():
                 live_session_ids = {session["id"] for session in sessions}
                 live_sessions_by_id.clear()
                 live_sessions_by_id.update({session["id"]: session for session in sessions})
-                if not initialized:
-                    publish_payload(sessions, payload)
-                    initialized = True
-                    start_fetch(results)
-                    fetch_in_flight = True
-                    next_refresh = now + REFRESH_SECONDS
-                else:
-                    publish_payload(sessions, payload, only_new=not retry_publish)
+                publish_payload(sessions, payload, only_new=not retry_publish)
                 retry_publish = False
-                next_sessions = now + REFRESH_SECONDS
+                next_sessions = now + SESSION_POLL_SECONDS
 
             try:
                 request = action_requests.get_nowait()
@@ -530,7 +524,6 @@ def main():
                     if token in _payload_action_tokens(payload)
                 }
                 publish_payload(sessions, payload)
-                refresh_requested = True
 
             try:
                 session_request = session_create_requests.get_nowait()
@@ -557,13 +550,9 @@ def main():
                 }
                 publish_payload(sessions, payload)
                 active_session_create = None
-                refresh_requested = True
                 next_sessions = time.monotonic()
 
-            if initialized and now >= next_refresh:
-                refresh_requested = True
-                next_refresh = now + REFRESH_SECONDS
-            if initialized and refresh_requested:
+            if refresh_requested:
                 refresh_requested = False
                 if fetch_in_flight or action_in_flight:
                     refresh_pending = True
@@ -579,25 +568,26 @@ def main():
                 error = None
             if updated_payload is not None or updated_actions is not None:
                 fetch_in_flight = False
-                base_payload = updated_payload if error is None else status_payload(
-                    f"Could not load attention items: {error}",
-                )
-                payload = base_payload
-                action_tokens = updated_actions if error is None else {}
+                if error is None:
+                    base_payload = updated_payload
+                    payload = base_payload
+                    action_tokens = updated_actions
+                else:
+                    payload = payload_with_notice(
+                        base_payload, f"Refresh failed: {error}. Select Refresh to retry."
+                    )
                 publish_payload(sessions, payload)
-                if refresh_pending and not action_in_flight:
-                    refresh_pending = False
-                    start_fetch(results)
-                    fetch_in_flight = True
+            if refresh_pending and not fetch_in_flight and not action_in_flight:
+                refresh_pending = False
+                start_fetch(results)
+                fetch_in_flight = True
         except EOFError:
             return
         except Exception as exc:
             print(f"attention AoE worker: {exc}", file=sys.stderr, flush=True)
             retry_publish = True
-            retry_at = time.monotonic() + REFRESH_SECONDS
+            retry_at = time.monotonic() + SESSION_POLL_SECONDS
             next_sessions = retry_at
-            next_refresh = retry_at
-            refresh_requested = False
 
 
 if __name__ == "__main__":

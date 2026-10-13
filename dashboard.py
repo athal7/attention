@@ -32,18 +32,18 @@ from typing import Callable, NamedTuple, Protocol
 
 
 class PresenterResult(NamedTuple):
-    key: str | None  # None means wait_for_exit's timeout elapsed
+    key: str | None
     row: str
 
 
 class Presenter(Protocol):
     def launch(self) -> None: ...
     def push_snapshot(self, rows: list[str], pending: list[str]) -> None: ...
-    def wait_for_exit(self, timeout: float) -> PresenterResult: ...
+    def wait_for_exit(self) -> PresenterResult: ...
     def stop(self) -> None: ...
 
 
-_IDLE_HEADER = "Hotkeys act immediately on this row · Enter = primary action · Esc = quit"
+_IDLE_HEADER = "Hotkeys act immediately · r = refresh · Enter = primary action · Esc = quit"
 
 
 def _pending_header(pending):
@@ -120,6 +120,7 @@ class DashboardController:
         self._recently_acted = {}
         self._empty_final = False
         self._closed = False
+        self._refresh_after_round = False
 
     @staticmethod
     def _default_fetch_error(name, exc):
@@ -130,28 +131,20 @@ class DashboardController:
             "weight": 0, "actions": [],
         }
 
-    def run(self, refresh_interval=60):
-        """Runs until the user quits (Esc) or the merged snapshot goes
-        permanently empty. Returns True if the session ended because the
-        user quit (whether or not any snapshot ever had items), False if
-        it ended because every provider finished with nothing to show at
-        all -- the caller's cue to print the same "nothing needs
-        attention" message used for the zero-configured-plugins case.
-        """
+    def run(self):
+        """Fetch once on open; subsequent rounds start only on explicit refresh."""
         if not self.plugin_names:
             return False
         try:
             self._begin_round()
             while True:
-                result = self.presenter.wait_for_exit(refresh_interval)
-                if result.key is None:
-                    self._advance_round()
+                result = self.presenter.wait_for_exit()
+                if result.key == "r":
+                    self._refresh()
                     continue
                 if result.row == "":
                     return not self._empty_final
                 if result.key == "":
-                    # Enter pressed on a row — relaunch presenter without
-                    # advancing the round so the list stays on screen.
                     self._relaunch_presenter()
                     continue
                 action = self._action_for(result.key, result.row)
@@ -168,6 +161,14 @@ class DashboardController:
                     self._closed = True
                 self.presenter.stop()
 
+    def _refresh(self):
+        if self._round_is_terminal():
+            self._begin_round(force=True)
+        else:
+            with self._state_lock:
+                self._refresh_after_round = True
+            self._relaunch_presenter()
+
     def _next_generation(self):
         self._generation += 1
         return self._generation
@@ -176,30 +177,12 @@ class DashboardController:
         with self._state_lock:
             return self._round is None or self._round.terminal
 
-    def _advance_round(self):
-        """A periodic timeout or a dispatched hotkey both call this: a
-        new fetch round starts only if the active round has already
-        gone terminal (design.md Decision 6's hard invariant); either
-        way the presenter is always relaunched, primed with whatever the
-        active round has produced so far.
-        """
-        if self._round_is_terminal():
-            self._begin_round()
-        else:
-            self._relaunch_presenter()
-
-    def _begin_round(self):
-        """Creates a fresh round and relaunches the presenter against
-        its (still all-pending) state *before* submitting a single
-        fetch_plugin() call -- otherwise a plugin fast enough to finish
-        before this method returns could publish its own snapshot ahead
-        of the round's own initial launch, showing it out of order.
-        """
-        round_ = self._create_round()
+    def _begin_round(self, force=False):
+        round_ = self._create_round(force=force)
         self._relaunch_presenter()
         self._submit_round_fetches(round_)
 
-    def _create_round(self):
+    def _create_round(self, force=False):
         now = self._clock()
         with self._state_lock:
             cached = {
@@ -207,7 +190,7 @@ class DashboardController:
                 if (entry := self._cache.get(name)) is not None
             }
             items_by_plugin = {name: entry[0] for name, entry in cached.items()}
-            pending = {
+            pending = set(self.plugin_names) if force else {
                 name for name in self.plugin_names
                 if name not in cached or cached[name][1] <= now
             }
@@ -215,6 +198,7 @@ class DashboardController:
                 self.plugin_names, self._next_generation(), items_by_plugin, pending,
             )
             self._round = round_
+            self._refresh_after_round = False
         return round_
 
     def _submit_round_fetches(self, round_):
@@ -246,10 +230,13 @@ class DashboardController:
             terminal_now = not round_.pending
             if terminal_now:
                 round_.terminal = True
+            refresh_after_round = terminal_now and self._refresh_after_round
             items_by_plugin = dict(round_.items_by_plugin)
             pending = [n for n in self.plugin_names if n in round_.pending]
+        if refresh_after_round:
+            self._refresh()
+            return
         rows = self._render_snapshot(items_by_plugin)
-
         with self._presenter_lock:
             with self._state_lock:
                 if self._closed:
@@ -259,7 +246,6 @@ class DashboardController:
                 self.presenter.stop()
                 return
             self.presenter.push_snapshot(rows, pending)
-
     def _relaunch_presenter(self):
         with self._state_lock:
             round_ = self._round
@@ -338,10 +324,10 @@ class CursesPresenter:
             self._pending = list(pending)
             self._snapshot_version += 1
 
-    def wait_for_exit(self, timeout):
+    def wait_for_exit(self):
         import curses
 
-        return curses.wrapper(self._run, time.monotonic() + timeout)
+        return curses.wrapper(self._run)
 
     def stop(self):
         with self._lock:
@@ -434,7 +420,7 @@ class CursesPresenter:
     def _read_key(self, screen):
         return screen.getch()
 
-    def _run(self, screen, deadline):
+    def _run(self, screen):
         import curses
 
         screen.keypad(True)
@@ -450,9 +436,9 @@ class CursesPresenter:
             if stopped:
                 return PresenterResult("", "")
             visible, selected = self._draw(screen, rows, pending, selected, query)
-            if time.monotonic() >= deadline:
-                return PresenterResult(None, "")
             key = self._read_key(screen)
+            if query is None and key == ord("r"):
+                return PresenterResult("r", "")
             if key == -1:
                 # Check for a new snapshot pushed by the controller
                 # (e.g. after an action) without exiting the loop.
@@ -518,10 +504,10 @@ class CursesGroupPresenter:
         if presenter is not None:
             presenter.push_snapshot(scoped_rows, pending)
 
-    def wait_for_exit(self, timeout):
+    def wait_for_exit(self):
         import curses
 
-        return curses.wrapper(self._run, time.monotonic() + timeout)
+        return curses.wrapper(self._run)
 
     def stop(self):
         with self._lock:
@@ -570,12 +556,12 @@ class CursesGroupPresenter:
             marker = "›" if index == selected else " "
             attr = curses.A_REVERSE if index == selected else 0
             write(3 + index, f"{marker} {group} ({counts[group]})", attr)
-        write(height - 1, "↑/↓ select  Enter open group  Esc quit")
+        write(height - 1, "↑/↓ select  Enter open group  r refresh  Esc quit")
         screen.refresh()
         return visible_groups
 
 
-    def _open_group_and_track(self, screen, group, deadline):
+    def _open_group_and_track(self, screen, group):
         last_selection = 0
         while True:
             presenter = CursesPresenter(group)
@@ -588,7 +574,7 @@ class CursesGroupPresenter:
             try:
                 presenter.launch()
                 presenter.push_snapshot(rows, pending)
-                result = presenter._run(screen, deadline)
+                result = presenter._run(screen)
             finally:
                 presenter.stop()
                 with self._lock:
@@ -605,7 +591,7 @@ class CursesGroupPresenter:
                     self._reopen_group = group
             return result, should_return
 
-    def _run(self, screen, deadline):
+    def _run(self, screen):
         import curses
 
         screen.keypad(True)
@@ -621,7 +607,7 @@ class CursesGroupPresenter:
         if reopen_group is not None:
             _, _, stopped, counts = self._snapshot()
             if not stopped and counts.get(reopen_group):
-                result, should_return = self._open_group_and_track(screen, reopen_group, deadline)
+                result, should_return = self._open_group_and_track(screen, reopen_group)
                 if should_return:
                     return result
         while True:
@@ -633,16 +619,16 @@ class CursesGroupPresenter:
                 selected %= len(visible_groups)
             else:
                 selected = 0
-            if time.monotonic() >= deadline:
-                return PresenterResult(None, "")
             key = screen.getch()
             if key in (27, ord("q")):
                 return PresenterResult("", "")
+            if key == ord("r"):
+                return PresenterResult("r", "")
             if key in (curses.KEY_UP, ord("k")) and visible_groups:
                 selected = (selected - 1) % len(visible_groups)
             elif key in (curses.KEY_DOWN, ord("j")) and visible_groups:
                 selected = (selected + 1) % len(visible_groups)
             elif key in (curses.KEY_ENTER, 10, 13) and visible_groups:
-                result, should_return = self._open_group_and_track(screen, visible_groups[selected], deadline)
+                result, should_return = self._open_group_and_track(screen, visible_groups[selected])
                 if should_return:
                     return result

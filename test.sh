@@ -114,7 +114,7 @@ class FakePresenter:
         with self._cond:
             return self._cond.wait_for(lambda: self.launch_count >= n, timeout=timeout)
 
-    def wait_for_exit(self, timeout):
+    def wait_for_exit(self):
         return self._results.get()
 
     def stop(self):
@@ -123,8 +123,8 @@ class FakePresenter:
             self.calls.append(('stop',))
         self._results.put(d.PresenterResult('', ''))
 
-    def send_timeout(self):
-        self._results.put(d.PresenterResult(None, ''))
+    def send_refresh(self):
+        self._results.put(d.PresenterResult('r', ''))
 
     def send_result(self, key, row):
         self._results.put(d.PresenterResult(key, row))
@@ -3599,7 +3599,7 @@ presenter.push_snapshot(['row1', 'row2'], [])
 print([c[1] for c in presenter.push_calls()])
 result_holder = []
 def waiter():
-    result_holder.append(presenter.wait_for_exit(3600))
+    result_holder.append(presenter.wait_for_exit())
 th = threading.Thread(target=waiter)
 th.start()
 started_blocked = not th.join(timeout=0.2) and th.is_alive()
@@ -3631,7 +3631,7 @@ controller = d.DashboardController(
     render_rows=titles_render_rows,
     act=lambda key, row: None,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 presenter.wait_for_push_count(1, timeout=5)
 presenter.send_result('', '')
@@ -3645,6 +3645,40 @@ print('attention' not in sys.modules)
     "$(sed -n 2p <<<"$out")" "True"
 }
 test_dashboard_controller_from_fakes_touches_nothing_real
+
+test_dashboard_idle_waits_for_explicit_refresh() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+import time
+calls = CallLog()
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter, fetch_plugin=lambda name: (
+        calls.append(name) or [{'title': 'Item', 'id': 'item'}]
+    ),
+    build_snapshot=flatten_build_snapshot, render_rows=titles_render_rows,
+    act=lambda key, row: None,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+calls.wait_for_count(1, timeout=5)
+presenter.wait_for_push_count(2, timeout=5)
+time.sleep(0.15)
+idle_calls = calls.snapshot()
+presenter.send_refresh()
+calls.wait_for_count(2, timeout=5)
+presenter.wait_for_push_count(4, timeout=5)
+presenter.send_result('', '')
+th.join(timeout=5)
+print(idle_calls)
+print(calls.snapshot())
+")"
+  check "interactive idle leaves the initial result cached without another fetch" "$(sed -n 1p <<<"$out")" "['solo']"
+  check "the explicit refresh key starts exactly one new fetch" "$(sed -n 2p <<<"$out")" "['solo', 'solo']"
+}
+test_dashboard_idle_waits_for_explicit_refresh
 
 # ---------------------------------------------------------------------------
 echo
@@ -3668,7 +3702,7 @@ controller = d.DashboardController(
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 # push #1 is the round's initial (empty, all-pending) priming snapshot;
 # push #2 is 'a' finishing.
@@ -3710,7 +3744,7 @@ controller = d.DashboardController(
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 presenter.wait_for_launch_count(1, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
@@ -3751,39 +3785,35 @@ controller = d.DashboardController(
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None, cache_ttl=0,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(2, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
 calls_before = sorted(calls.snapshot())
 launches = presenter.launch_count
 for _ in range(5):
-    presenter.send_timeout()
+    presenter.send_refresh()
     presenter.wait_for_launch_count(launches + 1, timeout=5)
     launches = presenter.launch_count
 calls_during_gate = sorted(calls.snapshot())
 pushes_before_release = len(presenter.push_calls())
 gate_a.set()
-presenter.wait_for_push_count(pushes_before_release + 1, timeout=5)
-presenter.send_timeout()
-presenter.wait_for_launch_count(launches + 1, timeout=5)
-pushes_after_new_round_launch = len(presenter.push_calls())
-presenter.wait_for_push_count(pushes_after_new_round_launch + 1, timeout=5)
-calls_after_release_and_timeout = sorted(calls.snapshot())
+calls.wait_for_count(3, timeout=5)
+calls_after_release_and_refresh = sorted(calls.snapshot())
 presenter.send_result('', '')
 th.join(timeout=5)
 print(calls_before)
 print(calls_during_gate == calls_before)
-print(len(calls_after_release_and_timeout) > len(calls_during_gate))
+print(len(calls_after_release_and_refresh) > len(calls_during_gate))
 ")"
-  check "while one plugin is still gated, repeated timeouts submit no second round's fetch_plugin calls" \
+  check "while a plugin is gated, repeated manual refreshes queue no concurrent follow-up fetch" \
     "$(sed -n 2p <<<"$out")" "True"
-  check "once the gated plugin finally returns, the round goes terminal and a fresh round becomes eligible" \
+  check "releasing the gate allows the explicitly requested follow-up fetch" \
     "$(sed -n 3p <<<"$out")" "True"
 }
 test_round_goes_terminal_only_once_every_plugin_returns
 
-test_timeout_and_accept_relaunch_presenter_without_new_fetch_calls_mid_round() {
+test_manual_refresh_and_accept_relaunch_presenter_without_duplicate_fetches() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
@@ -3805,7 +3835,7 @@ controller = d.DashboardController(
     act=lambda key, row: events.append('act'),
     acknowledge_action=lambda: events.append('acknowledge'),
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(2, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
@@ -3835,7 +3865,7 @@ print(events)
   check "the controller acknowledges action output before it relaunches the dashboard" \
     "$(sed -n 5p <<<"$out")" "['act', 'acknowledge']"
 }
-test_timeout_and_accept_relaunch_presenter_without_new_fetch_calls_mid_round
+test_manual_refresh_and_accept_relaunch_presenter_without_duplicate_fetches
 
 test_terminal_action_relaunches_existing_list_before_refresh() {
   local out
@@ -3855,7 +3885,7 @@ controller = d.DashboardController(
     render_rows=blob_render_rows,
     act=lambda key, row: None,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(1, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
@@ -3867,7 +3897,7 @@ print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
 presenter.send_result('', '')
 th.join(timeout=5)
 ")"
-  check "a terminal session action does not start a fresh fetch before the refresh interval" \
+  check "a terminal session action causes no fetch until the user refreshes" \
     "$(sed -n 1p <<<"$out")" "['solo']"
   check "a terminal session action relaunches the same item list" \
     "$(sed -n 2p <<<"$out")" "['A']"
@@ -3892,7 +3922,7 @@ controller = d.DashboardController(
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None, cache_ttl=0,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(2, timeout=5)
 presenter.wait_for_push_count(2, timeout=5)
@@ -3900,7 +3930,7 @@ never_grew = True
 launches = presenter.launch_count
 for _ in range(50):
     calls_snapshot = sorted(calls.snapshot())
-    presenter.send_timeout()
+    presenter.send_refresh()
     presenter.wait_for_launch_count(launches + 1, timeout=5)
     launches = presenter.launch_count
     if sorted(calls.snapshot()) != calls_snapshot or presenter.push_calls()[-1][2] != ['a']:
@@ -3908,7 +3938,7 @@ for _ in range(50):
 pushes_before_release = len(presenter.push_calls())
 gate_a.set()
 presenter.wait_for_push_count(pushes_before_release + 1, timeout=5)
-presenter.send_timeout()
+presenter.send_refresh()
 presenter.wait_for_launch_count(launches + 1, timeout=5)
 pushes_after_new_round_launch = len(presenter.push_calls())
 presenter.wait_for_push_count(pushes_after_new_round_launch + 1, timeout=5)
@@ -3918,7 +3948,7 @@ th.join(timeout=5)
 print(never_grew)
 print(became_eligible_again)
 ")"
-  check "across 50 consecutive periodic-timeout cycles with one plugin permanently gated, no new round ever starts (no bounded escape hatch)" \
+  check "across 50 manual refreshes while one plugin stays gated, no overlapping fetch round starts" \
     "$(sed -n 1p <<<"$out")" "True"
   check "releasing the gated plugin finally lets the round go terminal and a new round becomes possible" \
     "$(sed -n 2p <<<"$out")" "True"
@@ -3939,7 +3969,7 @@ controller = d.DashboardController(
 )
 result_holder = []
 def runner():
-    result_holder.append(controller.run(3600))
+    result_holder.append(controller.run())
 th = threading.Thread(target=runner)
 th.start()
 th.join(timeout=5)
@@ -3976,7 +4006,7 @@ controller = d.DashboardController(
     fetch_plugin=fetch_plugin, build_snapshot=flatten_build_snapshot,
     render_rows=titles_render_rows, act=lambda key, row: None,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 started.wait(timeout=5)
 presenter.send_result('', '')
@@ -4003,7 +4033,7 @@ print(calls_after_quit == calls_after_release)
 }
 test_quit_returns_promptly_and_discards_a_later_gated_completion
 
-test_dashboard_cache_revalidates_stale_results_and_keeps_fresh_hits_terminal() {
+test_dashboard_manual_refresh_revalidates_cached_results() {
   local out
   out="$(python3 -c "
 $LOAD_DASHBOARD
@@ -4027,33 +4057,28 @@ controller = d.DashboardController(
     build_snapshot=flatten_build_snapshot, render_rows=titles_render_rows,
     act=lambda key, row: None, cache_ttl=10, clock=lambda: clock[0],
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(1)
 presenter.wait_for_push_count(2)
-clock[0] = 1
-presenter.send_timeout()
-presenter.wait_for_launch_count(2)
-fresh_calls = calls.snapshot()
-clock[0] = 11
-presenter.send_timeout()
-presenter.wait_for_launch_count(3)
+presenter.send_refresh()
+calls.wait_for_count(2)
+presenter.wait_for_push_count(3)
 stale_push = presenter.push_calls()[-1]
-pushes_before_release = len(presenter.push_calls())
 gate.set()
-presenter.wait_for_push_count(pushes_before_release + 1)
+presenter.wait_for_push_count(4)
 new_rows = presenter.push_calls()[-1][1]
 presenter.send_result('', '')
 th.join(timeout=5)
-print(fresh_calls)
+print(calls.snapshot())
 print(stale_push[1:])
 print(new_rows)
 ")"
-  check "a fresh cache hit starts no fetch and the round is terminal" "$(sed -n 1p <<<"$out")" "['a']"
-  check "an expired cache entry stays visible while its replacement is pending" "$(sed -n 2p <<<"$out")" "(['Old'], ['a'])"
-  check "the expired entry is replaced when revalidation succeeds" "$(sed -n 3p <<<"$out")" "['New']"
+  check "manual refresh fetches again despite a fresh in-memory cache entry" "$(sed -n 1p <<<"$out")" "['a', 'a']"
+  check "the last good in-memory rows stay visible while explicit refresh is pending" "$(sed -n 2p <<<"$out")" "(['Old'], ['a'])"
+  check "manual refresh replaces cached rows on success" "$(sed -n 3p <<<"$out")" "['New']"
 }
-test_dashboard_cache_revalidates_stale_results_and_keeps_fresh_hits_terminal
+test_dashboard_manual_refresh_revalidates_cached_results
 
 test_dashboard_action_invalidates_its_plugin_cache() {
   local out
@@ -4079,14 +4104,14 @@ controller = d.DashboardController(
     build_snapshot=flatten_build_snapshot, render_rows=render,
     act=lambda key, row: None, cache_ttl=60, clock=lambda: clock[0],
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(1)
 presenter.wait_for_push_count(2)
 row = presenter.push_calls()[-1][1][0]
 presenter.send_result('o', row)
 presenter.wait_for_launch_count(2)
-presenter.send_timeout()
+presenter.send_refresh()
 calls.wait_for_count(2)
 pushes_before_release = len(presenter.push_calls())
 gate.set()
@@ -4119,19 +4144,19 @@ controller = d.DashboardController(
     build_snapshot=flatten_build_snapshot, render_rows=render,
     act=lambda key, row: False, cache_ttl=60,
 )
-th = threading.Thread(target=controller.run, args=(3600,))
+th = threading.Thread(target=controller.run)
 th.start()
 calls.wait_for_count(1)
 presenter.wait_for_push_count(2)
 presenter.send_result('o', presenter.push_calls()[-1][1][0])
 presenter.wait_for_launch_count(2)
-presenter.send_timeout()
-presenter.wait_for_launch_count(3)
+import time
+time.sleep(0.15)
 presenter.send_result('', '')
 th.join(timeout=5)
 print(calls.snapshot())
 ")"
-  check "a failed action does not invalidate the still-fresh plugin cache" "$out" "['a']"
+  check "a failed action does not trigger an automatic fetch" "$out" "['a']"
 }
 test_dashboard_failed_action_preserves_its_plugin_cache
 
@@ -4194,24 +4219,24 @@ rows = [
 filtered = d.CursesPresenter()
 filtered.launch()
 filtered.push_snapshot(rows, [])
-filtered_result = filtered._run(FakeScreen([ord('/'), *(ord(c) for c in 'review'), 10]), time.monotonic() + 1)
+filtered_result = filtered._run(FakeScreen([ord('/'), *(ord(c) for c in 'review'), 10]))
 alt = d.CursesPresenter()
 alt.launch()
 alt.push_snapshot(rows, [])
-alt_result = alt._run(FakeScreen([ord('o')]), time.monotonic() + 1)
+alt_result = alt._run(FakeScreen([ord('o')]))
 reserved_results = []
 for key in ('q', 'j', 'k'):
     row = 'Reserved ' + key + chr(9) + 'blob' + chr(9) + key + chr(9) + key + ' action'
     reserved = d.CursesPresenter()
     reserved.launch()
     reserved.push_snapshot([row], [])
-    result = reserved._run(FakeScreen([ord(key), 27]), time.monotonic() + 1)
+    result = reserved._run(FakeScreen([ord(key), 27]))
     reserved_results.append(result == d.PresenterResult('', ''))
 unbound_lowercase = d.CursesPresenter()
 unbound_lowercase.launch()
 unbound_lowercase.push_snapshot(rows, [])
 lowercase_screen = RecordingScreen([ord('z'), 27])
-unbound_lowercase._run(lowercase_screen, time.monotonic() + 1)
+unbound_lowercase._run(lowercase_screen)
 print(filtered_result == d.PresenterResult('', rows[1]))
 print(alt_result == d.PresenterResult('o', rows[0]))
 print(all(reserved_results))
@@ -4260,7 +4285,7 @@ presenter = d.CursesPresenter()
 presenter.launch()
 presenter.push_snapshot(rows, [])
 # Navigate to the third row (index 2), then press its action key 'D'.
-result = presenter._run(FakeScreen([ord('j'), ord('j'), ord('D')]), time.monotonic() + 1)
+result = presenter._run(FakeScreen([ord('j'), ord('j'), ord('D')]))
 # Selection should be preserved at index 2 after the action.
 print(presenter._last_selection)
 print(result == d.PresenterResult('D', rows[2]))
@@ -4268,6 +4293,27 @@ print(result == d.PresenterResult('D', rows[2]))
   check "flat presenter preserves selection index after action key" "$(sed -n 1p <<<"$out")" "2"
   check "flat presenter dispatches the action on the selected row" "$(sed -n 2p <<<"$out")" "True"
 }
+
+test_curses_presenter_reports_manual_refresh() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+class FakeScreen:
+    def keypad(self, value): pass
+    def timeout(self, value): pass
+    def getmaxyx(self): return (24, 80)
+    def erase(self): pass
+    def addnstr(self, *args, **kwargs): pass
+    def refresh(self): pass
+    def getch(self): return ord('r')
+presenter = d.CursesPresenter()
+presenter.launch()
+presenter.push_snapshot(['Item' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'o open'], [])
+print(presenter._run(FakeScreen()) == d.PresenterResult('r', ''))
+")"
+  check "curses presenter maps r to explicit refresh" "$out" "True"
+}
+test_curses_presenter_reports_manual_refresh
 test_curses_presenter_detects_inflight_snapshot_update() {
   local out
   out="$(python3 -c "
@@ -4300,13 +4346,13 @@ presenter.push_snapshot(rows1, [])
 rows2 = ['Item A' + chr(9) + 'blob1' + chr(9) + 'a' + chr(9) + 'hint', 'Item B' + chr(9) + 'blob2' + chr(9) + 'b' + chr(9) + 'hint']
 presenter.push_snapshot(rows2, [])
 # No keys to press; presenter should detect the version change and loop.
-# After deadline, it returns None.
-result = presenter._run(FakeScreen([]), time.monotonic() + 0.5)
-print(result.key is None)
+# r exits the presenter with a refresh result rather than a row action.
+result = presenter._run(FakeScreen([-1, ord('r')]))
+print(result == d.PresenterResult('r', ''))
 print(presenter._snapshot_version >= 2)
 ")"
-  check "presenter detects in-flight snapshot version change" "$(sed -n 1p <<<"$out")" "True"
-  check "presenter snapshot version incremented after push" "$(sed -n 2p <<<"$out")" "True"
+  check "presenter stays open while idle and returns on explicit refresh" "$(sed -n 1p <<<"$out")" "True"
+  check "presenter snapshot version increments after push" "$(sed -n 2p <<<"$out")" "True"
 }
 test_curses_presenter_dispatches_filtered_and_alt_actions
 test_curses_presenter_preserves_selection_after_action
@@ -4511,24 +4557,16 @@ presenter._rows = [
     'a-item' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'A',
     'b-item' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'B',
 ]
-deadline = time.monotonic() + 5
-
-# Shared FakeScreen drives both outer (overview) and inner (group) loops.
-# Key sequence: Enter(10) opens group A, 'o'(111) dispatches action,
-# timeout(-1) triggers snapshot check then Esc(27) exits group,
-# Esc(27) quits overview.
-screen = FakeScreen([10, 111, -1, 27, 27])
+screen = FakeScreen([10, 111, ord('r'), 27, 27])
 
 # 1) Enter on the overview's first row opens 'A' and dispatches 'o'.
-result1 = presenter._run(screen, deadline)
+result1 = presenter._run(screen)
 reopen_after_action = presenter._reopen_group
-# 2) The next relaunch (e.g. a periodic refresh timeout) reopens 'A'
-#    directly -- no keypress needed to pick it again.
-result2 = presenter._run(screen, deadline)
+result2 = presenter._run(screen)
 reopen_after_refresh = presenter._reopen_group
 # 3) An explicit Esc inside the reopened group falls through to the
 #    overview, which then consumes a real keypress (Esc) to quit.
-result3 = presenter._run(screen, deadline)
+result3 = presenter._run(screen)
 
 print((result1.key, result1.row))
 print(reopen_after_action)
@@ -4540,12 +4578,12 @@ print((result3.key, result3.row))
     "$(sed -n 1p <<<"$out")" "('o', 'a-item\tblob\to\thint')"
   check "acting on an item remembers its group instead of resetting to the overview" \
     "$(sed -n 2p <<<"$out")" "A"
-  check "the next relaunch reopens the same group with no overview keypress" \
-    "$(sed -n 3p <<<"$out")" "('', '')"
-  check "a periodic-refresh relaunch inside a group keeps remembering it too" \
-    "$(sed -n 4p <<<"$out")" "None"
+  check "manual refresh returns the group-scoped refresh result" \
+    "$(sed -n 3p <<<"$out")" "('r', '')"
+  check "manual refresh remembers the group for the next view" \
+    "$(sed -n 4p <<<"$out")" "A"
   check "explicit Esc inside the group still returns to the overview" \
-    "$(sed -n 5p <<<"$out")" "(None, '')"
+    "$(sed -n 5p <<<"$out")" "('', '')"
 }
 test_curses_presenter_reopens_group_after_action_or_refresh_instead_of_overview
 
@@ -4561,7 +4599,7 @@ class FailingController:
     def __init__(self, *args, **kwargs):
         pass
 
-    def run(self, refresh_interval):
+    def run(self):
         raise m.curses.error('terminal unavailable')
 
 
