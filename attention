@@ -350,6 +350,38 @@ def validate_and_normalize_item(item, name):
             raise ValueError(f"plugin '{name}' returned a malformed item: action 'payload' must be of type dict, got {type(action['payload']).__name__}")
 
 
+def collector_failure_item(name, exc):
+    """A visible, inert result; never include exception text or command output."""
+    label = Path(name).stem if "/" in name or name.endswith(".py") else name
+    label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:60] or "unknown"
+    reason = type(exc).__name__
+    if isinstance(exc, OSError) and exc.errno is not None:
+        import errno
+        reason += f" ({errno.errorcode.get(exc.errno, 'OS error')})"
+    elif isinstance(getattr(exc, "returncode", None), int):
+        reason += f" (exit {exc.returncode})"
+    elif isinstance(getattr(exc, "code", None), int):
+        reason += f" (HTTP {exc.code})"
+    return {
+        "_collector_failure": True, "_plugin": name,
+        "status": "FETCH FAILED", "title": f"{label} collector failed",
+        "context": label, "details": reason, "weight": 0, "actions": [],
+    }
+
+
+def fetch_plugin_items(name, config):
+    mod = load_plugin(name)
+    fetched = mod.fetch(config) or []
+    for item in fetched:
+        validate_and_normalize_item(item, name)
+    for item in fetched:
+        item["_plugin"] = name
+        for action in item.get("actions", []):
+            action["_plugin"] = name
+            action["_item_id"] = item.get("id")
+    return fetched
+
+
 def fetch_all(config):
     """Call every configured plugin's fetch() concurrently, tagging each
     returned action with which plugin produced it (core's own bookkeeping,
@@ -373,22 +405,9 @@ def fetch_all(config):
 
     def _fetch_one(name):
         try:
-            mod = load_plugin(name)
-            fetched = mod.fetch(config) or []
-        except Exception:
-            return []
-        try:
-            for item in fetched:
-                validate_and_normalize_item(item, name)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            return []
-        for item in fetched:
-            item["_plugin"] = name
-            for action in item.get("actions", []):
-                action["_plugin"] = name
-                action["_item_id"] = item.get("id")
-        return fetched
+            return fetch_plugin_items(name, config)
+        except Exception as exc:
+            return [collector_failure_item(name, exc)]
 
     items = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(plugin_names)) as pool:
@@ -893,10 +912,14 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     host["actions"] would otherwise re-absorb the same guest on every
     later call, compounding the note/weight/actions each time.
     """
+    failures = [
+        it for plugin_items in items_by_plugin.values()
+        for it in plugin_items if it.get("_collector_failure")
+    ]
     items = [
         dict(it, actions=[dict(a) for a in it.get("actions", [])])
         for plugin_items in items_by_plugin.values()
-        for it in plugin_items
+        for it in plugin_items if not it.get("_collector_failure")
     ]
     items = merge_cross_links(items)
 
@@ -930,7 +953,7 @@ def build_snapshot(items_by_plugin, recently_acted=None):
                 it["weight"] = max(0, it.get("weight", 0) - 20)
 
     items.sort(key=lambda x: x.get("weight", 0), reverse=True)
-    return items
+    return [*items, *failures]
 
 
 def build_prioritized_items(config, recently_acted=None):
@@ -1060,23 +1083,7 @@ def run_dashboard(refresh_interval=60):
             pass
 
     def fetch_plugin(name):
-        try:
-            mod = load_plugin(name)
-            fetched = mod.fetch(config) or []
-        except Exception:
-            return []
-        try:
-            for item in fetched:
-                validate_and_normalize_item(item, name)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            return []
-        for item in fetched:
-            item["_plugin"] = name
-            for action in item.get("actions", []):
-                action["_plugin"] = name
-                action["_item_id"] = item.get("id")
-        return fetched
+        return fetch_plugin_items(name, config)
 
     if groups:
         presenter = dashboard.CursesGroupPresenter([group["name"] for group in groups])
@@ -1088,6 +1095,7 @@ def run_dashboard(refresh_interval=60):
     controller = dashboard.DashboardController(
         plugin_names, presenter,
         fetch_plugin=fetch_plugin,
+        on_fetch_error=collector_failure_item,
         build_snapshot=build_snapshot,
         render_rows=render_rows,
         act=act,

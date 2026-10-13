@@ -1802,7 +1802,7 @@ write_config <<JSON
 JSON
 
 test_malformed_item_isolated_to_its_own_plugin() {
-  local out err rc
+  local out rc
   out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$GH_BIN:$PATH" python3 "$ATTENTION" list 2>"$WORK/validation-stderr.log")" && rc=0 || rc=$?
   check "a plugin returning a malformed item does not crash the whole run" "$rc" "0"
   if grep -q 'GHTEST-review-me' <<<"$out"; then
@@ -1810,12 +1810,11 @@ test_malformed_item_isolated_to_its_own_plugin() {
   else
     bad "other plugins still contribute when one plugin's item fails validation (got: $out)"
   fi
-  err="$(cat "$WORK/validation-stderr.log")"
-  case "$err" in
-    *"plugin '$VALIDATION_ISOLATION_PLUGIN' returned a malformed item: 'weight' must be of type int, got str"*)
-      ok "the validation failure is printed to stderr, naming the plugin and the exact problem" ;;
-    *) bad "the validation failure is printed to stderr, naming the plugin and the exact problem (got: $err)" ;;
-  esac
+  if grep -q 'FETCH FAILED' <<<"$out" && grep -q 'validation_isolation_plugin' <<<"$out" && grep -q 'ValueError' <<<"$out"; then
+    ok "the validation failure appears as a named, sanitized collector row"
+  else
+    bad "the validation failure appears as a named, sanitized collector row (got: $out)"
+  fi
 }
 test_malformed_item_isolated_to_its_own_plugin
 

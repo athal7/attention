@@ -217,6 +217,111 @@ class AttentionSourceTests(unittest.TestCase):
                 with patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
                     self.assertEqual(worker.attention_items(), [])
 
+    def test_cli_and_pane_show_sanitized_partial_and_total_collector_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "attention"
+            config_dir.mkdir(parents=True)
+            healthy = root / "healthy.py"
+            failing = root / "failing.py"
+            healthy.write_text(
+                "def fetch(config):\n"
+                "    return [{'status':'OPEN','context':'repo','title':'Healthy item',"
+                "'details':'','weight':1}]\n"
+            )
+            failing.write_text(
+                "def fetch(config):\n"
+                "    raise RuntimeError('token=collector-secret')\n"
+            )
+            config_path = config_dir / "config.json"
+            state = root / "state"
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(state),
+            }
+
+            def set_plugins(plugins):
+                config_path.write_text(json.dumps({"plugins": [str(p) for p in plugins]}))
+
+            def run_cli():
+                return subprocess.run(
+                    [sys.executable, str(ROOT / "attention"), "list"],
+                    env={**os.environ, **env}, capture_output=True, text=True, check=True,
+                ).stdout
+
+            set_plugins([healthy, failing])
+            output = run_cli()
+            self.assertIn("Healthy item", output)
+            self.assertIn("failing collector failed", output)
+            self.assertIn("RuntimeError", output)
+            self.assertNotIn("collector-secret", output)
+            with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
+            self.assertIn("Healthy item", pane_text)
+            self.assertIn("failing collector failed: RuntimeError", pane_text)
+            self.assertNotIn("collector-secret", pane_text)
+
+            set_plugins([failing])
+            output = run_cli()
+            self.assertIn("failing collector failed", output)
+            self.assertNotIn("Nothing needs attention", output)
+            with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
+            self.assertIn("failing collector failed: RuntimeError", pane_text)
+            self.assertNotIn("No attention items.", pane_text)
+
+            healthy.write_text("def fetch(config):\n    return []\n")
+            set_plugins([healthy])
+            self.assertEqual(run_cli(), "")
+            with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
+            self.assertIn("No attention items.", pane_text)
+            self.assertNotIn("collector failed", pane_text)
+
+    def test_interactive_dashboard_renders_failed_and_healthy_collectors(self):
+        dashboard_spec = importlib.util.spec_from_file_location(
+            "dashboard_failure_test", ROOT / "dashboard.py",
+        )
+        dashboard = importlib.util.module_from_spec(dashboard_spec)
+        dashboard_spec.loader.exec_module(dashboard)
+
+        class Presenter:
+            def __init__(self):
+                self.snapshots = []
+
+            def push_snapshot(self, rows, pending):
+                self.snapshots.append((rows, pending))
+
+            def launch(self):
+                pass
+
+            def stop(self):
+                pass
+
+        presenter = Presenter()
+
+        def fetch(name):
+            if name == "broken":
+                raise RuntimeError("token=collector-secret")
+            return [{"title": "Healthy item"}]
+
+        controller = dashboard.DashboardController(
+            ["broken", "healthy"], presenter,
+            fetch_plugin=fetch,
+            build_snapshot=lambda grouped, recent: [
+                item for values in grouped.values() for item in values
+            ],
+            render_rows=lambda items: [item["title"] for item in items],
+            act=lambda key, row: None,
+        )
+        round_ = controller._create_round()
+        controller._run_plugin_fetch(round_, "broken")
+        controller._run_plugin_fetch(round_, "healthy")
+        rows = presenter.snapshots[-1][0]
+        self.assertIn("broken collector failed", rows)
+        self.assertIn("Healthy item", rows)
+        self.assertNotIn("collector-secret", json.dumps(rows))
+
 
 class InteractiveActionTests(unittest.TestCase):
     @classmethod

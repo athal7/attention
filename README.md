@@ -210,8 +210,9 @@ initial prompt. The card actions remain in AoE's existing two-column layout.
 The item title and summary open the source directly; no separate **Open** button
 is shown. Status, context, and recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
-web pane; they remain available in the terminal dashboard. The worker refreshes
-every minute; select **Refresh** to fetch immediately. It uses the same
-`attention` configuration and integrations. At most one source action plus
-**New session** is shown per item; **Approve** is hidden on pull requests authored
-by the current GitHub user.
+web pane; they remain available in the terminal dashboard. Collector failures
+appear as named, sanitized notes alongside healthy items; exception messages
+are never shown. The worker refreshes every minute; select **Refresh** to fetch
+immediately. It uses the same `attention` configuration and integrations. At
+most one source action plus **New session** is shown per item; **Approve** is
+hidden on pull requests authored by the current GitHub user.

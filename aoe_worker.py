@@ -243,12 +243,20 @@ def _pane_toolbar():
 def build_pane(items, token_factory=None):
     token_factory = token_factory or (lambda: secrets.token_urlsafe(18))
     token_actions = {}
-    cards = [_item_card(item, token_actions, token_factory) for item in items]
+    failures = [item for item in items if item.get("_collector_failure")]
+    cards = [
+        _item_card(item, token_actions, token_factory)
+        for item in items if not item.get("_collector_failure")
+    ]
     toolbar = _pane_toolbar()
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     base = {"title": "Attention", "default_location": "right"}
-    blocks = []
-    if not cards:
+    notices = [
+        {"kind": "note", "text": f"{item['context']} collector failed: {item['details']}"}
+        for item in failures
+    ]
+    blocks = [*notices]
+    if not cards and not failures:
         blocks.append({"kind": "note", "text": "No attention items."})
     blocks.extend(cards)
     blocks.append(toolbar)
@@ -257,7 +265,7 @@ def build_pane(items, token_factory=None):
         return payload, token_actions
 
     kept = []
-    blocks = [omission, toolbar]
+    blocks = [*notices, omission, toolbar]
     size = len(json.dumps({**base, "blocks": blocks}, separators=(",", ":")).encode("utf-8"))
     for card in cards:
         card_size = len(json.dumps(card, separators=(",", ":")).encode("utf-8")) + 1

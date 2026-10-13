@@ -98,6 +98,7 @@ class DashboardController:
         render_rows: Callable[[list], list],
         act: Callable[[str, str], object],
         acknowledge_action: Callable[[], None] = lambda: None,
+        on_fetch_error: Callable[[str, Exception], dict] | None = None,
         cache_ttl: float = 60,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -110,6 +111,7 @@ class DashboardController:
         self._acknowledge_action = acknowledge_action
         self._cache_ttl = cache_ttl
         self._clock = clock
+        self._on_fetch_error = on_fetch_error or self._default_fetch_error
         self._cache = {}
         self._state_lock = threading.Lock()
         self._presenter_lock = threading.Lock()
@@ -118,6 +120,15 @@ class DashboardController:
         self._recently_acted = {}
         self._empty_final = False
         self._closed = False
+
+    @staticmethod
+    def _default_fetch_error(name, exc):
+        return {
+            "_collector_failure": True, "_plugin": name,
+            "status": "FETCH FAILED", "title": f"{name} collector failed",
+            "context": name, "details": type(exc).__name__,
+            "weight": 0, "actions": [],
+        }
 
     def run(self, refresh_interval=60):
         """Runs until the user quits (Esc) or the merged snapshot goes
@@ -215,19 +226,12 @@ class DashboardController:
             ).start()
 
     def _run_plugin_fetch(self, round_, name):
-        """Runs on its own plain daemon thread -- never a
-        ThreadPoolExecutor worker -- so a plugin's fetch_plugin() call
-        that never returns can never block interpreter exit.
-        ThreadPoolExecutor's workers are ordinary (non-daemon) threads
-        the stdlib joins at interpreter shutdown; a daemon thread never
-        is, so a permanently hung synchronous plugin call only ever
-        leaves its own round non-terminal (design.md Decision 6), never
-        the process itself.
-        """
+        """Fetch one plugin without letting failures stop other collectors."""
         try:
             items = self._fetch_plugin(name)
-        except Exception:
-            self._on_plugin_result(round_, name, None, False)
+        except Exception as exc:
+            items = [self._on_fetch_error(name, exc)]
+            self._on_plugin_result(round_, name, items, False)
             return
         self._on_plugin_result(round_, name, items, True)
 
@@ -237,7 +241,7 @@ class DashboardController:
                 return
             if succeeded:
                 self._cache[name] = (items, self._clock() + self._cache_ttl)
-                round_.items_by_plugin[name] = items
+            round_.items_by_plugin[name] = items
             round_.pending.discard(name)
             terminal_now = not round_.pending
             if terminal_now:
