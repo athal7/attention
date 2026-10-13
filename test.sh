@@ -1190,10 +1190,10 @@ items = p.fetch(config)
 print(json.dumps([a['key'] for a in items[0]['actions']]))
 print(json.dumps(items[0]['actions'][5]['payload']['command']))
 ")"
-  check "github fetch attaches lowercase defaults and preserves configured key casing" \
-    "$(sed -n 1p <<<"$gh_out")" '["o", "a", "m", "c", "g", "s", "l", "Z"]'
-  check "github fetch resolves template in configured action command" \
-    "$(sed -n 2p <<<"$gh_out")" '["my-session", "-d", "/tmp/repo/repo", "-n", "fix-bug"]'
+  check "github fetch omits merge until current PR state is proven ready" \
+    "$(sed -n 1p <<<"$gh_out")" '["o", "a", "c", "g", "s", "l", "Z"]'
+  check "github fetch preserves configured action commands after conditional merge action" \
+    "$(sed -n 2p <<<"$gh_out")" '["my-lumen", "https://github.com/myorg/repo/pull/42"]'
 }
 test_plugin_configurable_actions
 
@@ -1990,6 +1990,62 @@ print([(item['id'], item.get('_is_own_pr'), any(action.get('_is_own_pr') is True
   check "authored pull-request markers survive item projection and action merging" "$(sed -n 4p <<<"$out")" "[('3', False, False), ('4', False, False), ('1', True, True), ('2', True, True)]"
 }
 test_pr_attention_classification_uses_batched_reviews
+
+test_merge_ready_requires_known_state_and_user_confirmation() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import builtins, contextlib, io
+
+pr = {'number': 41, 'title': 'Ready PR', 'repository': {'nameWithOwner': 'owner/repo'},
+      'url': 'https://github.com/owner/repo/pull/41'}
+raw_detail = {
+    'state': 'OPEN', 'isDraft': False, 'reviewDecision': 'APPROVED',
+    'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'headRefOid': 'head-1',
+    'reviewRequests': {'pageInfo': {'hasNextPage': False}, 'nodes': []},
+    'statusCheckRollup': {'contexts': {'pageInfo': {'hasNextPage': False},
+                                       'nodes': [{'conclusion': 'SUCCESS'}]}},
+}
+detail = p._normalize_pr_detail(raw_detail)
+ready = p._classify_pr_attention(pr, 'me', detail)
+unknown_detail = dict(detail, mergeable=None, statusChecksComplete=False)
+unknown = p._classify_pr_attention(dict(pr, number=42), 'me', unknown_detail)
+ready['type'] = 'authored_attention'
+notified = dict(pr, number=43, title='Notification', type='notification',
+                subject_type='PullRequest', notification_reason='author')
+p._fetch_raw = lambda _: [ready, notified]
+p._repo_dir_index = lambda _: {}
+items = p.fetch({})
+merge = next(action for action in items[0]['actions'] if action['key'] == 'm')
+print(items[0]['status'], items[0]['indicators']['state'])
+print(items[0]['weight'] > items[1]['weight'], items[1]['status'])
+print(unknown is None)
+commands = []
+current_detail = dict(raw_detail, statusCheckRollup=[{'conclusion': 'SUCCESS'}],
+                      statusChecksComplete=True, reviewRequests=[])
+p._fetch_pr_detail = lambda *_: current_detail
+p.run_cmd = lambda command: commands.append(command) or True
+builtins.input = lambda _: 'y'
+print(p.act('m', merge['payload']), len(commands) == 1,
+      '--match-head-commit' in commands[0], '--disable-auto' in commands[0])
+commands.clear()
+p._fetch_pr_detail = lambda *_: dict(current_detail, headRefOid='head-2')
+with contextlib.redirect_stdout(io.StringIO()):
+    stale_result = p.act('m', merge['payload'])
+print(stale_result, commands == [])
+")"
+  check "fully confirmed PR state renders explicitly as Merge ready" \
+    "$(sed -n 1p <<<"$out")" "MERGE READY Merge ready"
+  check "Merge ready sorts above Notified" \
+    "$(sed -n 2p <<<"$out")" "True NOTIFIED"
+  check "unknown mergeability or incomplete CI never classifies ready" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "user confirmation revalidates and pins the displayed head without auto-merge" \
+    "$(sed -n 4p <<<"$out")" "True True True True"
+  check "a changed head after readiness display is rejected without merge" \
+    "$(sed -n 5p <<<"$out")" "False True"
+}
+test_merge_ready_requires_known_state_and_user_confirmation
 test_pr_attention_distinguishes_pending_review_feedback() {
   local out
   out="$(python3 -c "
@@ -3418,35 +3474,16 @@ else
 fi
 
 echo
-echo "-- merge gate (m): confirm_and_merge runs as a plain input() prompt --"
+echo "-- merge gate rejects a row without a pinned ready head --"
 
 : > "$GH_ACT_LOG"
 run_act "m" "$FIX_GH_FULL_LINE" "y
 "
-check "merge confirm 'y' exits 0" "$ACT_RC" "0"
-if grep -q 'pr merge --squash --delete-branch 42 --repo myorg/kb' "$GH_ACT_LOG"; then
-  ok "merge confirm 'y' invokes gh pr merge --squash --delete-branch"
-else
-  bad "merge confirm 'y' invokes gh pr merge --squash --delete-branch (got: $(cat "$GH_ACT_LOG"))"
-fi
-
-: > "$GH_ACT_LOG"
-run_act "m" "$FIX_GH_FULL_LINE" "n
-"
-check "merge confirm 'n' exits 0" "$ACT_RC" "0"
+check "unverified merge action exits cleanly" "$ACT_RC" "0"
 if [ -s "$GH_ACT_LOG" ]; then
-  bad "merge confirm 'n' must not invoke gh pr merge (got: $(cat "$GH_ACT_LOG"))"
+  bad "unverified merge action must not invoke gh pr merge (got: $(cat "$GH_ACT_LOG"))"
 else
-  ok "merge confirm 'n' does not invoke gh pr merge"
-fi
-
-: > "$GH_ACT_LOG"
-run_act "m" "$FIX_GH_FULL_LINE" ""
-check "merge confirm EOF (no stdin) exits 0, canceled gracefully" "$ACT_RC" "0"
-if [ -s "$GH_ACT_LOG" ]; then
-  bad "merge confirm EOF must not invoke gh pr merge (got: $(cat "$GH_ACT_LOG"))"
-else
-  ok "merge confirm EOF does not invoke gh pr merge"
+  ok "unverified merge action does not invoke gh pr merge"
 fi
 
 echo

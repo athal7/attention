@@ -30,18 +30,23 @@ _NOTIFICATION_REASONS = {
 }
 
 _PR_DETAIL_FIELDS = (
-    "author,mergeable,reviewDecision,statusCheckRollup,latestReviews,"
-    "closingIssuesReferences,isDraft,reviewRequests,baseRefName,headRefName"
+    "author,state,headRefOid,mergeable,mergeStateStatus,reviewDecision,"
+    "statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,"
+    "reviewRequests,baseRefName,headRefName"
 )
 _PR_GRAPHQL_SELECTION = """
 pullRequest(number: %d) {
   author { login }
+  state
+  headRefOid
+  mergeStateStatus
   mergeable
   reviewDecision
   isDraft
   baseRefName
   headRefName
   reviewRequests(first: 50) {
+    pageInfo { hasNextPage }
     nodes {
       requestedReviewer {
         __typename
@@ -77,6 +82,7 @@ pullRequest(number: %d) {
   }
   statusCheckRollup {
     contexts(first: 100) {
+      pageInfo { hasNextPage }
       nodes {
         ... on CheckRun { conclusion }
         ... on StatusContext { state }
@@ -107,12 +113,12 @@ def _normalize_pr_detail(detail):
         if isinstance(reviews_payload, dict)
         else reviews_payload
     )
-    reviews = [review for review in reviews if isinstance(review, dict)]
-    check_payload = detail.get("statusCheckRollup") or []
+    check_payload = detail.get("statusCheckRollup")
+    check_contexts = check_payload.get("contexts") if isinstance(check_payload, dict) else None
     check_nodes = (
-        check_payload.get("contexts", {}).get("nodes", [])
-        if isinstance(check_payload, dict)
-        else check_payload
+        check_contexts.get("nodes", [])
+        if isinstance(check_contexts, dict)
+        else check_payload if isinstance(check_payload, list) else []
     )
     state_to_conclusion = {
         "SUCCESS": "SUCCESS",
@@ -142,9 +148,12 @@ def _normalize_pr_detail(detail):
     )
     return {
         "author": detail.get("author"),
+        "state": detail.get("state"),
+        "headRefOid": detail.get("headRefOid"),
+        "mergeStateStatus": detail.get("mergeStateStatus"),
         "mergeable": detail.get("mergeable"),
         "reviewDecision": detail.get("reviewDecision"),
-        "isDraft": detail.get("isDraft", False),
+        "isDraft": detail.get("isDraft"),
         "baseRefName": detail.get("baseRefName") or "",
         "headRefName": detail.get("headRefName") or "",
         "reviewRequests": [
@@ -152,11 +161,24 @@ def _normalize_pr_detail(detail):
             for node in review_request_nodes
             if isinstance(node, dict) and node.get("requestedReviewer", node)
         ],
+        "reviewRequestsComplete": (
+            isinstance(review_request_payload, list)
+            or (
+                isinstance(review_request_payload, dict)
+                and (review_request_payload.get("pageInfo") or {}).get("hasNextPage") is False
+                and isinstance(review_request_payload.get("nodes"), list)
+            )
+        ),
         "latestReviews": reviews,
         "latestReviewsComplete": (
             isinstance(reviews_payload, dict)
             and (reviews_payload.get("pageInfo") or {}).get("hasNextPage") is False
         ),
+        "statusChecksComplete": (
+            isinstance(check_contexts, dict)
+            and (check_contexts.get("pageInfo") or {}).get("hasNextPage") is False
+            and isinstance(check_contexts.get("nodes"), list)
+        ) if isinstance(check_payload, dict) else isinstance(check_payload, list),
         "reviewThreads": detail.get("reviewThreads"),
         "closingIssuesReferences": [
             node for node in closing_nodes if isinstance(node, dict)
@@ -317,6 +339,34 @@ def _parse_github_timestamp(value, *, require_timezone=False):
     return timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
 
 
+def _merge_ready(detail):
+    if not isinstance(detail, dict):
+        return False
+    checks = detail.get("statusCheckRollup")
+    review_requests = detail.get("reviewRequests")
+    return (
+        detail.get("state") == "OPEN"
+        and detail.get("isDraft") is False
+        and detail.get("reviewDecision") == "APPROVED"
+        and not review_requests
+        and detail.get(
+            "reviewRequestsComplete", isinstance(review_requests, list),
+        ) is True
+        and detail.get("mergeable") == "MERGEABLE"
+        and detail.get("mergeStateStatus") == "CLEAN"
+        and isinstance(detail.get("headRefOid"), str)
+        and bool(detail["headRefOid"])
+        and isinstance(checks, list)
+        and bool(checks)
+        and detail.get("statusChecksComplete", True) is True
+        and all(
+            isinstance(check, dict)
+            and check.get("conclusion") in {"SUCCESS", "NEUTRAL", "SKIPPED"}
+            for check in checks
+        )
+    )
+
+
 
 def _pr_indicators(detail, is_draft):
     checks = detail.get("statusCheckRollup") or []
@@ -360,13 +410,15 @@ def _apply_pr_detail(pr, detail):
     if detail is None:
         return
     pr["reviewRequested"] = bool(detail.get("reviewRequests"))
+    pr["mergeReady"] = _merge_ready(detail)
+    pr["headRefOid"] = detail.get("headRefOid") or ""
     pr["closingIssuesReferences"] = detail.get("closingIssuesReferences") or []
     pr["isDraft"] = detail.get("isDraft", pr.get("isDraft", False))
     pr["baseRefName"] = detail.get("baseRefName") or ""
     pr["headRefName"] = detail.get("headRefName") or ""
     pr["indicators"] = _pr_indicators(detail, pr["isDraft"])
 
-def _status_label(gtype, reasons, review_requested, is_draft):
+def _status_label(gtype, reasons, review_requested, is_draft, merge_ready=False):
     if is_draft:
         return "Draft"
     if "Merge Conflict" in reasons:
@@ -381,6 +433,8 @@ def _status_label(gtype, reasons, review_requested, is_draft):
         return "Review requested"
     if "Review Update" in reasons:
         return "Review update"
+    if merge_ready:
+        return "Merge ready"
     if gtype == "assigned_issue":
         return "Assigned"
     if gtype == "repo_issue":
@@ -478,14 +532,14 @@ def _classify_pr_attention(pr, expected_author, detail):
     checks = detail.get("statusCheckRollup") or []
     if any(c.get("conclusion") in ("FAILURE", "ERROR") for c in checks):
         reasons.append("Checks Failing")
-    if not reasons:
+    merge_ready = not reasons and _merge_ready(detail)
+    if not reasons and not merge_ready:
         return None
     pr = dict(pr)
     _apply_pr_detail(pr, detail)
+    pr["mergeReady"] = merge_ready
     pr["attention_reasons"] = reasons
     return pr
-
-
 
 def _fetch_pr_attention(
     author, detail_pool, current_login=None, detail_lookup=None,
@@ -1184,6 +1238,13 @@ def fetch(config):
         else:
             # repo_issue: boost so they rank higher
             weight, status = 70, "OPEN"
+        if (
+            gtype in {"authored_attention", "tracked_attention"}
+            and g.get("mergeReady") is True
+            and not g.get("attention_reasons")
+            and not g.get("reviewRequested")
+        ):
+            weight, status = 83, "MERGE READY"
 
         if is_draft and not is_pull_request:
             status = f"DRAFT: {status}"
@@ -1202,6 +1263,7 @@ def fetch(config):
             g.get("attention_reasons", []),
             bool(g.get("reviewRequested")),
             is_draft,
+            g.get("mergeReady") is True and not g.get("reviewRequested"),
         )
         kind = (
             "pull_request" if is_pull_request
@@ -1232,10 +1294,22 @@ def fetch(config):
         actions = [
             {"key": "o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
             {"key": "a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
-            {"key": "m", "label": "merge", "payload": {"kind": "merge", "id": number, "url": url}},
             {"key": "c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
             {"key": "g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},
         ]
+        if (
+            gtype in {"authored_attention", "tracked_attention"}
+            and g.get("mergeReady") is True
+            and not g.get("attention_reasons")
+            and not g.get("reviewRequested")
+        ):
+            actions.append({
+                "key": "m", "label": "merge",
+                "payload": {
+                    "kind": "merge", "id": number, "url": url,
+                    "headRefOid": g.get("headRefOid", ""),
+                },
+            })
         configured_actions = config.get("github", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))
         if g.get("_is_own_pr") is True:
@@ -1298,12 +1372,15 @@ def fetch(config):
     return items
 
 
-def _confirm_and_merge(item_id, url):
-    """Run the merge only after explicit terminal confirmation."""
-    if not url:
-        print("No URL.")
+def _confirm_and_merge(item_id, url, expected_head_oid):
+    """Confirm, revalidate current readiness, then merge the expected head."""
+    if not url or not expected_head_oid:
+        print("Missing pull request URL or head commit.")
         return False
     repo = get_repo_from_url(url)
+    if not repo:
+        print("Invalid pull request URL.")
+        return False
     try:
         choice = input(f"\nMerge {repo}#{item_id} (squash + delete branch)? [y/N]: ").strip().lower()
     except (KeyboardInterrupt, EOFError):
@@ -1312,9 +1389,21 @@ def _confirm_and_merge(item_id, url):
     if choice != "y":
         print("Canceled.")
         return False
-    return run_cmd(
-        ["gh", "pr", "merge", "--squash", "--delete-branch", item_id, "--repo", repo]
-    )
+    try:
+        detail = _fetch_pr_detail(repo, item_id)
+    except Exception:
+        detail = None
+    if not _merge_ready(_normalize_pr_detail(detail)):
+        print("Pull request is no longer merge-ready at the displayed head commit.")
+        return False
+    if detail.get("headRefOid") != expected_head_oid:
+        print("Pull request head changed since it was displayed.")
+        return False
+    return run_cmd([
+        "gh", "pr", "merge", "--squash", "--delete-branch",
+        "--disable-auto", "--match-head-commit", expected_head_oid,
+        item_id, "--repo", repo,
+    ])
 
 
 def _mark_notification_threads_read(thread_ids):
@@ -1354,7 +1443,9 @@ def act(key, payload):
                 "--repo", get_repo_from_url(url),
             ])
         elif kind == "merge":
-            succeeded = _confirm_and_merge(payload["id"], payload.get("url"))
+            succeeded = _confirm_and_merge(
+                payload["id"], payload.get("url"), payload.get("headRefOid"),
+            )
         elif kind == "comment":
             url = payload.get("url")
             if not url:

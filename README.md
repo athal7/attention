@@ -41,7 +41,7 @@ An item is marked work in progress by running a custom action configured with `"
 |---|---|
 | Calendar event | `y` yank to clipboard; `x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
 | Reminder | `x` complete |
-| GitHub PR/issue | `o` open · `a` approve · `m` merge (squash + delete branch, confirms first) · `c` comment · `g` add label. If the item cross-links to a Linear issue (title contains its identifier), that issue's open/comment/transition actions are folded in too, each labeled *(linked)*; any key that collides with an existing one is remapped to a digit, shown in the footer hint |
+| GitHub PR/issue | `o` open · `a` approve · `m` merge (only for a verified Merge ready PR; confirms, rechecks state and pins the displayed head commit) · `c` comment · `g` add label. If the item cross-links to a Linear issue (title contains its identifier), that issue's open/comment/transition actions are folded in too, each labeled *(linked)*; any key that collides with an existing one is remapped to a digit, shown in the footer hint |
 | Linear issue | `o` open · `c` comment · `t` transition (lists the issue's own team's workflow states) |
 
 ## Configuration
@@ -130,6 +130,12 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   mentions and comments on your work are included. Passive subscription state
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
+  Merge ready requires an open, non-draft PR with approved review, a clean
+  merge state, a known mergeable result, and complete successful CI checks.
+  It ranks above NOTIFIED. Unknown, incomplete, pending, or failing state is
+  never treated as ready. The merge action is available only on ready authored
+  or explicitly tracked PRs; it is user-triggered, rechecks readiness after
+  confirmation, and pins the displayed head commit. No automatic merging.
   Eligible unread notifications appear in the default Other group unless they
   concern a pull request. Author notifications use NOTIFIED rather than claiming
   a reply is needed: the unread event can be your own or a bot's activity. Read
