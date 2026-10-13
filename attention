@@ -14,6 +14,8 @@ with their own empty defaults -- calendar/reminders/generic then
 contribute nothing until configured; github/linear still work out of
 the box, gated only by their own auth availability.
 """
+from __future__ import annotations
+
 import base64
 import curses
 import fcntl

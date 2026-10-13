@@ -24,6 +24,8 @@ This keeps the dependency direction one-way (`attention` -> `dashboard`,
 never back) and lets tests build a `DashboardController` entirely from
 fakes -- no real plugin loading, no real CLI process, and no on-disk config.
 """
+from __future__ import annotations
+
 import base64
 import json
 import threading
