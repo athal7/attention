@@ -2052,11 +2052,15 @@ test_pr_attention_distinguishes_pending_review_feedback() {
 $(load_plugin_py github)
 pr = {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}}
 review = {'author': {'login': 'reviewer'}, 'state': 'COMMENTED', 'body': ''}
-def classify(threads, reviews=None):
+def classify(threads, reviews=None, comments=None):
     detail = p._normalize_pr_detail({
         'mergeable': 'MERGEABLE', 'statusCheckRollup': {'contexts': {'nodes': []}},
         'latestReviews': {'pageInfo': {'hasNextPage': False},
                           'nodes': reviews if reviews is not None else [review]},
+        'discussionComments': (
+            {'pageInfo': {'hasNextPage': False}, 'nodes': comments}
+            if comments is not None else None
+        ),
         'reviewThreads': threads,
     })
     result = p._classify_pr_attention(pr, 'author', detail)
@@ -2096,6 +2100,11 @@ item['type'] = 'authored_attention'
 p._fetch_raw = lambda _: [item]
 p._build_repo_dir_index = lambda _: {}
 print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tmp'})])
+print(classify(
+    complete(),
+    [dict(review, id='R2', body='Please rebase', submittedAt='2026-10-05T20:00:00Z')],
+    [{'author': {'login': 'author'}, 'createdAt': '2026-10-08T20:06:15Z'}],
+))
 ")"
   check "resolved review threads no longer demand replies" "$(sed -n 1p <<<"$out")" "[]"
   check "the author's last reply clears a thread's reply-needed state" "$(sed -n 2p <<<"$out")" "[]"
@@ -2109,6 +2118,8 @@ print([(i['status'], i['indicators']['state']) for i in p.fetch({'codeDir': '/tm
   check "body-only feedback alongside other threads stays visible without asserting a reply" "$(sed -n 10p <<<"$out")" "['Review Update']"
   check "a review summary after the author's last thread reply is not a reply demand" "$(sed -n 11p <<<"$out")" "['Review Update']"
   check "a review update renders neutrally rather than as reply needed" "$(sed -n 12p <<<"$out")" "[('REVIEW UPDATE', 'Review update')]"
+  check "a later author discussion reply clears body-only review feedback" \
+    "$(sed -n 13p <<<"$out")" "[]"
 }
 test_pr_attention_distinguishes_pending_review_feedback
 
@@ -2366,6 +2377,30 @@ print([p._status_label('authored_attention', r['attention_reasons'], False, Fals
 }
 test_pr_attention_includes_bot_reviews_not_bot_timeline_comments
 
+test_own_pr_is_not_reported_as_review_requested() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+own = {'number': 1, 'repository': {'nameWithOwner': 'owner/repo'}}
+other = {'number': 2, 'repository': {'nameWithOwner': 'owner/repo'}}
+def required(args):
+    if args[:2] == ['search', 'prs']:
+        return [own, other] if '--review-requested=@me' in args else [own]
+    return []
+p._required_gh_json = required
+p._get_gh_login = lambda: 'author'
+p._fetch_my_repo_issues = lambda **kwargs: []
+p._fetch_pr_details = lambda prs: {
+    ('owner/repo', '1'): {'author': {'login': 'author'}},
+    ('owner/repo', '2'): {'author': {'login': 'reviewer'}},
+}
+print([(pr['number'], pr['type']) for pr in p._fetch_search_items({})])
+")"
+  check "own PRs returned by review-request search are excluded while other authors' requests remain" \
+    "$out" "[(2, 'review_request')]"
+}
+test_own_pr_is_not_reported_as_review_requested
+
 test_pr_attention_flags_review_requested_from_pending_requests() {
   local out
   out="$(python3 -c "
@@ -2406,7 +2441,7 @@ print([(r['number'], r['reviewRequested']) for r in sorted(result, key=lambda r:
 }
 test_pr_attention_flags_review_requested_from_pending_requests
 
-test_fetch_shows_review_requested_status_on_authored_and_tracked_prs() {
+test_fetch_hides_review_requested_status_for_authored_prs() {
   local out
   out="$(python3 -c "
 $(load_plugin_py github)
@@ -2422,8 +2457,8 @@ p._fetch_raw = lambda cfg: [
 items = p.fetch({'codeDir': '/tmp/nonexistent'})
 print(json.dumps({i['title']: i['status'] for i in items}))
 ")"
-  check "authored PR with a pending review request shows REVIEW REQUESTED" \
-    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored waiting on review'])" <<<"$out")" "REVIEW REQUESTED"
+  check "authored PR with a pending review request shows its attention reason, not REVIEW REQUESTED" \
+    "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored waiting on review'])" <<<"$out")" "NEEDS ATTENTION"
   check "authored PR with no pending review request keeps NEEDS ATTENTION" \
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored no reviewer yet'])" <<<"$out")" "NEEDS ATTENTION"
   check "tracked PR with a pending review request keeps the author prefix" \
@@ -2435,7 +2470,7 @@ print(json.dumps({i['title']: i['status'] for i in items}))
   check "authored review update stays visible ahead of a pending request" \
     "$(python3 -c "import sys,json; print(json.load(sys.stdin)['Authored review update with pending request'])" <<<"$out")" "REVIEW UPDATE"
 }
-test_fetch_shows_review_requested_status_on_authored_and_tracked_prs
+test_fetch_hides_review_requested_status_for_authored_prs
 
 test_tracked_attention_wins_over_duplicate_review_request() {
   local out

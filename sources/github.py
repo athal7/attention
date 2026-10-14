@@ -62,8 +62,13 @@ pullRequest(number: %d) {
       id
       state
       body
+      submittedAt
       author { login }
-    }
+  }
+  }
+  discussionComments: comments(first: 100) {
+    pageInfo { hasNextPage }
+    nodes { author { login } createdAt }
   }
   reviewThreads(first: 100) {
     pageInfo { hasNextPage }
@@ -112,6 +117,12 @@ def _normalize_pr_detail(detail):
         reviews_payload.get("nodes", [])
         if isinstance(reviews_payload, dict)
         else reviews_payload
+    )
+    discussion_payload = detail.get("discussionComments")
+    discussion_comments = (
+        discussion_payload.get("nodes", [])
+        if isinstance(discussion_payload, dict)
+        else discussion_payload if isinstance(discussion_payload, list) else None
     )
     check_payload = detail.get("statusCheckRollup")
     check_contexts = check_payload.get("contexts") if isinstance(check_payload, dict) else None
@@ -173,6 +184,11 @@ def _normalize_pr_detail(detail):
         "latestReviewsComplete": (
             isinstance(reviews_payload, dict)
             and (reviews_payload.get("pageInfo") or {}).get("hasNextPage") is False
+        ),
+        "discussionComments": discussion_comments,
+        "discussionCommentsComplete": (
+            isinstance(discussion_payload, dict)
+            and (discussion_payload.get("pageInfo") or {}).get("hasNextPage") is False
         ),
         "statusChecksComplete": (
             isinstance(check_contexts, dict)
@@ -429,7 +445,9 @@ def _status_label(gtype, reasons, review_requested, is_draft, merge_ready=False)
         return "CI failing"
     if "Review Commented" in reasons:
         return "Reply needed"
-    if gtype == "review_request" or review_requested:
+    if gtype == "review_request" or (
+        review_requested and gtype != "authored_attention"
+    ):
         return "Review requested"
     if "Review Update" in reasons:
         return "Review update"
@@ -496,12 +514,29 @@ def _review_comment_attention(reviews, expected_author, detail):
         body = review.get("body")
         if not isinstance(body, str):
             return "Review Update"
-        if body.strip() and (
+        if not body.strip() or not (
             association_unknown or review.get("id") not in review_ids_with_threads
         ):
-            # An unmatched body could be a new request or a routine summary of
-            # older threads. Keep it visible, but do not assert that a reply is due.
-            return "Review Update" if threads["nodes"] else "Review Commented"
+            continue
+        review_at = _parse_github_timestamp(review.get("submittedAt"))
+        comments = detail.get("discussionComments")
+        if (
+            review_at is not None
+            and detail.get("discussionCommentsComplete") is True
+            and isinstance(comments, list)
+            and any(
+                isinstance(comment, dict)
+                and isinstance((comment.get("author") or {}).get("login"), str)
+                and comment["author"]["login"].casefold() == expected_author.casefold()
+                and (comment_at := _parse_github_timestamp(comment.get("createdAt"))) is not None
+                and comment_at > review_at
+                for comment in comments
+            )
+        ):
+            continue
+        # An unmatched body could be a new request or a routine summary of
+        # older threads. Keep it visible, but do not assert that a reply is due.
+        return "Review Update" if threads["nodes"] else "Review Commented"
     return None
 
 
@@ -984,7 +1019,7 @@ def _fetch_search_items(config, current_login=None):
     def search_prs(*filters):
         return _required_gh_json([
             "search", "prs", *filters, "--state=open", "--archived=false", "--limit", "50",
-            "--json", "number,title,body,repository,url,isDraft,createdAt",
+            "--json", "number,title,body,repository,url,isDraft,createdAt,author",
         ]) or []
 
     def fetch_repo_issues():
@@ -1014,6 +1049,9 @@ def _fetch_search_items(config, current_login=None):
         ]
         assigned_issues = assigned_future.result() or []
         repo_issues = repo_future.result() or []
+    authored_keys = {
+        key for pr in authored_candidates if (key := _pr_key(pr)) is not None
+    }
 
     candidates = review_candidates + authored_candidates
     candidates.extend(pr for _, prs in tracked_candidates for pr in prs)
@@ -1097,8 +1135,24 @@ def _fetch_search_items(config, current_login=None):
 
     review_prs = []
     for candidate in review_candidates:
+        key = _pr_key(candidate)
+        if key in authored_keys:
+            continue
         pr = dict(candidate)
-        _apply_pr_detail(pr, detail_for(pr))
+        detail = detail_for(pr)
+        author = pr.get("author")
+        author = author.get("login") if isinstance(author, dict) else author
+        if not isinstance(author, str):
+            author = detail.get("author") if isinstance(detail, dict) else None
+            author = author.get("login") if isinstance(author, dict) else author
+        if (
+            isinstance(current_login, str)
+            and current_login
+            and isinstance(author, str)
+            and author.casefold() == current_login.casefold()
+        ):
+            continue
+        _apply_pr_detail(pr, detail)
         pr["type"] = "review_request"
         review_prs.append(pr)
 
@@ -1208,7 +1262,7 @@ def fetch(config):
         elif gtype in {"authored_attention", "tracked_attention"}:
             tracked = gtype == "tracked_attention"
             weight = 85 if tracked else 88
-            pending_request_only = g.get("reviewRequested") and not any(
+            pending_request_only = tracked and g.get("reviewRequested") and not any(
                 reason in ("Changes Requested", "Review Commented", "Review Update")
                 for reason in g.get("attention_reasons", ())
             )
