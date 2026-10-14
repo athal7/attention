@@ -1351,6 +1351,7 @@ def fetch(config):
             "identity_key": f"github:{repo_name.lower()}#{number}",
             "base_branch": g.get("baseRefName", ""),
             "head_branch": g.get("headRefName", ""),
+            "repo_path": repo_path,
             "association_keys": [
                 f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
                 for reference in g.get("closingIssuesReferences", [])

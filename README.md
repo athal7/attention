@@ -215,9 +215,12 @@ initial prompt. The card actions remain in AoE's existing two-column layout.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an
-inbox for generic or unrecognized sources. The item title and summary still open
-the source directly; no separate **Open** button is shown. Status, context, and
-recommendation are combined into one summary.
+inbox for generic or unrecognized sources. State indicators use colored icons,
+including PR review and CI state. When exactly one running AoE session matches
+a GitHub PR's repository and head branch, or an Attention-created session's
+unique title, the card also links to that session. The item title and summary
+still open the source directly; no separate **Open** button is shown. Status,
+context, and recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
 web pane; they remain available in the terminal dashboard. Collector failures
 appear as named, sanitized notes alongside healthy items; exception messages
