@@ -13,11 +13,30 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 SESSION_POLL_SECONDS = 60
 MAX_PANE_BYTES = 64 * 1024
 ACTION_TIMEOUT_SECONDS = 120
+STATE_VISUALS = (
+    ("merge conflict", "triangle-alert", "danger"),
+    ("changes requested", "circle-x", "danger"),
+    ("ci failing", "circle-x", "danger"),
+    ("error", "circle-alert", "danger"),
+    ("failed", "circle-x", "danger"),
+    ("overdue", "alarm-clock", "danger"),
+    ("blocked", "circle-x", "danger"),
+    ("review requested", "clock", "info"),
+    ("awaiting review", "clock", "info"),
+    ("waiting", "clock", "info"),
+    ("running", "loader", "info"),
+    ("due today", "clock", "warn"),
+    ("draft", "git-pull-request-draft", "warn"),
+    ("merge ready", "git-merge", "success"),
+    ("approved", "badge-check", "success"),
+    ("passed", "circle-check", "success"),
+    ("completed", "circle-check", "success"),
+)
 SOURCE_ICONS = {
     "github": "git-branch",
     "linear": "circle-dot",
@@ -145,13 +164,22 @@ def _primary_row(item, token_actions, token_factory):
         if value and key not in seen:
             seen.add(key)
             summary.append(value)
-
     row = {
         "kind": "row", "label": row_title,
         "icon": SOURCE_ICONS.get(item.get("_plugin"), "inbox"),
     }
     if summary:
         row["sublabel"] = " · ".join(summary)[:300]
+    state_values = [status, reason]
+    if isinstance(indicators, dict):
+        state_values.extend(indicators.values())
+    state_text = " ".join(_display_text(value, 100) for value in state_values).casefold()
+    visual = next((entry for entry in STATE_VISUALS if entry[0] in state_text), None)
+    if item.get("kind") == "pull_request" and visual is None:
+        visual = ("open PR", "git-pull-request-arrow", "success")
+    if visual:
+        state, icon, tone = visual
+        row["badges"] = [{"icon": icon, "tone": tone, "tooltip": state}]
 
     open_action = _open_action(item)
     action_payload = open_action.get("payload") if open_action else None
@@ -343,6 +371,55 @@ def pane_payload(items):
     return build_pane(items)[0]
 
 
+def _matching_sessions(item, sessions, allow_title=True):
+    branch = item.get("head_branch")
+    repo_path = item.get("repo_path")
+    repo_path = os.path.realpath(repo_path) if isinstance(repo_path, str) and repo_path else None
+    title = f"Attention: {_display_text(item.get('title'), 120) or 'Follow-up'}"
+    matches = []
+    for session in sessions:
+        if (session.get("status") not in {"Running", "Waiting", "Starting", "Creating"}
+                or any(session.get(flag) for flag in ("archived", "snoozed", "trashed"))):
+            continue
+        repos = list(session.get("workspace_repos") or [])
+        worktree = session.get("worktree")
+        if isinstance(worktree, dict):
+            repos.append({"source_path": worktree.get("main_repo_path"), "branch": worktree.get("branch")})
+        branch_match = bool(repo_path and branch and any(
+            isinstance(repo, dict) and repo.get("branch") == branch
+            and isinstance(repo.get("source_path"), str) and repo["source_path"]
+            and os.path.realpath(repo["source_path"]) == repo_path
+            for repo in repos
+        ))
+        title_match = allow_title and session.get("title") == title
+        if title_match and repo_path:
+            paths = [session.get("project_path"), *(repo.get("source_path") for repo in repos if isinstance(repo, dict))]
+            title_match = any(isinstance(path, str) and path and os.path.realpath(path) == repo_path for path in paths)
+        if branch_match or title_match:
+            matches.append(session)
+    return sorted(matches, key=lambda session: session["id"])
+
+
+def payload_with_sessions(base_payload, items, sessions):
+    items = [item for item in items if not item.get("_collector_failure")]
+    titles = [_display_text(item.get("title"), 120) or "Follow-up" for item in items]
+    payload = json.loads(json.dumps(base_payload))
+    cards = (block for block in payload["blocks"] if block.get("kind") == "section")
+    for card, item, title in zip(cards, items, titles):
+        matches = _matching_sessions(item, sessions, allow_title=titles.count(title) == 1)
+        if matches:
+            session = matches[0]
+            card["children"].insert(1, {
+                "kind": "row",
+                "label": f"Session: {_display_text(session.get('title'), 120) or session['id']}",
+                "sublabel": session["status"],
+                "icon": "square-terminal",
+                "tone": "info",
+                "href": f"/session/{quote(session['id'], safe='')}",
+            })
+    return _fit_payload(payload)
+
+
 def live_sessions():
     result = rpc("sessions.list")
     sessions = result.get("sessions", []) if isinstance(result, dict) else []
@@ -410,9 +487,14 @@ def payload_with_notice(base_payload, text, consumed_token=None):
     insert_at = next((i for i, block in enumerate(blocks)
                       if block.get("kind") in {"section", "note"}), max(0, len(blocks) - 1))
     blocks.insert(insert_at, {"kind": "note", "text": text[:200]})
+    return _fit_payload(payload)
+
+
+def _fit_payload(payload):
+    blocks = payload["blocks"]
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     while len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) > MAX_PANE_BYTES:
-        card_index = next((i for i in range(len(blocks) - 1, 0, -1) if blocks[i].get("kind") == "section"), None)
+        card_index = next((i for i in range(len(blocks) - 1, -1, -1) if blocks[i].get("kind") == "section"), None)
         if card_index is None:
             break
         blocks.pop(card_index)
@@ -425,7 +507,13 @@ def payload_with_notice(base_payload, text, consumed_token=None):
             blocks.insert(toolbar_index, omission)
     return payload
 
-def publish_payload(sessions, payload, only_new=False):
+def publish_payload(sessions, payload, only_new=False, items=()):
+    global action_tokens
+    payload = payload_with_sessions(payload, items, sessions)
+    visible_tokens = _payload_action_tokens(payload)
+    action_tokens = {
+        token: action for token, action in action_tokens.items() if token in visible_tokens
+    }
     for session in sessions:
         session_id = session["id"]
         if only_new and session_id in published_ids:
@@ -442,9 +530,9 @@ def fetch_snapshot(results):
             items = attention_items()
             fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             payload, actions = build_pane(items, fetched_at=fetched_at)
-        results.put((payload, actions, None))
+        results.put((payload, actions, None, items))
     except Exception as exc:
-        results.put((None, {}, str(exc)[:400]))
+        results.put((None, {}, str(exc)[:400], []))
 
 
 def start_fetch(results):
@@ -530,6 +618,7 @@ def main():
     results = queue.Queue(maxsize=1)
     base_payload = status_payload("Select Refresh to load attention items.")
     payload = base_payload
+    snapshot_items = []
     sessions = []
     fetch_in_flight = False
     action_in_flight = False
@@ -545,11 +634,13 @@ def main():
 
             now = time.monotonic()
             if now >= next_sessions:
-                sessions = live_sessions()
+                updated_sessions = live_sessions()
+                sessions_changed = updated_sessions != sessions
+                sessions = updated_sessions
                 live_session_ids = {session["id"] for session in sessions}
                 live_sessions_by_id.clear()
                 live_sessions_by_id.update({session["id"]: session for session in sessions})
-                publish_payload(sessions, payload, only_new=not retry_publish)
+                publish_payload(sessions, payload, only_new=not (retry_publish or sessions_changed), items=snapshot_items)
                 retry_publish = False
                 next_sessions = now + SESSION_POLL_SECONDS
 
@@ -564,7 +655,7 @@ def main():
                     token: action for token, action in action_tokens.items()
                     if token in _payload_action_tokens(payload)
                 }
-                publish_payload(sessions, payload)
+                publish_payload(sessions, payload, items=snapshot_items)
                 start_action(request["token"], request["action"], label, action_results)
                 action_in_flight = True
 
@@ -581,7 +672,7 @@ def main():
                     token: action for token, action in action_tokens.items()
                     if token in _payload_action_tokens(payload)
                 }
-                publish_payload(sessions, payload)
+                publish_payload(sessions, payload, items=snapshot_items)
 
             try:
                 session_request = session_create_requests.get_nowait()
@@ -595,7 +686,7 @@ def main():
                     token: action for token, action in action_tokens.items()
                     if token in _payload_action_tokens(payload)
                 }
-                publish_payload(sessions, payload)
+                publish_payload(sessions, payload, items=snapshot_items)
                 try:
                     created_id = create_session(session_request)
                     message_text = f"Created session: {created_id}"
@@ -606,7 +697,7 @@ def main():
                     token: action for token, action in action_tokens.items()
                     if token in _payload_action_tokens(payload)
                 }
-                publish_payload(sessions, payload)
+                publish_payload(sessions, payload, items=snapshot_items)
                 active_session_create = None
                 next_sessions = time.monotonic()
 
@@ -619,7 +710,7 @@ def main():
                     fetch_in_flight = True
 
             try:
-                updated_payload, updated_actions, error = results.get_nowait()
+                updated_payload, updated_actions, error, updated_items = results.get_nowait()
             except queue.Empty:
                 updated_payload = None
                 updated_actions = None
@@ -630,11 +721,12 @@ def main():
                     base_payload = updated_payload
                     payload = base_payload
                     action_tokens = updated_actions
+                    snapshot_items = updated_items
                 else:
                     payload = payload_with_notice(
                         base_payload, f"Refresh failed: {error}. Select Refresh to retry."
                     )
-                publish_payload(sessions, payload)
+                publish_payload(sessions, payload, items=snapshot_items)
             if refresh_pending and not fetch_in_flight and not action_in_flight:
                 refresh_pending = False
                 start_fetch(results)

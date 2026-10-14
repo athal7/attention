@@ -304,6 +304,41 @@ class DashboardController:
                 del self._recently_acted[next(iter(self._recently_acted))]
 
 
+def _read_key(screen):
+    """Decode arrow sequences not recognized by the active terminfo entry."""
+    import curses
+    key = screen.getch()
+
+    if key != 27:
+        return key
+    try:
+        if curses.isendwin():
+            return key
+    except curses.error:
+        return key
+    sequence = []
+    first = screen.getch()
+    sequence.append(first)
+    if first in (ord("["), ord("O")):
+        second = screen.getch()
+        sequence.append(second)
+        if second == ord("A"):
+            return curses.KEY_UP
+        if second == ord("B"):
+            return curses.KEY_DOWN
+    for next_key in reversed(sequence):
+        if next_key != -1:
+            curses.ungetch(next_key)
+    return 27
+
+
+def _set_escape_delay(curses):
+    try:
+        curses.set_escdelay(100)
+    except (AttributeError, curses.error):
+        pass
+
+
 class CursesPresenter:
     """Production presenter backed entirely by the terminal's curses UI."""
 
@@ -420,11 +455,12 @@ class CursesPresenter:
         return visible, selected
 
     def _read_key(self, screen):
-        return screen.getch()
+        return _read_key(screen)
 
     def _run(self, screen):
         import curses
 
+        _set_escape_delay(curses)
         screen.keypad(True)
         screen.timeout(100)
         try:
@@ -596,6 +632,7 @@ class CursesGroupPresenter:
     def _run(self, screen):
         import curses
 
+        _set_escape_delay(curses)
         screen.keypad(True)
         screen.timeout(100)
         try:
@@ -621,7 +658,7 @@ class CursesGroupPresenter:
                 selected %= len(visible_groups)
             else:
                 selected = 0
-            key = screen.getch()
+            key = _read_key(screen)
             if key in (27, ord("q")):
                 return PresenterResult("", "")
             if key == ord("r"):

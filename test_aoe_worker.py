@@ -155,6 +155,63 @@ class PanePayloadTests(unittest.TestCase):
         self.assertEqual(row["icon"], "circle-dot")
         self.assertEqual(row["href"], "https://github.com/example/repo/pull/1")
 
+    def test_pull_request_rows_render_state_iconography(self):
+        cases = [
+            ("CI failing", "circle-x", "danger", "ci failing"),
+            ("Changes requested", "circle-x", "danger", "changes requested"),
+            ("Approved", "badge-check", "success", "approved"),
+        ]
+        for state, icon, tone, tooltip in cases:
+            with self.subTest(state=state):
+                payload = worker.pane_payload([{
+                    "_plugin": "github", "kind": "pull_request",
+                    "title": "Review PR", "indicators": {"state": state},
+                }])
+                row = payload["blocks"][0]["children"][0]
+                self.assertEqual(row["badges"], [{"icon": icon, "tone": tone, "tooltip": tooltip}])
+
+    def test_active_matching_session_gets_an_encoded_in_app_link(self):
+        item = {"title": "Review PR", "repo_path": "/repo", "head_branch": "feature"}
+        payload = worker.pane_payload([item])
+        linked = worker.payload_with_sessions(payload, [item], [{
+            "id": "session/id", "title": "Work", "status": "Running",
+            "workspace_repos": [{"source_path": "/repo", "branch": "feature"}],
+        }])
+        card = linked["blocks"][0]
+        self.assertEqual(card["children"][1]["href"], "/session/session%2Fid")
+        self.assertEqual(card["children"][1]["sublabel"], "Running")
+        self.assertNotIn("href", payload["blocks"][0]["children"][0])
+
+    def test_missing_or_inactive_session_does_not_add_session_link(self):
+        item = {"title": "Review PR", "repo_path": "/repo", "head_branch": "feature"}
+        payload = worker.pane_payload([item])
+        for sessions in (
+            [],
+            [{"id": "idle", "status": "Idle", "workspace_repos": [
+                {"source_path": "/repo", "branch": "feature"},
+            ]}],
+            [{"id": "archived", "status": "Running", "archived": True, "workspace_repos": [
+                {"source_path": "/repo", "branch": "feature"},
+            ]}],
+        ):
+            with self.subTest(sessions=sessions):
+                linked = worker.payload_with_sessions(payload, [item], sessions)
+                self.assertEqual(len(linked["blocks"][0]["children"]), 2)
+
+    def test_attention_created_session_title_links_only_when_unique(self):
+        item = {"title": "Fix build"}
+        session = {"id": "session-1", "title": "Attention: Fix build", "status": "Waiting"}
+        payload = worker.pane_payload([item])
+        linked = worker.payload_with_sessions(payload, [item], [session])
+        self.assertEqual(linked["blocks"][0]["children"][1]["href"], "/session/session-1")
+        duplicate = worker.pane_payload([item, item])
+        linked = worker.payload_with_sessions(duplicate, [item, item], [session])
+        self.assertFalse(any(
+            child.get("icon") == "square-terminal"
+            for block in linked["blocks"] if block["kind"] == "section"
+            for child in block["children"]
+        ))
+
     def test_unknown_or_missing_collectors_use_fallback_not_url_or_context(self):
         for collector in ("custom", None):
             with self.subTest(collector=collector):

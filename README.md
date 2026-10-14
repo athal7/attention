@@ -218,9 +218,12 @@ Linear, a calendar for calendar events, a checklist for reminders, and an
 inbox for generic or unrecognized sources. GitHub PRs in a visible stack are
 ordered parent-first and use the same tree markers as the terminal dashboard;
 each PR remains its own card with its own actions. Missing stack members do not
-prevent visible children from appearing. The item title and summary still open
-the source directly; no separate **Open** button is shown. Status, context, and
-recommendation are combined into one summary.
+prevent visible children from appearing. State indicators use colored icons,
+including PR review and CI state. When exactly one running AoE session matches
+a GitHub PR's repository and head branch, or an Attention-created session's
+unique title, the card also links to that session. The item title and summary
+still open the source directly; no separate **Open** button is shown. Status,
+context, and recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
 web pane; they remain available in the terminal dashboard. Collector failures
 appear as named, sanitized notes alongside healthy items; exception messages
