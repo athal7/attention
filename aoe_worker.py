@@ -18,6 +18,13 @@ ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 SESSION_POLL_SECONDS = 60
 MAX_PANE_BYTES = 64 * 1024
 ACTION_TIMEOUT_SECONDS = 120
+SOURCE_ICONS = {
+    "github": "git-branch",
+    "linear": "circle-dot",
+    "calendar": "calendar-days",
+    "reminders": "list-todo",
+    "generic": "inbox",
+}
 _input_buffer = bytearray()
 _source_lock = threading.Lock()
 live_sessions_by_id = {}
@@ -138,7 +145,10 @@ def _primary_row(item, token_actions, token_factory):
             seen.add(key)
             summary.append(value)
 
-    row = {"kind": "row", "label": title}
+    row = {
+        "kind": "row", "label": title,
+        "icon": SOURCE_ICONS.get(item.get("_plugin"), "inbox"),
+    }
     if summary:
         row["sublabel"] = " · ".join(summary)[:300]
 

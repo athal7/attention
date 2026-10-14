@@ -213,8 +213,11 @@ same project path as the current AoE session (or a scratch session if it has no
 project path). It names the session after the Attention item and sends no
 initial prompt. The card actions remain in AoE's existing two-column layout.
 
-The item title and summary open the source directly; no separate **Open** button
-is shown. Status, context, and recommendation are combined into one summary.
+Each card title includes a source icon: a branch for GitHub, a circle for
+Linear, a calendar for calendar events, a checklist for reminders, and an
+inbox for generic or unrecognized sources. The item title and summary still open
+the source directly; no separate **Open** button is shown. Status, context, and
+recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
 web pane; they remain available in the terminal dashboard. Collector failures
 appear as named, sanitized notes alongside healthy items; exception messages

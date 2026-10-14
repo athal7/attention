@@ -74,11 +74,8 @@ class PanePayloadTests(unittest.TestCase):
         self.assertEqual(set(card), {"kind", "boxed", "children"})
         self.assertTrue(card["boxed"])
         row = card["children"][0]
-        self.assertEqual(row, {
-            "kind": "row", "label": "Ship release",
-            "sublabel": "NEEDS ATTENTION · private-repo · CI failing",
-            "href": "https://example.com/issue",
-        })
+        self.assertEqual(row["icon"], "git-branch")
+        self.assertEqual(row["href"], "https://example.com/issue")
         button_group = card["children"][1]
         buttons = button_group["children"]
         self.assertEqual([button["label"] for button in buttons], ["Run", "New session"])
@@ -94,6 +91,48 @@ class PanePayloadTests(unittest.TestCase):
         rendered = json.dumps(payload)
         for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
+
+    def test_known_source_icons_are_rendered_on_rows(self):
+        expected_icons = {
+            "github": "git-branch",
+            "linear": "circle-dot",
+            "calendar": "calendar-days",
+            "reminders": "list-todo",
+            "generic": "inbox",
+        }
+        for source, icon in expected_icons.items():
+            with self.subTest(source=source):
+                row = worker.pane_payload([{
+                    "_plugin": source, "title": "Readable title",
+                    "url": "https://example.com/item",
+                }])["blocks"][0]["children"][0]
+                self.assertEqual(row["icon"], icon)
+                self.assertEqual(row["label"], "Readable title")
+                self.assertEqual(row["href"], "https://example.com/item")
+
+
+    def test_source_icon_uses_item_collector_not_cross_linked_actions(self):
+        payload = worker.pane_payload([{
+            "_plugin": "linear", "title": "Linked issue",
+            "actions": [{"_plugin": "github", "label": "Open",
+                         "payload": {"kind": "open", "url": "https://github.com/example/repo/pull/1"}}],
+        }])
+        row = payload["blocks"][0]["children"][0]
+        self.assertEqual(row["icon"], "circle-dot")
+        self.assertEqual(row["href"], "https://github.com/example/repo/pull/1")
+
+    def test_unknown_or_missing_collectors_use_fallback_not_url_or_context(self):
+        for collector in ("custom", None):
+            with self.subTest(collector=collector):
+                item = {
+                    "title": "Custom item", "context": "github",
+                    "url": "https://github.com/example/repo/issues/1",
+                }
+                if collector is not None:
+                    item["_plugin"] = collector
+                row = worker.pane_payload([item])["blocks"][0]["children"][0]
+                self.assertEqual(row["icon"], "inbox")
+                self.assertEqual(row["href"], item["url"])
 
     def test_own_pull_request_hides_approve_and_keeps_another_supported_action(self):
         item = {
