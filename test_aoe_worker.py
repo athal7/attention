@@ -92,6 +92,40 @@ class PanePayloadTests(unittest.TestCase):
         for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
 
+    def test_pull_request_stacks_render_as_ordered_trees_with_independent_actions(self):
+        items = [
+            {"_plugin": "github", "title": "Grandchild", "identity_key": "pr:3",
+             "parent_identity_key": "pr:2", "url": "https://example.com/3"},
+            {"_plugin": "github", "title": "Child", "identity_key": "pr:2",
+             "parent_identity_key": "pr:1", "url": "https://example.com/2",
+             "actions": [{"label": "Run child", "payload": {"command": ["echo", "child"]}}]},
+            {"_plugin": "github", "title": "Base", "identity_key": "pr:1",
+             "url": "https://example.com/1"},
+            {"_plugin": "github", "title": "Unrelated", "identity_key": "pr:4",
+             "url": "https://example.com/4"},
+        ]
+        token_number = iter(range(8))
+        payload, actions = worker.build_pane(
+            items, token_factory=lambda: f"token-{next(token_number)}",
+        )
+        cards = [block for block in payload["blocks"] if block["kind"] == "section"]
+        self.assertEqual(
+            [card["children"][0]["label"] for card in cards],
+            ["Base", "└─ Child", "   └─ Grandchild", "Unrelated"],
+        )
+        child_buttons = cards[1]["children"][1]["children"]
+        self.assertEqual([button["label"] for button in child_buttons], ["Run child", "New session"])
+        self.assertEqual(set(actions), worker._payload_action_tokens(payload))
+        self.assertEqual(len(cards), len(items))
+        self.assertEqual(items[0]["title"], "Grandchild")
+        orphan = worker.pane_payload([{
+            "_plugin": "github", "title": "Orphan", "identity_key": "pr:5",
+            "parent_identity_key": "pr:missing",
+        }])["blocks"][0]["children"][0]
+        self.assertEqual(orphan["label"], "Orphan")
+
+
+
     def test_known_source_icons_are_rendered_on_rows(self):
         expected_icons = {
             "github": "git-branch",

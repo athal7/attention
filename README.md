@@ -215,7 +215,10 @@ initial prompt. The card actions remain in AoE's existing two-column layout.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an
-inbox for generic or unrecognized sources. The item title and summary still open
+inbox for generic or unrecognized sources. GitHub PRs in a visible stack are
+ordered parent-first and use the same tree markers as the terminal dashboard;
+each PR remains its own card with its own actions. Missing stack members do not
+prevent visible children from appearing. The item title and summary still open
 the source directly; no separate **Open** button is shown. Status, context, and
 recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the

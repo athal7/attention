@@ -129,6 +129,7 @@ def _open_action(item):
 
 def _primary_row(item, token_actions, token_factory):
     title = _display_text(item.get("title"), 240) or "Attention item"
+    row_title = f"{item.get('_tree_prefix', '')}{title}"
     status = _display_text(item.get("status"), 100)
     context = _display_text(item.get("context"), 160)
     indicators = item.get("indicators")
@@ -146,7 +147,7 @@ def _primary_row(item, token_actions, token_factory):
             summary.append(value)
 
     row = {
-        "kind": "row", "label": title,
+        "kind": "row", "label": row_title,
         "icon": SOURCE_ICONS.get(item.get("_plugin"), "inbox"),
     }
     if summary:
@@ -214,6 +215,51 @@ def _web_actions(item, token_actions, token_factory):
     return blocks
 
 
+def _tree_order(items):
+    by_identity = {
+        item["identity_key"]: item
+        for item in items
+        if item.get("identity_key")
+    }
+    children = {}
+    attached = set()
+    for item in items:
+        parent = item.get("parent_identity_key")
+        if parent in by_identity and parent != item.get("identity_key"):
+            children.setdefault(parent, []).append(item)
+            attached.add(id(item))
+    if not children:
+        return items
+
+    ordered = []
+    visited = set()
+
+    def append_item(item, prefix="", connector=""):
+        marker = id(item)
+        if marker in visited:
+            return
+        visited.add(marker)
+        row = dict(item)
+        if connector:
+            row["_tree_prefix"] = f"{prefix}{connector}"
+        ordered.append(row)
+        descendants = children.get(item.get("identity_key"), [])
+        descendant_prefix = prefix + (
+            "   " if connector == "└─ " else "│  " if connector else ""
+        )
+        for index, child in enumerate(descendants):
+            child_connector = "└─ " if index == len(descendants) - 1 else "├─ "
+            append_item(child, descendant_prefix, child_connector)
+
+    for item in items:
+        if id(item) not in attached:
+            append_item(item)
+    for item in items:
+        append_item(item)
+    return ordered
+
+
+
 def _item_card(item, token_actions, token_factory):
     row = _primary_row(item, token_actions, token_factory)
     actions = _web_actions(item, token_actions, token_factory)
@@ -257,7 +303,9 @@ def build_pane(items, token_factory=None, fetched_at=None):
     failures = [item for item in items if item.get("_collector_failure")]
     cards = [
         _item_card(item, token_actions, token_factory)
-        for item in items if not item.get("_collector_failure")
+        for item in _tree_order([
+            item for item in items if not item.get("_collector_failure")
+        ])
     ]
     toolbar = _pane_toolbar()
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
