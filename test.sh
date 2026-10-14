@@ -2562,6 +2562,12 @@ print(f('tracked_attention', ['Checks Failing']))
 print(f('tracked_attention', ['Changes Requested']))
 print(f('assigned_issue', []))
 print(f('repo_issue', []))
+probe = {'title': 'My PR', 'repository': {'nameWithOwner': 'o/r'}, 'number': 1,
+         'url': 'https://github.com/o/r/pull/1', 'type': 'authored_attention',
+         'attention_reasons': ['Checks Failing'], 'isDraft': False}
+p._fetch_raw = lambda config: [probe]
+p._repo_dir_index = lambda code_dir: {}
+print(p.fetch({'codeDir': '/tmp'})[0]['session_prompt'])
 ")"
   check "my PR with failing CI tells me to fix CI" \
     "$(sed -n 1p <<<"$out")" "Fix the failing CI checks."
@@ -2583,6 +2589,8 @@ print(f('repo_issue', []))
     "$(sed -n 9p <<<"$out")" "Work on it."
   check "an owned-repo issue tells me to work on it" \
     "$(sed -n 10p <<<"$out")" "Work on it."
+  check "GitHub PR items carry their state-aware prompt into structured handoff" \
+    "$(sed -n 11p <<<"$out")" "Fix the failing CI checks."
 }
 test_github_session_prompt_state_aware
 

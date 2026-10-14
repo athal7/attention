@@ -1406,6 +1406,7 @@ def fetch(config):
             "base_branch": g.get("baseRefName", ""),
             "head_branch": g.get("headRefName", ""),
             "repo_path": repo_path,
+            "session_prompt": session_prompt,
             "association_keys": [
                 f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
                 for reference in g.get("closingIssuesReferences", [])

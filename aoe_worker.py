@@ -46,7 +46,12 @@ SOURCE_ICONS = {
 }
 _input_buffer = bytearray()
 _source_lock = threading.Lock()
+_filter_lock = threading.Lock()
 live_sessions_by_id = {}
+hidden_sources = set()
+hidden_providers = set()
+filter_refresh_requested = False
+snapshot_fetched_at = None
 
 
 def send(message):
@@ -233,6 +238,12 @@ def _web_actions(item, token_actions, token_factory):
     token = token_factory()
     title = _display_text(item.get("title"), 120) or "Follow-up"
     token_actions[token] = {"_aoe_operation": "new_session", "title": f"Attention: {title}"}
+    repo_path = item.get("repo_path")
+    if isinstance(repo_path, str) and repo_path:
+        token_actions[token]["repo_path"] = repo_path
+    session_prompt = item.get("session_prompt")
+    if isinstance(session_prompt, str) and session_prompt.strip():
+        token_actions[token]["initial_turn"] = session_prompt
     blocks.append({
         "kind": "action",
         "label": "New session",
@@ -287,6 +298,36 @@ def _tree_order(items):
     return ordered
 
 
+def _item_cards(items, token_actions, token_factory):
+    groups = []
+    current_group = []
+    for item in _tree_order(items):
+        if current_group and not item.get("_tree_prefix"):
+            groups.append(current_group)
+            current_group = []
+        current_group.append(item)
+    if current_group:
+        groups.append(current_group)
+
+    cards = []
+    for group in groups:
+        item_cards = [_item_card(item, token_actions, token_factory) for item in group]
+        cards.append(item_cards[0])
+        if len(group) > 1:
+            stacked_count = len(group) - 1
+            count_label = "PR" if stacked_count == 1 else "PRs"
+            cards.append({
+                "kind": "section",
+                "title": "Stacked pull requests",
+                "value": f"{stacked_count} {count_label}",
+                "boxed": True,
+                "collapsible": True,
+                "collapsed": True,
+                "children": item_cards[1:],
+            })
+    return cards
+
+
 
 def _item_card(item, token_actions, token_factory):
     row = _primary_row(item, token_actions, token_factory)
@@ -309,7 +350,7 @@ def _tokens_in_payload(payload):
     return {
         block.get("params", {}).get("token")
         for block in _walk_blocks(payload.get("blocks", []))
-        if block.get("method") in {"attention.action", "attention.new_session"}
+        if block.get("method") in {"attention.action", "attention.new_session", "attention.filter"}
         and isinstance(block.get("params", {}).get("token"), str)
     }
 
@@ -325,17 +366,68 @@ def _pane_toolbar():
     }
 
 
-def build_pane(items, token_factory=None, fetched_at=None):
+def _filter_controls(items, token_actions, token_factory, hidden_sources, hidden_providers):
+    options = []
+    sources = sorted({
+        item.get("_plugin") for item in items
+        if isinstance(item.get("_plugin"), str) and item["_plugin"]
+    })
+    providers = sorted({
+        item.get("_provider") for item in items
+        if isinstance(item.get("_provider"), str) and item["_provider"]
+    })
+    for kind, names, hidden in (
+        ("source", sources, hidden_sources),
+        ("provider", providers, hidden_providers),
+    ):
+        for name in names:
+            token = token_factory()
+            token_actions[token] = {
+                "_aoe_operation": "filter",
+                "filter_kind": kind,
+                "value": name,
+            }
+            options.append({
+                "kind": "action",
+                "label": f"{'Show' if name in hidden else 'Hide'} {kind}: {name}",
+                "method": "attention.filter",
+                "params": {"token": token},
+                "variant": "secondary",
+            })
+    if not options:
+        return None
+    return {
+        "kind": "section", "title": "Filters",
+        "collapsible": True, "collapsed": True,
+        "children": options,
+    }
+
+
+def _filter_item(item, hidden_sources, hidden_providers):
+    source = item.get("_plugin")
+    provider = item.get("_provider")
+    return (
+        source not in hidden_sources
+        and provider not in hidden_providers
+    )
+
+
+def build_pane(items, token_factory=None, fetched_at=None, hidden_sources=(), hidden_providers=()):
+    items = list(items)
+    all_items = items
+    items = [item for item in items if _filter_item(item, hidden_sources, hidden_providers)]
     token_factory = token_factory or (lambda: secrets.token_urlsafe(18))
     token_actions = {}
     failures = [item for item in items if item.get("_collector_failure")]
-    cards = [
-        _item_card(item, token_actions, token_factory)
-        for item in _tree_order([
-            item for item in items if not item.get("_collector_failure")
-        ])
-    ]
+    cards = _item_cards(
+        [item for item in items if not item.get("_collector_failure")],
+        token_actions,
+        token_factory,
+    )
     toolbar = _pane_toolbar()
+    filters = _filter_controls(
+        all_items, token_actions, token_factory, hidden_sources, hidden_providers,
+    )
     omission = {"kind": "note", "text": "Additional items omitted to fit the pane."}
     base = {"title": "Attention", "default_location": "right"}
     notices = [
@@ -344,17 +436,23 @@ def build_pane(items, token_factory=None, fetched_at=None):
     ]
     notices = ([{"kind": "note", "text": f"Fetched at {fetched_at} · Refresh to update."}]
                if fetched_at else []) + notices
-    blocks = [*notices]
+    blocks = [toolbar]
+    if filters:
+        blocks.append(filters)
+    blocks.extend(notices)
     if not cards and not failures:
         blocks.append({"kind": "note", "text": "No attention items."})
     blocks.extend(cards)
-    blocks.append(toolbar)
     payload = {**base, "blocks": blocks}
     if len(json.dumps(payload, separators=(",", ":")).encode("utf-8")) <= MAX_PANE_BYTES:
         return payload, token_actions
 
     kept = []
-    blocks = [*notices, omission, toolbar]
+    blocks = [toolbar]
+    if filters:
+        blocks.append(filters)
+    blocks.extend(notices)
+    blocks.append(omission)
     size = len(json.dumps({**base, "blocks": blocks}, separators=(",", ":")).encode("utf-8"))
     for card in cards:
         card_size = len(json.dumps(card, separators=(",", ":")).encode("utf-8")) + 1
@@ -362,14 +460,13 @@ def build_pane(items, token_factory=None, fetched_at=None):
             break
         kept.append(card)
         size += card_size
-    payload = {**base, "blocks": [*kept, omission, toolbar]}
+    payload = {**base, "blocks": [toolbar, *([filters] if filters else []), *notices, *kept, omission]}
     visible_tokens = _tokens_in_payload(payload)
     return payload, {token: action for token, action in token_actions.items() if token in visible_tokens}
 
 
 def pane_payload(items):
     return build_pane(items)[0]
-
 
 def _matching_sessions(item, sessions, allow_title=True):
     branch = item.get("head_branch")
@@ -402,9 +499,13 @@ def _matching_sessions(item, sessions, allow_title=True):
 
 def payload_with_sessions(base_payload, items, sessions):
     items = [item for item in items if not item.get("_collector_failure")]
+    items = _tree_order(items)
     titles = [_display_text(item.get("title"), 120) or "Follow-up" for item in items]
     payload = json.loads(json.dumps(base_payload))
-    cards = (block for block in payload["blocks"] if block.get("kind") == "section")
+    cards = (
+        block for block in _walk_blocks(payload["blocks"])
+        if block.get("kind") == "section" and block.get("collapsible") is not True
+    )
     for card, item, title in zip(cards, items, titles):
         matches = _matching_sessions(item, sessions, allow_title=titles.count(title) == 1)
         if matches:
@@ -444,7 +545,10 @@ def create_session(request):
         "title": request["action"]["title"],
         "idempotency_key": request["token"],
     }
-    project_path = session.get("project_path")
+    initial_turn = request["action"].get("initial_turn")
+    if isinstance(initial_turn, str) and initial_turn.strip():
+        params["initial_turn"] = initial_turn
+    project_path = request["action"].get("repo_path")
     if isinstance(project_path, str) and project_path:
         params["project_path"] = project_path
     result = rpc("sessions.create", params)
@@ -458,7 +562,7 @@ def status_payload(text):
     return {
         "title": "Attention",
         "default_location": "right",
-        "blocks": [{"kind": "note", "text": text}, _pane_toolbar()],
+        "blocks": [_pane_toolbar(), {"kind": "note", "text": text}],
     }
 
 
@@ -529,10 +633,17 @@ def fetch_snapshot(results):
         with _source_lock:
             items = attention_items()
             fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            payload, actions = build_pane(items, fetched_at=fetched_at)
-        results.put((payload, actions, None, items))
+            with _filter_lock:
+                current_hidden_sources = set(hidden_sources)
+                current_hidden_providers = set(hidden_providers)
+            payload, actions = build_pane(
+                items, fetched_at=fetched_at,
+                hidden_sources=current_hidden_sources,
+                hidden_providers=current_hidden_providers,
+            )
+        results.put((payload, actions, None, items, fetched_at))
     except Exception as exc:
-        results.put((None, {}, str(exc)[:400], []))
+        results.put((None, {}, str(exc)[:400], [], None))
 
 
 def start_fetch(results):
@@ -561,7 +672,7 @@ def start_action(token, action, label, results):
 
 
 def dispatch(message):
-    global refresh_requested, active_action, active_session_create
+    global refresh_requested, active_action, active_session_create, filter_refresh_requested
     method = message.get("method", "")
     request_id = message.get("id")
     params = message.get("params")
@@ -570,6 +681,27 @@ def dispatch(message):
     if method == "attention.refresh":
         refresh_requested = True
         result = {"ok": True}
+    elif method == "attention.filter":
+        token = params.get("token")
+        if params.get("session_id") not in live_session_ids:
+            result = {"ok": False, "error": "Unknown session."}
+        else:
+            action = action_tokens.get(token) if isinstance(token, str) else None
+            kind = action.get("filter_kind") if isinstance(action, dict) else None
+            value = action.get("value") if isinstance(action, dict) else None
+            if (not isinstance(action, dict) or action.get("_aoe_operation") != "filter"
+                    or kind not in {"source", "provider"} or not isinstance(value, str)):
+                result = {"ok": False, "error": "This filter expired. Refresh the pane and try again."}
+            else:
+                action_tokens.pop(token, None)
+                with _filter_lock:
+                    filters = hidden_sources if kind == "source" else hidden_providers
+                    if value in filters:
+                        filters.remove(value)
+                    else:
+                        filters.add(value)
+                filter_refresh_requested = True
+                result = {"ok": True}
     elif method in {"attention.action", "attention.new_session"}:
         token = params.get("token")
         session_id = params.get("session_id")
@@ -605,6 +737,11 @@ def main():
     global published_ids, refresh_requested, action_tokens, live_session_ids
     global action_requests, action_results, active_action
     global session_create_requests, active_session_create, live_sessions_by_id
+    global filter_refresh_requested, hidden_sources, hidden_providers, snapshot_fetched_at
+    filter_refresh_requested = False
+    hidden_sources = set()
+    hidden_providers = set()
+    snapshot_fetched_at = None
     published_ids = set()
     refresh_requested = False
     action_tokens = {}
@@ -631,6 +768,18 @@ def main():
             message = read_message(max(0, min(0.25, next_sessions - time.monotonic())))
             if isinstance(message, dict) and "method" in message:
                 dispatch(message)
+            if filter_refresh_requested:
+                filter_refresh_requested = False
+                with _filter_lock:
+                    current_hidden_sources = set(hidden_sources)
+                    current_hidden_providers = set(hidden_providers)
+                base_payload, action_tokens = build_pane(
+                    snapshot_items, fetched_at=snapshot_fetched_at,
+                    hidden_sources=current_hidden_sources,
+                    hidden_providers=current_hidden_providers,
+                )
+                payload = base_payload
+                publish_payload(sessions, payload, items=snapshot_items)
 
             now = time.monotonic()
             if now >= next_sessions:
@@ -710,11 +859,12 @@ def main():
                     fetch_in_flight = True
 
             try:
-                updated_payload, updated_actions, error, updated_items = results.get_nowait()
+                updated_payload, updated_actions, error, updated_items, fetched_at = results.get_nowait()
             except queue.Empty:
                 updated_payload = None
                 updated_actions = None
                 error = None
+                fetched_at = None
             if updated_payload is not None or updated_actions is not None:
                 fetch_in_flight = False
                 if error is None:
@@ -722,6 +872,7 @@ def main():
                     payload = base_payload
                     action_tokens = updated_actions
                     snapshot_items = updated_items
+                    snapshot_fetched_at = fetched_at
                 else:
                     payload = payload_with_notice(
                         base_payload, f"Refresh failed: {error}. Select Refresh to retry."

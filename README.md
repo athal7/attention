@@ -202,25 +202,31 @@ This repository also provides an Agent of Empires community plugin that
 publishes prioritized Attention items in each session's right-hand pane.
 Install from the repository root with `aoe plugin install .`, then enable it with
 `aoe plugin enable athal7.attention`.
-AoE requests the plugin's `session.create` and `session.unattended` capabilities.
-`session.create` enables **New session** for AoE-reviewed interactive agents.
+AoE requests the plugin's `session.create`, `session.prompt`, and
+`session.unattended` capabilities. `session.create` enables **New session** for
+AoE-reviewed interactive agents; `session.prompt` lets the plugin send the
+source's initial task when available.
 The plugin needs `session.unattended` for unattended defaults such as `omp`; this
 plugin-wide grant may let any configured agent bypass interactive approval.
 Grant it only if that behavior is acceptable; otherwise choose an AoE-reviewed
 interactive ACP agent in the **New session agent** setting.
 
-Each card's **New session** action creates a structured ACP session with the
-same project path as the current AoE session (or a scratch session if it has no
-project path). It names the session after the Attention item and sends no
-initial prompt. The card actions remain in AoE's existing two-column layout.
+Each card's **New session** action creates a structured ACP session for the
+item's repository. Items without a repository create a scratch session; the
+repository is never inferred from whichever AoE session displays the pane.
+It names the session after the Attention item and sends its source-generated
+initial task when available. The AoE `sessions.create` API does not let this
+plugin select a PR head branch, so the AoE GitHub plugin only recognizes the
+branch actually checked out in the selected repository.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an
-inbox for generic or unrecognized sources. GitHub PRs in a visible stack are
-ordered parent-first and use the same tree markers as the terminal dashboard;
-each PR remains its own card with its own actions. Missing stack members do not
-prevent visible children from appearing. State indicators use colored icons,
-including PR review and CI state. When exactly one running AoE session matches
+inbox for generic or unrecognized sources. A stack's base PR stays visible;
+dependent PRs start folded in a native collapsible **Stacked pull requests**
+section. Expanding it reveals each dependent PR card in parent-first order,
+with its own actions. Missing stack members do not prevent visible children
+from appearing. State indicators use colored icons, including PR review and CI
+state. When exactly one running AoE session matches
 a GitHub PR's repository and head branch, or an Attention-created session's
 unique title, the card also links to that session. The item title and summary
 still open the source directly; no separate **Open** button is shown. Status,
@@ -228,9 +234,12 @@ context, and recommendation are combined into one summary.
 Lumen diff actions and actions requiring prompted input are omitted from the
 web pane; they remain available in the terminal dashboard. Collector failures
 appear as named, sanitized notes alongside healthy items; exception messages
-are never shown. The pane never fetches automatically; select **Refresh** to
-load or update items. Each result is labelled with its UTC fetch time. Session
-enumeration and actions update pane state without fetching attention sources.
+are never shown. The **Refresh** button stays at the top of the pane; items
+load only when **Refresh** is selected. Expand **Filters** to hide or show
+individual sources and configured generic providers; filter choices update with
+each refresh and selections last for the worker's lifetime. Each result is
+labelled with its UTC fetch time. Session enumeration and actions update pane
+state without fetching attention sources.
 The `attention` GitHub source does not persist a snapshot locally. It uses
 `gh search`; `gh api --cache` covers GET requests and does not cache those searches.
 No stale snapshot is shown as current. At most one source action plus **New

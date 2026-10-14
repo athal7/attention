@@ -110,6 +110,7 @@ def _fetch_provider(name, spec):
         if not isinstance(record, dict):
             continue
         items.append({
+            "_provider": name,
             "status": _resolve(spec.get("status", name), record),
             "context": _resolve(spec.get("context", name), record),
             "title": _resolve(spec.get("title", ""), record),
