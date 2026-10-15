@@ -101,6 +101,28 @@ class PanePayloadTests(unittest.TestCase):
         for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
 
+    def test_new_session_selects_head_branch_only_for_github_pull_requests(self):
+        items = [
+            {
+                "_plugin": "github", "kind": "pull_request", "title": "PR",
+                "repo_path": "/repo", "head_branch": "feature/pr-42",
+            },
+            {
+                "_plugin": "github", "kind": "issue", "title": "Issue",
+                "repo_path": "/repo", "head_branch": "feature/issue",
+            },
+        ]
+        tokens = iter(str(index) for index in range(20))
+        _, actions = worker.build_pane(items, token_factory=lambda: next(tokens))
+        sessions = {
+            action["title"]: action for action in actions.values()
+            if action.get("_aoe_operation") == "new_session"
+        }
+        pr_action = sessions["Attention: PR"]
+        self.assertTrue(pr_action["is_pull_request"])
+        self.assertEqual(pr_action["worktree_branch"], "feature/pr-42")
+        self.assertNotIn("worktree_branch", sessions["Attention: Issue"])
+
     def test_source_and_provider_filters_hide_only_matching_items(self):
         items = [
             {"_plugin": "github", "title": "PR"},
@@ -595,6 +617,37 @@ class InteractiveActionTests(unittest.TestCase):
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_pr_session_refuses_missing_repository_or_head_branch(self):
+        cases = (
+            (
+                "missing repository",
+                {"is_pull_request": True, "worktree_branch": "feature/pr-42"},
+                "no repository path",
+            ),
+            (
+                "missing head branch",
+                {"is_pull_request": True, "repo_path": "/repos/app"},
+                "no valid head branch",
+            ),
+            (
+                "malformed head branch",
+                {
+                    "is_pull_request": True,
+                    "repo_path": "/repos/app",
+                    "worktree_branch": "feature/pr-42 ",
+                },
+                "no valid head branch",
+            ),
+        )
+        with patch.object(worker, "rpc") as rpc:
+            for label, action, message in cases:
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        worker.create_session({
+                            "action": action, "session_id": "s1", "token": "token",
+                        })
+            rpc.assert_not_called()
+
     def test_new_session_action_creates_and_confirms_a_host_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -603,6 +656,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 "def load_config(): return {}\n"
                 "def build_prioritized_items(config):\n"
                 "    return [{'status':'now','context':'repo','title':'Fix regression','details':'ready',"
+                "'_plugin':'github','kind':'pull_request','head_branch':'feature/pr-42',"
                 "'repo_path':'/repositories/target','session_prompt':'Review this pull request.'}]\n"
             )
             source = (ROOT / "aoe_worker.py").read_text().replace(
@@ -676,7 +730,11 @@ class WorkerProtocolTests(unittest.TestCase):
                 self.assertEqual(create["params"]["agent_id"], "omp")
                 self.assertEqual(create["params"]["title"], "Attention: Fix regression")
                 self.assertEqual(create["params"]["project_path"], "/repositories/target")
-                self.assertEqual(create["params"]["initial_turn"], "Review this pull request.")
+                self.assertEqual(
+                    create["params"]["initial_turn"],
+                    {"text": "Review this pull request."},
+                )
+                self.assertEqual(create["params"]["worktree_branch"], "feature/pr-42")
                 self.assertEqual(create["params"]["idempotency_key"], button["params"]["token"])
                 reply(create, {"session_id": "created-session", "created": True})
 

@@ -212,12 +212,18 @@ Grant it only if that behavior is acceptable; otherwise choose an AoE-reviewed
 interactive ACP agent in the **New session agent** setting.
 
 Each card's **New session** action creates a structured ACP session for the
-item's repository. Items without a repository create a scratch session; the
-repository is never inferred from whichever AoE session displays the pane.
+item's repository. Items without a repository create scratch sessions, except
+GitHub pull requests, which fail closed rather than create a scratch session.
+The repository is never inferred from whichever AoE session displays the pane.
 It names the session after the Attention item and sends its source-generated
-initial task when available. The AoE `sessions.create` API does not let this
-plugin select a PR head branch, so the AoE GitHub plugin only recognizes the
-branch actually checked out in the selected repository.
+initial task through `sessions.create.initial_turn` as `{"text": "…"}` when
+nonblank; otherwise it omits `initial_turn`. For GitHub pull requests, it also
+requests an AoE-managed worktree on the PR's head branch in that repository. Missing
+repository or head-branch data fails instead of creating a scratch or
+default-branch session; the branch must be available in the repository and
+not already checked out in any worktree. This requires an AoE host version
+that supports `sessions.create.worktree_branch`; older hosts reject the
+request rather than use another checkout.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an

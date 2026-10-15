@@ -241,6 +241,9 @@ def _web_actions(item, token_actions, token_factory):
     repo_path = item.get("repo_path")
     if isinstance(repo_path, str) and repo_path:
         token_actions[token]["repo_path"] = repo_path
+    if item.get("_plugin") == "github" and item.get("kind") == "pull_request":
+        token_actions[token]["is_pull_request"] = True
+        token_actions[token]["worktree_branch"] = item.get("head_branch")
     session_prompt = item.get("session_prompt")
     if isinstance(session_prompt, str) and session_prompt.strip():
         token_actions[token]["initial_turn"] = session_prompt
@@ -533,6 +536,16 @@ def live_sessions():
 
 
 def create_session(request):
+    action = request["action"]
+    is_pull_request = action.get("is_pull_request") is True
+    project_path = action.get("repo_path")
+    worktree_branch = action.get("worktree_branch")
+    if is_pull_request:
+        if not isinstance(project_path, str) or not project_path.strip():
+            raise RuntimeError("GitHub pull request has no repository path.")
+        if (not isinstance(worktree_branch, str) or not worktree_branch
+                or worktree_branch.strip() != worktree_branch):
+            raise RuntimeError("GitHub pull request has no valid head branch.")
     settings = rpc("config.get", {"key": "agent_id"})
     agent_id = settings.get("value") if isinstance(settings, dict) else None
     if not isinstance(agent_id, str) or not agent_id.strip():
@@ -542,15 +555,16 @@ def create_session(request):
         raise RuntimeError("This session is no longer available.")
     params = {
         "agent_id": agent_id.strip(),
-        "title": request["action"]["title"],
+        "title": action["title"],
         "idempotency_key": request["token"],
     }
-    initial_turn = request["action"].get("initial_turn")
+    initial_turn = action.get("initial_turn")
     if isinstance(initial_turn, str) and initial_turn.strip():
-        params["initial_turn"] = initial_turn
-    project_path = request["action"].get("repo_path")
+        params["initial_turn"] = {"text": initial_turn}
     if isinstance(project_path, str) and project_path:
         params["project_path"] = project_path
+    if is_pull_request:
+        params["worktree_branch"] = worktree_branch
     result = rpc("sessions.create", params)
     session_id = result.get("session_id") if isinstance(result, dict) else None
     if not isinstance(session_id, str) or not session_id:
