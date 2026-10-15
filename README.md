@@ -92,7 +92,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, optional `"wip": true` to mark or `"wip": "clear"` to unmark the item when it runs successfully, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
-| `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, and/or `statuses`) or `fallback: true`. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
+| `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, and/or `any`) or `fallback: true`. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
 ### Dashboard groups
 
@@ -105,10 +105,22 @@ interactive dashboard performs one initial fetch, with no background refresh.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
-`kinds` and `statuses` matches only items satisfying both. The first matching
-group wins; the fallback receives every remaining item. Invalid grouping
-configuration emits a warning and uses the existing flat dashboard, so it
-cannot hide attention items.
+`kinds` and `statuses` matches only items satisfying both. Use `any` for OR
+alternatives across fields; outer fields remain ANDed with the alternatives:
+
+```json
+{ "name": "My Work", "match": {
+  "plugins": ["github"],
+  "any": [
+    { "kinds": ["pull_request"], "statuses": ["NEEDS"] },
+    { "contexts": ["Release"] }
+  ]
+} }
+```
+
+The first matching group wins; the fallback receives every remaining item.
+Invalid grouping configuration emits a warning and uses the existing flat
+dashboard, so it cannot hide attention items.
 
 Each group can select a different table with `columns`. Bundled groups use one
 compact `state` column by default. Its value is a short status label such as

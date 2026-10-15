@@ -4461,6 +4461,57 @@ print(typed_prefix_error)
 }
 test_dashboard_group_rules_and_rows
 
+test_dashboard_group_any_alternatives() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, error = m.dashboard_groups({
+    'dashboard': {'groups': [
+        {'name': 'Selected', 'match': {
+            'plugins': ['github'],
+            'any': [
+                {'kinds': ['issue'], 'statuses': ['NEEDS']},
+                {'contexts': ['Release'], 'contextPrefixes': ['Release']},
+            ],
+        }},
+        {'name': 'Other', 'fallback': True},
+    ]},
+})
+items = [
+    {'_plugin': 'github', 'kind': 'issue', 'status': 'NEEDS', 'context': 'Inbox'},
+    {'_plugin': 'github', 'kind': 'event', 'status': 'READY', 'context': 'release/stable'},
+    {'_plugin': 'github', 'kind': 'event', 'status': 'READY', 'context': 'Release'},
+    {'_plugin': 'linear', 'kind': 'issue', 'status': 'NEEDS', 'context': 'Inbox'},
+]
+rows = m.render_grouped_dashboard_rows(items, groups)
+print(error)
+print(','.join(row.rpartition(chr(9))[2] for row in rows))
+invalid_matches = [
+    ('not a list', {'any': {'plugins': ['github']}}),
+    ('empty list', {'any': []}),
+    ('non-object alternative', {'any': [{'plugins': ['github']}, 'invalid']}),
+    ('unknown field', {'any': [{'unknown': ['value']}]}),
+    ('invalid field values', {'any': [{'statuses': []}]}),
+    ('nested any', {'any': [{'any': [{'plugins': ['github']}]}]}),
+]
+for label, match in invalid_matches:
+    _, validation_error = m.dashboard_groups({'dashboard': {'groups': [
+        {'name': 'Selected', 'match': match},
+        {'name': 'Other', 'fallback': True},
+    ]}})
+    print(label + ':' + str(validation_error))
+")"
+  check "valid OR alternatives have no validation error" "$(sed -n 1p <<<"$out")" "None"
+  check "alternatives use OR with outer plugin constraint ANDed" "$(sed -n 2p <<<"$out")" "Selected,Selected,Other,Other"
+  check "any requires a list" "$(sed -n 3p <<<"$out")" "not a list:dashboard.groups[1].match.any must be a non-empty list of match objects"
+  check "empty alternatives are rejected" "$(sed -n 4p <<<"$out")" "empty list:dashboard.groups[1].match.any must be a non-empty list of match objects"
+  check "non-object alternatives are rejected" "$(sed -n 5p <<<"$out")" "non-object alternative:dashboard.groups[1].match.any[2] must contain only plugins, kinds, contexts, contextPrefixes, or statuses"
+  check "unknown alternative fields are rejected" "$(sed -n 6p <<<"$out")" "unknown field:dashboard.groups[1].match.any[1] must contain only plugins, kinds, contexts, contextPrefixes, or statuses"
+  check "malformed alternative fields are rejected" "$(sed -n 7p <<<"$out")" "invalid field values:dashboard.groups[1].match.any[1].statuses must be a non-empty list of strings"
+  check "nested any alternatives are rejected" "$(sed -n 8p <<<"$out")" "nested any:dashboard.groups[1].match.any[1] must contain only plugins, kinds, contexts, contextPrefixes, or statuses"
+}
+test_dashboard_group_any_alternatives
+
 test_default_dashboard_groups_items_by_type() {
   local out
   out="$(python3 -c "

@@ -745,6 +745,36 @@ def _default_dashboard_groups():
     ]
 
 
+def _normalize_group_match(match, path, *, allow_any=False):
+    fields = ("plugins", "kinds", "contexts", "contextPrefixes", "statuses")
+    supported_fields = fields + ("any",) if allow_any else fields
+    if not isinstance(match, dict) or set(match) - set(supported_fields):
+        return None, f"{path} must contain only {', '.join(supported_fields[:-1])}, or {supported_fields[-1]}"
+
+    normalized_match = {}
+    for key in fields:
+        values = match.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+            return None, f"{path}.{key} must be a non-empty list of strings"
+        normalized_match[key] = list(values)
+
+    if "any" in match:
+        alternatives = match["any"]
+        if not isinstance(alternatives, list) or not alternatives:
+            return None, f"{path}.any must be a non-empty list of match objects"
+        normalized_match["any"] = []
+        for index, alternative in enumerate(alternatives, 1):
+            normalized_alternative, error = _normalize_group_match(
+                alternative, f"{path}.any[{index}]",
+            )
+            if error:
+                return None, error
+            normalized_match["any"].append(normalized_alternative)
+    return normalized_match, None
+
+
 def dashboard_groups(config):
     dashboard_config = config.get("dashboard")
     if dashboard_config is None:
@@ -791,17 +821,11 @@ def dashboard_groups(config):
             groups.append({"name": name, "fallback": True, "columns": columns})
             continue
 
-        match = raw_group["match"]
-        if not isinstance(match, dict) or set(match) - {"plugins", "kinds", "contexts", "contextPrefixes", "statuses"}:
-            return None, f"dashboard.groups[{index}].match must contain only plugins, kinds, contexts, contextPrefixes, or statuses"
-        normalized_match = {}
-        for key in ("plugins", "kinds", "contexts", "contextPrefixes", "statuses"):
-            values = match.get(key)
-            if values is None:
-                continue
-            if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
-                return None, f"dashboard.groups[{index}].match.{key} must be a non-empty list of strings"
-            normalized_match[key] = list(values)
+        normalized_match, error = _normalize_group_match(
+            raw_group["match"], f"dashboard.groups[{index}].match", allow_any=True,
+        )
+        if error:
+            return None, error
         groups.append({"name": name, "match": normalized_match, "columns": columns})
 
     if fallback_count != 1:
@@ -821,10 +845,14 @@ def _group_matches(item, match):
         "contexts": context,
         "statuses": item.get("status", ""),
     }
-    return all(
+    if not all(
         fields[key] in values
         for key, values in match.items()
-        if key != "contextPrefixes"
+        if key != "contextPrefixes" and key != "any"
+    ):
+        return False
+    return "any" not in match or any(
+        _group_matches(item, alternative) for alternative in match["any"]
     )
 
 
