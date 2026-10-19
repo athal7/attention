@@ -64,6 +64,7 @@ class PanePayloadTests(unittest.TestCase):
             "_plugin": "github", "status": "NEEDS ATTENTION", "context": "private-repo",
             "title": "Ship release", "details": "Review required", "weight": 99,
             "repo_path": "/repositories/private-repo",
+            "repo_project_path": "/registered/private-repo",
             "actions": [
                 {"_plugin": "github", "key": "o", "label": "open", "primary": True,
                  "payload": {"kind": "open", "url": "https://example.com/issue", "token": "secret-token"}},
@@ -95,21 +96,23 @@ class PanePayloadTests(unittest.TestCase):
         self.assertEqual(actions["opaque-session"], {
             "_aoe_operation": "new_session", "title": "Attention: Ship release",
             "repo_path": "/repositories/private-repo",
+            "project_path": "/registered/private-repo",
         })
         self.assertEqual(actions["opaque-filter"]["filter_kind"], "source")
         rendered = json.dumps(payload)
         for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
 
-    def test_new_session_selects_head_branch_only_for_github_pull_requests(self):
+    def test_new_session_selects_registered_project_for_github_items(self):
         items = [
             {
                 "_plugin": "github", "kind": "pull_request", "title": "PR",
-                "repo_path": "/repo", "head_branch": "feature/pr-42",
+                "repo_path": "/worktrees/repo", "repo_project_path": "/registered/repo",
+                "head_branch": "feature/pr-42", "base_branch": "main",
             },
             {
                 "_plugin": "github", "kind": "issue", "title": "Issue",
-                "repo_path": "/repo", "head_branch": "feature/issue",
+                "repo_path": "/worktrees/repo", "repo_project_path": "/registered/repo",
             },
         ]
         tokens = iter(str(index) for index in range(20))
@@ -119,9 +122,14 @@ class PanePayloadTests(unittest.TestCase):
             if action.get("_aoe_operation") == "new_session"
         }
         pr_action = sessions["Attention: PR"]
+        self.assertEqual(pr_action["project_path"], "/registered/repo")
+        self.assertEqual(pr_action["head_branch"], "feature/pr-42")
+        self.assertEqual(pr_action["base_branch"], "main")
         self.assertTrue(pr_action["is_pull_request"])
-        self.assertEqual(pr_action["worktree_branch"], "feature/pr-42")
-        self.assertNotIn("worktree_branch", sessions["Attention: Issue"])
+        issue_action = sessions["Attention: Issue"]
+        self.assertEqual(issue_action["project_path"], "/registered/repo")
+        self.assertNotIn("head_branch", issue_action)
+        self.assertNotIn("base_branch", issue_action)
 
     def test_source_and_provider_filters_hide_only_matching_items(self):
         items = [
@@ -432,6 +440,82 @@ class PanePayloadTests(unittest.TestCase):
             encoded = json.dumps(worker.pane_payload(huge), separators=(",", ":")).encode("utf-8")
         self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
 
+
+
+class GitHubRepositoryResolutionTests(unittest.TestCase):
+    def test_verified_identity_prefers_registered_projects_and_resolves_bare_heads(self):
+        source_path = str(ROOT / "sources")
+        sys.path.insert(0, source_path)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "attention_github_source", ROOT / "sources" / "github.py",
+            )
+            github = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(github)
+        finally:
+            sys.path.remove(source_path)
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *(str(arg) for arg in args)], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+        def init_repo(path, origin):
+            path.mkdir()
+            git("init", "-b", "main", path)
+            git("-C", path, "config", "user.email", "test@example.com")
+            git("-C", path, "config", "user.name", "Test")
+            (path / "README").write_text("fixture\n")
+            git("-C", path, "add", "README")
+            git("-C", path, "commit", "-m", "fixture")
+            git("-C", path, "remote", "add", "origin", origin)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code_dir = Path(tmp) / "code"
+            code_dir.mkdir()
+            registered = code_dir / "registered-copy"
+            duplicate = code_dir / "different-name"
+            init_repo(registered, "git@github.com:Org/Widget.git")
+            init_repo(duplicate, "https://github.com/org/widget.git")
+
+            renamed = code_dir / "renamed-checkout"
+            init_repo(renamed, "git@github.com:fork/project.git")
+            git("-C", renamed, "remote", "add", "upstream", "https://github.com/org/project.git")
+
+            ambiguous_a = code_dir / "ambiguous-a"
+            ambiguous_b = code_dir / "ambiguous-b"
+            init_repo(ambiguous_a, "git@github.com:org/ambiguous.git")
+            init_repo(ambiguous_b, "git@github.com:org/ambiguous.git")
+
+            foreign = code_dir / "foreign-host-checkout"
+            init_repo(foreign, "git@gitlab.com:org/private.git")
+
+            seed = Path(tmp) / "seed"
+            init_repo(seed, "git@github.com:org/bare.git")
+            bare = code_dir / "registered-bare.git"
+            git("clone", "--bare", seed, bare)
+            git("-C", bare, "symbolic-ref", "HEAD", "refs/heads/main")
+            git("-C", bare, "remote", "set-url", "origin", "git@github.com:org/bare.git")
+            bare_head = code_dir / "bare-default-checkout"
+            git("-C", bare, "worktree", "add", bare_head, "main")
+
+            registered_projects = {str(registered.resolve()), str(bare.resolve())}
+            with patch.object(github, "_registered_repo_paths", return_value=registered_projects):
+                index = github._build_repo_dir_index(str(code_dir))
+
+            self.assertEqual(index["org/widget"], {
+                "repo_path": str(registered.resolve()),
+                "repo_project_path": str(registered.resolve()),
+            })
+            self.assertEqual(index["fork/project"]["repo_path"], os.path.abspath(renamed))
+            self.assertEqual(index["org/project"]["repo_path"], os.path.abspath(renamed))
+            self.assertNotIn("org/ambiguous", index)
+            self.assertNotIn("org/private", index)
+            self.assertEqual(index["org/bare"], {
+                "repo_path": str(bare_head.resolve()),
+                "repo_project_path": str(bare.resolve()),
+            })
 class SessionCreationTests(unittest.TestCase):
     def test_manifest_requests_unattended_session_creation(self):
         import tomllib
@@ -445,12 +529,21 @@ class SessionCreationTests(unittest.TestCase):
         request = {
             "token": "single-use-token",
             "session_id": "s1",
-            "action": {"title": "Attention: Review PR"},
+            "action": {
+                "title": "Attention: Review PR",
+                "project_path": "/repos/app",
+            },
         }
-        with patch.object(worker, "rpc", return_value={"value": None}) as rpc:
-            with self.assertRaisesRegex(RuntimeError, "Choose an ACP agent"):
-                worker.create_session(request)
+        cli_sessions = json.dumps([{"id": "s1", "profile": "test-profile", "group": ""}])
+        with patch.dict(worker.live_sessions_by_id, {"s1": {"id": "s1"}}):
+            with patch.object(worker.subprocess, "run", return_value=subprocess.CompletedProcess(
+                args=["aoe"], returncode=0, stdout=cli_sessions, stderr="",
+            )) as run:
+                with patch.object(worker, "rpc", return_value={"value": None}) as rpc:
+                    with self.assertRaisesRegex(RuntimeError, "Choose an ACP agent"):
+                        worker.create_session(request)
         rpc.assert_called_once_with("config.get", {"key": "agent_id"})
+        run.assert_called_once()
 
 
 class AttentionSourceTests(unittest.TestCase):
@@ -621,20 +714,20 @@ class WorkerProtocolTests(unittest.TestCase):
         cases = (
             (
                 "missing repository",
-                {"is_pull_request": True, "worktree_branch": "feature/pr-42"},
-                "no repository path",
+                {"is_pull_request": True, "head_branch": "feature/pr-42"},
+                "no AoE project path",
             ),
             (
                 "missing head branch",
-                {"is_pull_request": True, "repo_path": "/repos/app"},
+                {"is_pull_request": True, "project_path": "/repos/app"},
                 "no valid head branch",
             ),
             (
                 "malformed head branch",
                 {
                     "is_pull_request": True,
-                    "repo_path": "/repos/app",
-                    "worktree_branch": "feature/pr-42 ",
+                    "project_path": "/repos/app",
+                    "head_branch": "feature/pr-42 ",
                 },
                 "no valid head branch",
             ),
@@ -648,16 +741,77 @@ class WorkerProtocolTests(unittest.TestCase):
                         })
             rpc.assert_not_called()
 
-    def test_new_session_action_creates_and_confirms_a_host_session(self):
+    def test_new_session_action_creates_an_isolated_worktree_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             attention = root / "attention"
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            (repo / "README").write_text("fixture\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "fixture"], check=True, capture_output=True)
+            state_path = root / "aoe-state.json"
+            worktrees = root / "worktrees"
+            state_path.write_text(json.dumps({
+                "sessions": [{"id": "s1", "profile": "test-profile", "group": "test-group"}],
+                "repo": str(repo), "worktrees": str(worktrees),
+            }))
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            aoe = bin_dir / "aoe"
+            aoe.write_text("""#!/usr/bin/env python3
+import json, os, subprocess, sys
+state_path = os.environ["ATTENTION_AOE_STATE"]
+state = json.load(open(state_path))
+args = sys.argv[1:]
+profile = None
+if args[:1] == ["--profile"]:
+    profile, args = args[1], args[2:]
+if args[:3] == ["list", "--all", "--json"]:
+    print(json.dumps(state["sessions"]))
+elif args[:3] == ["project", "list", "--json"]:
+    print(json.dumps([{"path": state["repo"]}]) if profile == "test-profile" else "[]")
+elif args[:1] == ["add"]:
+    repo = args[1]
+    branch = args[args.index("--worktree") + 1]
+    title = args[args.index("--title") + 1]
+    group = args[args.index("--group") + 1]
+    agent = args[args.index("--agent") + 1]
+    path = os.path.join(state["worktrees"], branch.replace("/", "_"))
+    os.makedirs(state["worktrees"], exist_ok=True)
+    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, path], check=True, capture_output=True)
+    state["created"] = {"path": path, "branch": branch, "title": title, "group": group,
+                        "agent": agent, "profile": profile, "repo": repo}
+    state["sessions"].append({"id": "created-session", "profile": profile,
+                              "worktree": {"branch": branch, "main_repo_path": os.path.realpath(repo)}})
+    with open(state_path, "w") as f: json.dump(state, f)
+elif args[:2] == ["acp", "status"]:
+    pass
+elif args[:2] == ["acp", "prompt"]:
+    state["prompt_attempts"] = state.get("prompt_attempts", 0) + 1
+    with open(state_path, "w") as f: json.dump(state, f)
+    if state["prompt_attempts"] == 1:
+        print("structured view session not found on the daemon", file=sys.stderr)
+        raise SystemExit(1)
+    state["prompt"] = args[-1]
+    with open(state_path, "w") as f: json.dump(state, f)
+else:
+    raise SystemExit("unexpected aoe command: " + repr(args))
+""")
+            aoe.chmod(0o755)
             attention.write_text(
+                "import os\n"
                 "def load_config(): return {}\n"
                 "def build_prioritized_items(config):\n"
+                "    assert os.environ.get('AGENT_OF_EMPIRES_PROFILE') == 'test-profile'\n"
                 "    return [{'status':'now','context':'repo','title':'Fix regression','details':'ready',"
                 "'_plugin':'github','kind':'pull_request','head_branch':'feature/pr-42',"
-                "'repo_path':'/repositories/target','session_prompt':'Review this pull request.'}]\n"
+                "'base_branch':'main','repo_path':" + repr(str(repo)) + ","
+                "'repo_project_path':" + repr(str(repo)) + ","
+                "'session_prompt':'Review this PR; check out feature/pr-42.'}]\n"
             )
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
@@ -665,9 +819,12 @@ class WorkerProtocolTests(unittest.TestCase):
             )
             worker_path = root / "aoe_worker.py"
             worker_path.write_text(source)
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+            env["ATTENTION_AOE_STATE"] = str(state_path)
             proc = subprocess.Popen(
                 [sys.executable, str(worker_path)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
             )
             stdout_buffer = bytearray()
 
@@ -683,11 +840,9 @@ class WorkerProtocolTests(unittest.TestCase):
             try:
                 listing = receive()
                 self.assertEqual(listing["method"], "sessions.list")
-                reply(listing, {"sessions": [{"id": "s1", "project_path": "/repositories/attention-open"}]})
-
+                reply(listing, {"sessions": [{"id": "s1", "project_path": str(repo)}]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
-                self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
                 reply(loading)
                 proc.stdin.write((json.dumps({
                     "jsonrpc": "2.0", "id": "initial-refresh",
@@ -695,54 +850,45 @@ class WorkerProtocolTests(unittest.TestCase):
                 }) + "\n").encode())
                 proc.stdin.flush()
                 self.assertTrue(receive()["result"]["ok"])
-
                 snapshot = receive()
-                self.assertEqual(snapshot["method"], "ui.state.set")
-                payload = snapshot["params"]["payload"]
                 button = next(
-                    block for block in worker._walk_blocks(payload["blocks"])
+                    block for block in worker._walk_blocks(snapshot["params"]["payload"]["blocks"])
                     if block.get("label") == "New session"
                 )
-                self.assertEqual(button["method"], "attention.new_session")
                 reply(snapshot)
-
-                action_id = "create-session-action"
                 proc.stdin.write((json.dumps({
-                    "jsonrpc": "2.0", "id": action_id, "method": button["method"],
+                    "jsonrpc": "2.0", "id": "create-session-action", "method": button["method"],
                     "params": {**button["params"], "session_id": "s1"},
                 }) + "\n").encode())
                 proc.stdin.flush()
-                accepted = receive()
-                self.assertEqual(accepted["id"], action_id)
-                self.assertTrue(accepted["result"]["ok"])
-
+                self.assertTrue(receive()["result"]["ok"])
                 creating = receive()
-                self.assertEqual(creating["method"], "ui.state.set")
-                self.assertIn("Creating session: Attention: Fix regression", json.dumps(creating["params"]["payload"]))
+                self.assertIn("Creating session: Attention: Fix regression",
+                              json.dumps(creating["params"]["payload"]))
                 reply(creating)
-
                 settings = receive()
-                self.assertEqual((settings["method"], settings["params"]), ("config.get", {"key": "agent_id"}))
+                self.assertEqual((settings["method"], settings["params"]),
+                                 ("config.get", {"key": "agent_id"}))
                 reply(settings, {"value": "omp"})
-
-                create = receive()
-                self.assertEqual(create["method"], "sessions.create")
-                self.assertEqual(create["params"]["agent_id"], "omp")
-                self.assertEqual(create["params"]["title"], "Attention: Fix regression")
-                self.assertEqual(create["params"]["project_path"], "/repositories/target")
-                self.assertEqual(
-                    create["params"]["initial_turn"],
-                    {"text": "Review this pull request."},
-                )
-                self.assertEqual(create["params"]["worktree_branch"], "feature/pr-42")
-                self.assertEqual(create["params"]["idempotency_key"], button["params"]["token"])
-                reply(create, {"session_id": "created-session", "created": True})
-
                 completed = receive()
-                self.assertEqual(completed["method"], "ui.state.set")
-                self.assertIn("Created session: created-session", json.dumps(completed["params"]["payload"]))
-                self.assertEqual(completed["params"]["session_id"], "s1")
+                self.assertIn("Created session: created-session",
+                              json.dumps(completed["params"]["payload"]))
                 reply(completed)
+                state = json.loads(state_path.read_text())
+                created = state["created"]
+                self.assertEqual(created["repo"], str(repo))
+                self.assertEqual(created["profile"], "test-profile")
+                self.assertEqual(created["group"], "test-group")
+                self.assertEqual(created["agent"], "omp")
+                self.assertEqual(created["branch"], "attention/" + __import__("hashlib").sha256(
+                    button["params"]["token"].encode()).hexdigest()[:20])
+                self.assertEqual(state["prompt_attempts"], 2)
+                self.assertEqual(state["prompt"], "Review this PR; check out feature/pr-42.")
+                self.assertNotEqual(os.path.realpath(created["path"]), os.path.realpath(repo))
+                self.assertEqual(subprocess.run(
+                    ["git", "-C", created["path"], "branch", "--show-current"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip(), created["branch"])
             finally:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -1046,7 +1192,6 @@ class WorkerActionProtocolTests(unittest.TestCase):
             attention = root / "attention"
             fetches = root / "fetches"
             dispatched = root / "dispatched.json"
-            created_params = []
             attention.write_text(
                 "import json, sys\nfrom pathlib import Path\n"
                 f"FETCHES = Path({str(fetches)!r})\nDISPATCHED = Path({str(dispatched)!r})\n"
@@ -1173,23 +1318,17 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 while time.monotonic() < deadline and not created_notice_seen:
                     message = receive(max(0.01, deadline - time.monotonic()))
                     if message.get("method") == "ui.state.set":
-                        created_notice_seen = "Created session: created-session" in json.dumps(message["params"]["payload"])
+                        state = json.dumps(message["params"]["payload"])
+                        created_notice_seen = (
+                            "Session creation failed: Attention item has no AoE project path."
+                            in state
+                        )
                         reply(message)
-                    elif message.get("method") == "config.get":
-                        self.assertEqual(message["params"], {"key": "agent_id"})
-                        reply(message, {"value": "omp"})
-                    elif message.get("method") == "sessions.create":
-                        created_params.append(message["params"])
-                        reply(message, {"session_id": "created-session", "created": True})
                     elif message.get("method") == "sessions.list":
-                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repositories/attention-open"}]})
+                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
                     else:
                         self.fail(f"unexpected host RPC during create: {message}")
-                self.assertTrue(created_notice_seen, "pane omitted session creation result")
-                self.assertEqual(created_params, [{
-                    "agent_id": "omp", "title": "Attention: Fetch 1",
-                    "idempotency_key": new_session_token,
-                }])
+                self.assertTrue(created_notice_seen, "pane did not fail closed for an unmapped repository")
                 self.assertEqual(fetches.read_text(), "1", "session creation fetched implicitly")
                 send_action("duplicate-session", new_session_token, "s1", method="attention.new_session")
                 duplicate_session = wait_response("duplicate-session")

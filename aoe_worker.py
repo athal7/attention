@@ -7,9 +7,11 @@ import json
 import os
 import queue
 from pathlib import Path
+import hashlib
 import secrets
 import select
 import subprocess
+import re
 import sys
 import threading
 import time
@@ -105,6 +107,26 @@ def attention_items():
         return module.build_prioritized_items(module.load_config())
     finally:
         sys.modules.pop(name, None)
+
+
+def attention_host_profile():
+    session_ids = set(live_sessions_by_id)
+    if not session_ids:
+        return None
+    try:
+        result = subprocess.run(
+            ["aoe", "list", "--all", "--json"], capture_output=True,
+            text=True, timeout=20,
+        )
+        sessions = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    profiles = {
+        session["profile"] for session in sessions
+        if isinstance(session, dict) and session.get("id") in session_ids
+        and isinstance(session.get("profile"), str) and session["profile"]
+    }
+    return next(iter(profiles)) if len(profiles) == 1 else None
 
 
 def _safe_source_url(value):
@@ -241,9 +263,16 @@ def _web_actions(item, token_actions, token_factory):
     repo_path = item.get("repo_path")
     if isinstance(repo_path, str) and repo_path:
         token_actions[token]["repo_path"] = repo_path
+    project_path = item.get("repo_project_path")
+    if isinstance(project_path, str) and project_path:
+        token_actions[token]["project_path"] = project_path
+    resolution_error = item.get("repo_resolution_error")
+    if isinstance(resolution_error, str) and resolution_error:
+        token_actions[token]["repo_resolution_error"] = resolution_error
     if item.get("_plugin") == "github" and item.get("kind") == "pull_request":
+        token_actions[token]["head_branch"] = item.get("head_branch")
+        token_actions[token]["base_branch"] = item.get("base_branch")
         token_actions[token]["is_pull_request"] = True
-        token_actions[token]["worktree_branch"] = item.get("head_branch")
     session_prompt = item.get("session_prompt")
     if isinstance(session_prompt, str) and session_prompt.strip():
         token_actions[token]["initial_turn"] = session_prompt
@@ -538,37 +567,141 @@ def live_sessions():
 def create_session(request):
     action = request["action"]
     is_pull_request = action.get("is_pull_request") is True
-    project_path = action.get("repo_path")
-    worktree_branch = action.get("worktree_branch")
-    if is_pull_request:
-        if not isinstance(project_path, str) or not project_path.strip():
-            raise RuntimeError("GitHub pull request has no repository path.")
-        if (not isinstance(worktree_branch, str) or not worktree_branch
-                or worktree_branch.strip() != worktree_branch):
-            raise RuntimeError("GitHub pull request has no valid head branch.")
+    resolution_error = action.get("repo_resolution_error")
+    if isinstance(resolution_error, str) and resolution_error:
+        raise RuntimeError(resolution_error)
+    project_path = action.get("project_path")
+    if not isinstance(project_path, str) or not project_path.strip():
+        raise RuntimeError("Attention item has no AoE project path.")
+    head_branch = action.get("head_branch")
+    if is_pull_request and (
+            not isinstance(head_branch, str) or not head_branch
+            or head_branch.strip() != head_branch):
+        raise RuntimeError("GitHub pull request has no valid head branch.")
+
+    def list_sessions():
+        result = subprocess.run(
+            ["aoe", "list", "--all", "--json"], capture_output=True,
+            text=True, timeout=20,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Could not inspect AoE sessions.")
+        sessions = json.loads(result.stdout)
+        if not isinstance(sessions, list):
+            raise RuntimeError("AoE returned an invalid session list.")
+        return sessions
+
+    sessions = list_sessions()
+    current = [
+        entry for entry in sessions
+        if isinstance(entry, dict) and entry.get("id") == request["session_id"]
+    ]
+    if len(current) != 1 or not isinstance(current[0].get("profile"), str):
+        raise RuntimeError("Could not identify the Attention host profile.")
+    profile = current[0]["profile"]
+    if not profile:
+        raise RuntimeError("Attention host profile is empty.")
+    session = live_sessions_by_id.get(request["session_id"])
+    if session is None:
+        raise RuntimeError("This session is no longer available.")
     settings = rpc("config.get", {"key": "agent_id"})
     agent_id = settings.get("value") if isinstance(settings, dict) else None
     if not isinstance(agent_id, str) or not agent_id.strip():
         raise RuntimeError("Choose an ACP agent in Attention plugin settings before creating a session.")
-    session = live_sessions_by_id.get(request["session_id"])
-    if session is None:
-        raise RuntimeError("This session is no longer available.")
-    params = {
-        "agent_id": agent_id.strip(),
-        "title": action["title"],
-        "idempotency_key": request["token"],
-    }
-    initial_turn = action.get("initial_turn")
-    if isinstance(initial_turn, str) and initial_turn.strip():
-        params["initial_turn"] = {"text": initial_turn}
-    if isinstance(project_path, str) and project_path:
-        params["project_path"] = project_path
-    if is_pull_request:
-        params["worktree_branch"] = worktree_branch
-    result = rpc("sessions.create", params)
-    session_id = result.get("session_id") if isinstance(result, dict) else None
-    if not isinstance(session_id, str) or not session_id:
-        raise RuntimeError("AoE did not return the created session id.")
+
+    token = request["token"]
+    branch = "attention/" + hashlib.sha256(token.encode()).hexdigest()[:20]
+    root = os.path.realpath(project_path)
+    existing = [
+        entry for entry in sessions
+        if isinstance(entry, dict)
+        and entry.get("profile") == profile
+        and isinstance(entry.get("worktree"), dict)
+        and entry["worktree"].get("branch") == branch
+    ]
+    if len(existing) > 1:
+        raise RuntimeError("More than one AoE worktree matches this action.")
+    if existing:
+        worktree = existing[0]["worktree"]
+        if os.path.realpath(worktree.get("main_repo_path", "")) != root:
+            raise RuntimeError("Action worktree branch already belongs to another project.")
+        return existing[0]["id"]
+
+    title = action["title"]
+    group = current[0].get("group")
+    if not isinstance(group, str):
+        raise RuntimeError("AoE did not report the host session group.")
+    command = [
+        "aoe", "--profile", profile, "add", project_path,
+        "--title", title, "--group", group,
+        "--agent", agent_id.strip(), "--structured-view",
+        "--worktree", branch, "--new-branch", "--launch",
+    ]
+    base_branch = action.get("base_branch")
+    if is_pull_request and isinstance(base_branch, str) and base_branch.strip():
+        command.extend(["--base-branch", base_branch])
+    created = subprocess.run(
+        command, capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS,
+    )
+    if created.returncode:
+        detail = created.stderr.strip() or created.stdout.strip()
+        raise RuntimeError(detail or "AoE failed to create the worktree session.")
+
+    sessions = list_sessions()
+    matches = [
+        entry for entry in sessions
+        if isinstance(entry, dict)
+        and entry.get("profile") == profile
+        and isinstance(entry.get("worktree"), dict)
+        and entry["worktree"].get("branch") == branch
+        and os.path.realpath(entry["worktree"].get("main_repo_path", "")) == root
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+        raise RuntimeError("AoE created a session but its worktree identity was not unique.")
+    session_id = matches[0]["id"]
+    prompt = action.get("initial_turn")
+    if isinstance(prompt, str) and prompt.strip():
+        ready = subprocess.run(
+            ["aoe", "--profile", profile, "acp", "status", "--json", session_id],
+            capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS,
+        )
+        if ready.returncode:
+            raise RuntimeError(
+                f"Created session {session_id}, but its ACP worker is not ready: "
+                f"{ready.stderr.strip() or ready.stdout.strip()}"
+            )
+        deadline = time.monotonic() + 30
+        detail = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Created session {session_id}, but initial prompt delivery failed: "
+                    f"{detail or 'AoE worker did not become ready within 30 seconds.'}"
+                )
+            try:
+                sent = subprocess.run(
+                    ["aoe", "--profile", profile, "acp", "prompt", session_id, prompt],
+                    capture_output=True, text=True,
+                    timeout=min(ACTION_TIMEOUT_SECONDS, remaining),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"Created session {session_id}, but initial prompt delivery failed: "
+                    "AoE did not accept the prompt within 30 seconds."
+                ) from exc
+            if sent.returncode == 0:
+                break
+            detail = sent.stderr.strip() or sent.stdout.strip()
+            if (
+                "not found on the daemon" not in detail
+                and "worker_not_ready" not in detail
+            ):
+                raise RuntimeError(
+                    f"Created session {session_id}, but initial prompt delivery failed: "
+                    f"{detail}"
+                )
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
     return session_id
 
 
@@ -645,7 +778,15 @@ def publish_payload(sessions, payload, only_new=False, items=()):
 def fetch_snapshot(results):
     try:
         with _source_lock:
-            items = attention_items()
+            profile = attention_host_profile()
+            previous_profile = os.environ.pop("AGENT_OF_EMPIRES_PROFILE", None)
+            if profile:
+                os.environ["AGENT_OF_EMPIRES_PROFILE"] = profile
+            try:
+                items = attention_items()
+            finally:
+                if previous_profile is not None:
+                    os.environ["AGENT_OF_EMPIRES_PROFILE"] = previous_profile
             fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             with _filter_lock:
                 current_hidden_sources = set(hidden_sources)

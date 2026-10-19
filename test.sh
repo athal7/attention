@@ -898,7 +898,11 @@ actions = json.loads(base64.b64decode(blob))
 session = next(a for a in actions if a.get('key') == 's')
 print(session['payload']['command'][2])
 " "$repo_line" 2>/dev/null || true)"
-  check "repo_path matches the shorthand-named local clone via its git remote" "$decoded" "$FAKE_CODE_DIR/bigproj"
+  if [[ "$decoded" -ef "$FAKE_CODE_DIR/bigproj" ]]; then
+    ok "repo_path resolves to the shorthand-named local clone via its git remote"
+  else
+    bad "repo_path does not resolve to the shorthand-named local clone via its git remote (want '$FAKE_CODE_DIR/bigproj' got '$decoded')"
+  fi
 }
 test_repo_path_git_remote_autodetect
 

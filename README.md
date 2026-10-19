@@ -86,7 +86,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | Key | Meaning |
 |---|---|
 | `plugins` | Which plugins to run, in order. A bare name (`"github"`) loads a bundled plugin; anything containing `/` or ending in `.py` is a path to your own -- see [PLUGINS.md](PLUGINS.md). Missing entirely = the five bundled plugins. |
-| `codeDir` | Parent directory of your local repo clones (default `~/code`). Used by the `github` plugin, which resolves each item's local checkout by matching each subdirectory's own `git remote origin` against the item's repo -- not by name, so a repo cloned under a shorthand directory name still resolves. |
+| `codeDir` | Parent directory of local repo clones (default `~/code`). The `github` plugin matches a GitHub `owner/repo` identity against verified GitHub remotes in these checkouts and AoE registered projects. It prefers one registered match, resolves bare registrations through their default-branch worktree, and leaves missing or ambiguous identities unresolved rather than guessing from a folder name or scan order. |
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
@@ -226,19 +226,24 @@ plugin-wide grant may let any configured agent bypass interactive approval.
 Grant it only if that behavior is acceptable; otherwise choose an AoE-reviewed
 interactive ACP agent in the **New session agent** setting.
 
-Each card's **New session** action creates a structured ACP session for the
-item's repository. Items without a repository create scratch sessions, except
-GitHub pull requests, which fail closed rather than create a scratch session.
-The repository is never inferred from whichever AoE session displays the pane.
-It names the session after the Attention item and sends its source-generated
-initial task through `sessions.create.initial_turn` as `{"text": "…"}` when
-nonblank; otherwise it omits `initial_turn`. For GitHub pull requests, it also
-requests an AoE-managed worktree on the PR's head branch in that repository. Missing
-repository or head-branch data fails instead of creating a scratch or
-default-branch session; the branch must be available in the repository and
-not already checked out in any worktree. This requires an AoE host version
-that supports `sessions.create.worktree_branch`; older hosts reject the
-request rather than use another checkout.
+Each card's **New session** action resolves the GitHub repository by owner/name
+from verified GitHub remotes, including upstream remotes. A unique registered
+project in the host session's profile is preferred over unregistered copies;
+within the chosen candidates, `origin` takes precedence over other remotes.
+For a registered bare repository, the resolver verifies identity through its
+default-branch worktree but passes the registered project path to AoE. Missing
+or ambiguous matches fail closed: Attention does not guess from a same-named
+folder or create a scratch session.
+
+Attention invokes AoE's worktree-aware `add` command with the resolved project
+path, a deterministic action branch, the host session's profile and group, the
+configured agent, and the item title. For pull requests, the source-generated
+initial task tells the agent to check out the PR head branch, while AoE creates
+the worktree from the PR base branch. Attention sends that task with
+`aoe acp prompt`, retrying transient worker-startup responses for up to 30
+seconds. Other prompt errors fail immediately; if AoE cannot create the
+worktree or accept the prompt, Attention reports the failure and never falls
+back to a shared checkout.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an

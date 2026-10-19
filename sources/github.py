@@ -965,49 +965,135 @@ def _fetch_notification_delta(since=None, current_login=None):
         ],
         poll_started.isoformat().replace("+00:00", "Z"),
     )
-def _build_repo_dir_index(code_dir):
-    """Map "owner/repo" (lowercased) -> the actual local directory name
-    under code_dir, derived from each subdirectory's own `git remote
-    origin`. Intentionally not a maintained/committed mapping -- a repo
-    cloned under a shorthand directory name still resolves, with nothing
-    to keep in sync. Each subdirectory's `git remote` invocation is its
-    own subprocess spawn, independent of every other one, so they run
-    concurrently -- a code_dir with a hundred checkouts would otherwise
-    mean a hundred sequential process spawns before the dashboard can
-    even render.
-    """
-    index = {}
+def _github_remote_identity(url):
+    match = re.fullmatch(
+        r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+        r"([^/\s:]+/[^/\s]+?)(?:\.git)?/?",
+        url, re.IGNORECASE,
+    )
+    return match.group(1).casefold() if match else None
+
+
+def _registered_repo_paths():
+    # AoE registries are profile-scoped. Without the host profile, avoid using
+    # the shell's unrelated default profile.
+    profile = os.environ.get("AGENT_OF_EMPIRES_PROFILE")
+    if not profile:
+        return set()
+    command = ["aoe", "--profile", profile, "project", "list", "--json"]
     try:
-        entries = [e for e in os.scandir(code_dir) if e.is_dir()]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+        projects = json.loads(result.stdout) if result.returncode == 0 else []
+        return {
+            os.path.expanduser(project["path"])
+            for project in projects
+            if isinstance(project, dict) and isinstance(project.get("path"), str)
+            and project["path"]
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return set()
+
+def _build_repo_dir_index(code_dir):
+    """Resolve GitHub identities to a checkout and its AoE project path.
+
+    For bare projects, the default-branch worktree verifies the checkout.
+    """
+    code_dir = os.path.expanduser(code_dir)
+    if not os.path.isabs(code_dir):
+        code_dir = os.path.join(os.getcwd(), code_dir)
+    registered = _registered_repo_paths()
+    paths = {}
+    for path in sorted(registered):
+        paths.setdefault(os.path.realpath(path), path)
+    try:
+        for entry in os.scandir(code_dir):
+            if entry.is_dir() and not entry.name.startswith("."):
+                path = entry.path
+                paths.setdefault(os.path.realpath(path), path)
     except OSError:
-        return index
-    if not entries:
-        return index
-    # Strip any inherited GIT_DIR/GIT_WORK_TREE/etc: if the caller's
-    # environment has one set (e.g. running inside another git hook),
+        pass
+    registered_paths = {
+        os.path.realpath(path) for path in registered
+    }
+    if not paths:
+        return {}
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
-    def _origin_for(entry):
-        try:
-            res = subprocess.run(
-                ["git", "-C", entry.path, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=2, env=git_env,
+    def inspect(candidate):
+        path, project_path = candidate
+        def git(*args):
+            result = subprocess.run(
+                ["git", "-C", path, *args], capture_output=True, text=True,
+                timeout=2, env=git_env,
             )
-            if res.returncode != 0:
+            return result.stdout.strip() if result.returncode == 0 else ""
+
+        try:
+            bare = git("rev-parse", "--is-bare-repository")
+            if bare not in {"true", "false"}:
                 return None
-            m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", res.stdout.strip())
-            return (m.group(1).lower(), entry.name) if m else None
-        except Exception:
+            checkout = project_path
+            if bare == "true":
+                head = git("symbolic-ref", "HEAD")
+                worktrees = git("worktree", "list", "--porcelain", "-z")
+                matches = []
+                for record in worktrees.split("\0\0"):
+                    fields = record.split("\0")
+                    if head and f"branch {head}" in fields:
+                        matches.extend(field[9:] for field in fields if field.startswith("worktree "))
+                if len(matches) != 1:
+                    return None
+                checkout = os.path.abspath(matches[0])
+                result = subprocess.run(
+                    ["git", "-C", checkout, "rev-parse", "--show-toplevel"],
+                    capture_output=True, text=True, timeout=2, env=git_env,
+                )
+                if result.returncode or os.path.realpath(result.stdout.strip()) != os.path.realpath(checkout):
+                    return None
+            elif os.path.realpath(git("rev-parse", "--show-toplevel")) != os.path.realpath(path):
+                return None
+            identities = set()
+            origin_identities = set()
+            for remote in git("remote").splitlines():
+                for url in git("remote", "get-url", "--all", remote).splitlines():
+                    identity = _github_remote_identity(url)
+                    if identity:
+                        identities.add(identity)
+                        if remote == "origin":
+                            origin_identities.add(identity)
+            return path, project_path, checkout, identities, origin_identities
+        except (OSError, subprocess.SubprocessError):
             return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(entries), _MAX_WORKERS)) as pool:
-        for result in pool.map(_origin_for, entries):
-            if result:
-                index[result[0]] = result[1]
+    candidates = {}
+    candidate_paths = [(path, paths[path]) for path in sorted(paths)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(paths), _MAX_WORKERS)) as pool:
+        for result in pool.map(inspect, candidate_paths):
+            if result is None:
+                continue
+            path, project, checkout, identities, origin_identities = result
+            for identity in identities:
+                candidates.setdefault(identity, {})[path] = (
+                    checkout, identity in origin_identities, project,
+                )
+    index = {}
+    for identity, projects in candidates.items():
+        preferred = {path: value for path, value in projects.items() if path in registered_paths}
+        choices = preferred or projects
+        origin_choices = {path: value for path, value in choices.items() if value[1]}
+        choices = origin_choices or choices
+        if len(choices) == 1:
+            _, (checkout, _, project) = next(iter(choices.items()))
+            index[identity] = {
+                "repo_path": checkout, "repo_project_path": project,
+            }
     return index
 
 def _repo_dir_index(code_dir):
-    key = os.path.realpath(os.path.abspath(os.path.expanduser(code_dir)))
+    key = (
+        os.path.realpath(os.path.abspath(os.path.expanduser(code_dir))),
+        os.environ.get("AGENT_OF_EMPIRES_PROFILE"),
+    )
     with _repo_dir_indexes_lock:
         index = _repo_dir_indexes.get(key)
         if index is None:
@@ -1280,10 +1366,7 @@ def fetch(config):
         return []
 
     code_dir = config.get("codeDir", str(Path.home() / "code"))
-    # Match each repo's actual `git remote origin` against local
-    # directories under code_dir, so a repo cloned under a shorthand name
-    # still resolves. One-time scan, only when there's something to
-    # resolve.
+    # Shared identity resolution supplies both CLI actions and pane starts.
     repo_dir_index = _repo_dir_index(code_dir)
 
     items = []
@@ -1369,17 +1452,28 @@ def fetch(config):
             else "other"
         )
 
-        dir_name = repo_dir_index.get(repo_name.lower(), repo_name.split("/")[-1])
-        repo_path = os.path.join(code_dir, dir_name)
+        repository = repo_dir_index.get(repo_name.casefold(), {})
+        repo_path = repository.get("repo_path", "")
+        repo_project_path = repository.get("repo_project_path", "")
+        repo_resolution_error = (
+            "" if repo_path else f"No unique local GitHub checkout for {repo_name}."
+        )
         slug = slugify(title)
-
         session_prompt = _session_prompt(gtype, g.get("attention_reasons", []))
+
+        head_branch = g.get("headRefName", "")
+        if kind == "pull_request" and head_branch:
+            session_prompt = (
+                f"Check out the `{head_branch}` branch in this worktree. "
+                f"{session_prompt}"
+            )
         record = {
             "url": url,
             "number": number,
             "id": number,
             "repo_path": repo_path,
             "slug": slug,
+            "repo_project_path": repo_project_path,
             "repo": repo_name,
             "context": repo_name,
             "title": title,
@@ -1449,6 +1543,8 @@ def fetch(config):
             "base_branch": g.get("baseRefName", ""),
             "head_branch": g.get("headRefName", ""),
             "repo_path": repo_path,
+            "repo_resolution_error": repo_resolution_error,
+            "repo_project_path": repo_project_path,
             "session_prompt": session_prompt,
             "association_keys": [
                 f"github:{reference.get('repository', {}).get('nameWithOwner', repo_name).lower()}#{reference.get('number')}"
