@@ -32,7 +32,7 @@ _NOTIFICATION_REASONS = {
 _PR_DETAIL_FIELDS = (
     "author,state,headRefOid,mergeable,mergeStateStatus,reviewDecision,"
     "statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,"
-    "reviewRequests,baseRefName,headRefName"
+    "reviewRequests,assignees,baseRefName,headRefName"
 )
 _PR_GRAPHQL_SELECTION = """
 pullRequest(number: %d) {
@@ -45,6 +45,9 @@ pullRequest(number: %d) {
   isDraft
   baseRefName
   headRefName
+  assignees(first: 100) {
+    nodes { login }
+  }
   reviewRequests(first: 50) {
     pageInfo { hasNextPage }
     nodes {
@@ -63,7 +66,7 @@ pullRequest(number: %d) {
       state
       body
       submittedAt
-      author { login }
+      author { login __typename }
   }
   }
   discussionComments: comments(first: 100) {
@@ -157,8 +160,15 @@ def _normalize_pr_detail(detail):
         if isinstance(closing_payload, dict)
         else closing_payload
     )
+    assignees_payload = detail.get("assignees") or []
+    assignees = (
+        assignees_payload.get("nodes", [])
+        if isinstance(assignees_payload, dict)
+        else assignees_payload
+    )
     return {
         "author": detail.get("author"),
+        "assignees": assignees,
         "state": detail.get("state"),
         "headRefOid": detail.get("headRefOid"),
         "mergeStateStatus": detail.get("mergeStateStatus"),
@@ -1008,6 +1018,37 @@ def _repo_dir_index(code_dir):
 
 
 
+def _review_handled_by_other(detail, current_login):
+    if not isinstance(detail, dict) or not isinstance(current_login, str) or not current_login:
+        return False
+    current_login = current_login.casefold()
+    for assignee in detail.get("assignees") or []:
+        login = assignee.get("login") if isinstance(assignee, dict) else None
+        if isinstance(login, str) and login and login.casefold() != current_login:
+            return True
+
+    excluded = current_login
+    for review in detail.get("latestReviews") or []:
+        if not isinstance(review, dict) or review.get("state") not in {
+            "APPROVED", "CHANGES_REQUESTED", "COMMENTED",
+        }:
+            continue
+        author = review.get("author") or {}
+        if not isinstance(author, dict):
+            continue
+        login = author.get("login")
+        if (
+            isinstance(login, str)
+            and login
+            and login.casefold() != excluded
+            and author.get("__typename") != "Bot"
+            and not author.get("is_bot")
+            and not login.casefold().endswith("[bot]")
+        ):
+            return True
+    return False
+
+
 def _fetch_search_items(config, current_login=None):
     github = config.get("github", {}) if isinstance(config, dict) else {}
     track_authors = github.get("trackAuthors", [])
@@ -1151,6 +1192,8 @@ def _fetch_search_items(config, current_login=None):
             and isinstance(author, str)
             and author.casefold() == current_login.casefold()
         ):
+            continue
+        if _review_handled_by_other(detail, current_login):
             continue
         _apply_pr_detail(pr, detail)
         pr["type"] = "review_request"
