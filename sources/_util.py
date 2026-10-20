@@ -27,7 +27,13 @@ def slugify(text, max_len=50):
 def run_cmd(cmd):
     try:
         print(f"Running: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
         return True
     except Exception as e:
         print(f"Command failed: {e}")
@@ -208,6 +214,7 @@ def resolve_configured_actions(configured_actions, record):
             cmd = []
         payload = {
             "command": cmd,
+            "terminal": a.get("terminal", False),
             "background": a.get("background", False),
         }
         input_specs = _resolve_input_specs(a, a.get("label", ""), record)
@@ -224,7 +231,9 @@ def resolve_configured_actions(configured_actions, record):
 
 
 def prompt_for_input(spec):
-
+    interactive = getattr(input, "prompt_spec", None)
+    if callable(interactive):
+        return interactive(spec)
     prompt = spec.get("prompt") or "Input"
     choices = spec.get("choices")
     default = spec.get("default")

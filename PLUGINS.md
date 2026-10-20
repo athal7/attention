@@ -195,7 +195,8 @@ an `actions` array in their config section to attach non-inherent custom actions
       {
         "key": "l",
         "label": "lumen",
-        "command": ["lumen", "diff", "{url}"]
+        "command": ["lumen", "diff", "{url}"],
+        "terminal": true
       },
       {
         "key": "p",
@@ -270,12 +271,15 @@ Every text field (`status`/`context`/`title`/`details`/`id`, each
 `indicators` value, and each action's `command` token) is a template: plain
 text is used as-is, and `{dotted.path}` substitutes that field from the record
 (missing paths become `""`). `weight` is a plain int, or a `{path}`
-template parsed as one (falling back to `50` if that fails). An action
-may set `"background": true` to dispatch via `dispatch_background`
-(fire-and-forget, e.g. starting a long-running session) instead of the
-default `run_cmd` (blocks, prints failures). Provider actions support
-the same optional `"input"` or `"inputs"` declarations as bundled
-plugins: text or pick-one prompts fill `{input}` or
+template parsed as one (falling back to `50` if that fails).
+
+An action may set `"terminal": true` to run in a separate interactive terminal
+window when the platform supports it, or `"background": true` to dispatch via
+`dispatch_background` instead of the default blocking `run_cmd`. When both are
+set, `"terminal"` takes precedence.
+
+Provider actions support the same optional `"input"` or `"inputs"` declarations
+as bundled plugins: text or pick-one prompts fill `{input}` or
 `{input.<name>}` placeholders in the command.
 
 An action may also set `"wip": true` to mark the item work in progress

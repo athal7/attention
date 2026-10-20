@@ -3,13 +3,15 @@
 import importlib.util
 import json
 import os
-from pathlib import Path
+import queue
 import select
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
@@ -23,6 +25,13 @@ def _first_item_card(payload):
         block for block in worker._walk_blocks(payload["blocks"])
         if block.get("kind") == "section" and block.get("collapsible") is not True
     )
+
+def _item_action_blocks(card):
+    return [
+        block for block in worker._walk_blocks(card["children"])
+        if block.get("kind") == "action"
+    ]
+
 
 def _receive_json_line(stream, buffer, timeout, timeout_message):
     deadline = time.monotonic() + timeout
@@ -59,7 +68,7 @@ class PanePayloadTests(unittest.TestCase):
             "kind": "note", "text": "Source refresh failed; showing cached items."
         })
 
-    def test_cards_are_compact_and_the_primary_row_opens_the_source(self):
+    def test_cards_expose_every_action_and_primary_row_opens_the_source(self):
         item = {
             "_plugin": "github", "status": "NEEDS ATTENTION", "context": "private-repo",
             "title": "Ship release", "details": "Review required", "weight": 99,
@@ -73,10 +82,10 @@ class PanePayloadTests(unittest.TestCase):
                 {"_plugin": "generic", "key": "2", "label": "Prompt", "payload": {"command": ["echo"], "inputs": [{"prompt": "secret-prompt"}]}},
                 {"_plugin": "generic", "key": "3", "label": "Run", "payload": {"command": ["echo", "secret-command"]}},
                 {"_plugin": "github", "key": "l", "label": "Lumen",
-                 "payload": {"command": ["/opt/homebrew/bin/lumen", "diff", "https://private.example/issue"]}},
+                 "payload": {"command": ["/opt/homebrew/bin/lumen", "diff", "https://private.example/issue"], "terminal": True}},
             ],
         }
-        tokens = iter(["opaque-run", "opaque-session", "opaque-filter"])
+        tokens = iter(f"opaque-{index}" for index in range(20))
         payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
         card = _first_item_card(payload)
         self.assertEqual(set(card), {"kind", "boxed", "children"})
@@ -84,21 +93,28 @@ class PanePayloadTests(unittest.TestCase):
         row = card["children"][0]
         self.assertEqual(row["icon"], "git-branch")
         self.assertEqual(row["href"], "https://example.com/issue")
-        button_group = card["children"][1]
-        buttons = button_group["children"]
-        self.assertEqual([button["label"] for button in buttons], ["Run", "New session"])
-        self.assertEqual([button["params"] for button in buttons], [
-            {"token": "opaque-run"}, {"token": "opaque-session"},
+        buttons = _item_action_blocks(card)
+        self.assertEqual([button["label"] for button in buttons], [
+            "Merge", "Comment", "Prompt", "Run", "Lumen", "New session",
         ])
-        self.assertEqual(buttons[-1]["method"], "attention.new_session")
-        self.assertEqual(set(actions), {"opaque-filter", "opaque-run", "opaque-session"})
-        self.assertEqual(actions["opaque-run"], item["actions"][4])
-        self.assertEqual(actions["opaque-session"], {
-            "_aoe_operation": "new_session", "title": "Attention: Ship release",
-            "repo_path": "/repositories/private-repo",
-            "project_path": "/registered/private-repo",
+        self.assertEqual(
+            [button["method"] for button in buttons],
+            ["attention.action"] * 5 + ["attention.new_session"],
+        )
+        action_tokens = [button["params"]["token"] for button in buttons]
+        self.assertEqual([actions[token] for token in action_tokens[:5]],
+                         item["actions"][1:])
+        self.assertEqual(actions[action_tokens[-1]]["_aoe_operation"], "new_session")
+        session_action = actions[action_tokens[-1]]
+        self.assertEqual(session_action["label"], "New session")
+        self.assertEqual(session_action["params"], {
+            "title": "Attention: Ship release",
+            "path": "/registered/private-repo",
+            "scratch": False,
+            "is_pull_request": False,
         })
-        self.assertEqual(actions["opaque-filter"]["filter_kind"], "source")
+        self.assertTrue(any(action.get("filter_kind") == "source"
+                            for action in actions.values()))
         rendered = json.dumps(payload)
         for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
             self.assertNotIn(secret, rendered)
@@ -118,18 +134,103 @@ class PanePayloadTests(unittest.TestCase):
         tokens = iter(str(index) for index in range(20))
         _, actions = worker.build_pane(items, token_factory=lambda: next(tokens))
         sessions = {
-            action["title"]: action for action in actions.values()
+            action["params"]["title"]: action for action in actions.values()
             if action.get("_aoe_operation") == "new_session"
         }
         pr_action = sessions["Attention: PR"]
-        self.assertEqual(pr_action["project_path"], "/registered/repo")
-        self.assertEqual(pr_action["head_branch"], "feature/pr-42")
-        self.assertEqual(pr_action["base_branch"], "main")
-        self.assertTrue(pr_action["is_pull_request"])
-        issue_action = sessions["Attention: Issue"]
-        self.assertEqual(issue_action["project_path"], "/registered/repo")
-        self.assertNotIn("head_branch", issue_action)
-        self.assertNotIn("base_branch", issue_action)
+        self.assertEqual(pr_action["params"]["path"], "/registered/repo")
+        self.assertEqual(sessions["Attention: Issue"]["params"]["path"], "/registered/repo")
+        self.assertTrue(pr_action["params"]["is_pull_request"])
+        self.assertEqual(pr_action["params"]["worktree_branch"], "feature/pr-42")
+        self.assertEqual(pr_action["params"]["base_branch"], "main")
+        self.assertNotIn("worktree_branch", sessions["Attention: Issue"]["params"])
+
+    def test_dashboard_page_trims_low_priority_entries_to_payload_limit(self):
+        items = [
+            {"title": "Highest priority", "details": "h" * 4000, "weight": 100},
+            {"title": "Middle priority", "details": "m" * 4000, "weight": 50},
+            {"title": "Lowest priority", "details": "l" * 4000, "weight": 1},
+        ]
+        page = worker.dashboard_payload(items, "2026-10-19 12:00:00 UTC", [])
+        with patch.object(worker, "MAX_PANE_BYTES", 6000):
+            fitted = worker._fit_dashboard(page)
+        self.assertLessEqual(
+            len(json.dumps(fitted, separators=(",", ":")).encode("utf-8")),
+            worker.MAX_PANE_BYTES,
+        )
+        self.assertEqual([item["title"] for item in fitted["items"]],
+                         ["Highest priority"])
+        self.assertEqual(fitted["omitted_items"], 2)
+
+    def test_dashboard_page_omits_a_single_card_that_exceeds_the_payload_limit(self):
+        item = {
+            "title": "Too many actions",
+            "actions": [
+                {"key": str(index), "label": f"Action {index} " + "x" * 80,
+                 "payload": {"command": ["echo", str(index)]}}
+                for index in range(100)
+            ],
+        }
+        page = worker.dashboard_payload([item], "2026-10-19 12:00:00 UTC", [])
+        with patch.object(worker, "MAX_PANE_BYTES", 6000):
+            fitted = worker._fit_dashboard(page)
+        encoded = json.dumps(fitted, separators=(",", ":")).encode("utf-8")
+        self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
+        self.assertEqual(fitted["items"], [])
+        self.assertEqual(fitted["omitted_items"], 1)
+
+    def test_configured_session_action_replaces_generated_session_action(self):
+        for label in ("session", "New session"):
+            with self.subTest(label=label):
+                session_action = {
+                    "_plugin": "generic", "key": "s", "label": label,
+                    "payload": {"command": ["aoe", "add"]},
+                }
+                item = {
+                    "_plugin": "generic", "title": "Existing session flow",
+                    "repo_path": "/repo", "actions": [session_action],
+                }
+                tokens = iter(str(index) for index in range(20))
+                payload, action_tokens = worker.build_pane(
+                    [item], token_factory=lambda: next(tokens),
+                )
+                card = _first_item_card(payload)
+                buttons = _item_action_blocks(card)
+                pane_label = label[:1].upper() + label[1:]
+                self.assertEqual([button["label"] for button in buttons], [pane_label])
+                self.assertEqual(buttons[0]["method"], "attention.action")
+                self.assertIs(action_tokens[buttons[0]["params"]["token"]], session_action)
+                self.assertFalse(any(
+                    action.get("_aoe_operation") == "new_session"
+                    for action in action_tokens.values()
+                ))
+
+                page = worker.dashboard_payload(
+                    [item], "2026-10-19 12:00:00 UTC", [], action_tokens,
+                )
+                self.assertEqual([action["label"] for action in page["items"][0]["actions"]],
+                                 [label])
+                self.assertEqual(page["items"][0]["actions"][0]["method"], "attention.action")
+
+    def test_dashboard_page_exposes_actions_with_prompts(self):
+        item = {
+            "_plugin": "github", "kind": "pull_request", "title": "Review PR",
+            "_is_own_pr": False,
+            "actions": [
+                {"label": "Open", "payload": {"kind": "open"}},
+                {"label": "Approve", "payload": {"kind": "approve"}},
+                {"label": "Comment", "payload": {"kind": "comment"}},
+                {"label": "Prompt", "payload": {"command": ["echo"], "inputs": [
+                    {"name": "comment", "prompt": "Review note"},
+                ]}},
+                {"label": "Session", "payload": {"command": ["aoe", "add"]}},
+            ],
+        }
+        page = worker.dashboard_payload([item], "2026-10-19 12:00:00 UTC", [])
+        actions = page["items"][0]["actions"]
+        self.assertEqual([action["label"] for action in actions],
+                         ["Open", "Approve", "Comment", "Prompt", "Session"])
+        self.assertTrue(all(action["method"] == "attention.action" for action in actions))
 
     def test_source_and_provider_filters_hide_only_matching_items(self):
         items = [
@@ -362,7 +463,7 @@ class PanePayloadTests(unittest.TestCase):
         self.assertNotIn("approve", json.dumps(payload).casefold())
         self.assertEqual(set(actions), {"run-token", "session-token", "filter-token"})
 
-    def test_each_item_shows_at_most_one_source_action_plus_new_session(self):
+    def test_each_item_shows_all_configured_actions_plus_new_session(self):
         item = {
             "title": "Build",
             "actions": [
@@ -370,13 +471,20 @@ class PanePayloadTests(unittest.TestCase):
                 for label in ("First", "Second", "Third")
             ],
         }
-        tokens = iter(["first-token", "session-token"])
+        tokens = iter(["first-token", "second-token", "third-token", "session-token"])
         payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
         card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        buttons = card["children"][1]["children"]
-        self.assertEqual([button["label"] for button in buttons], ["First", "New session"])
-        self.assertLessEqual(len(buttons), 2)
-        self.assertEqual(set(actions), {"first-token", "session-token"})
+        buttons = _item_action_blocks(card)
+        self.assertEqual([button["label"] for button in buttons],
+                         ["First", "Second", "Third", "New session"])
+        self.assertEqual([actions[button["params"]["token"]]
+                          for button in buttons[:3]], item["actions"])
+        self.assertEqual([button["method"] for button in buttons],
+                         ["attention.action"] * 3 + ["attention.new_session"])
+        self.assertEqual(set(actions), {
+            "first-token", "second-token", "third-token", "session-token",
+        })
+
 
     def test_command_based_open_uses_the_linked_row_without_an_open_button(self):
         open_action = {
@@ -395,6 +503,28 @@ class PanePayloadTests(unittest.TestCase):
         buttons = card["children"][1]["children"]
         self.assertEqual([button["label"] for button in buttons], ["New session"])
         self.assertEqual(actions["open-token"], open_action)
+
+    def test_secondary_open_action_remains_available_as_a_button(self):
+        first_open = {
+            "label": "Open", "payload": {"kind": "open", "url": "https://example.com/build"}
+        }
+        secondary_open = {
+            "label": "Open docs", "payload": {"kind": "open", "url": "https://example.com/docs"}
+        }
+        tokens = iter(["docs-token", "session-token"])
+        payload, actions = worker.build_pane(
+            [{"title": "Build", "url": "https://example.com/build",
+              "actions": [first_open, secondary_open]}],
+            token_factory=lambda: next(tokens),
+        )
+        card = next(block for block in payload["blocks"] if block["kind"] == "section")
+        row = card["children"][0]
+        self.assertEqual(row["href"], "https://example.com/build")
+        buttons = _item_action_blocks(card)
+        self.assertEqual([button["label"] for button in buttons],
+                         ["Open docs", "New session"])
+        self.assertIs(actions[buttons[0]["params"]["token"]], secondary_open)
+
 
     def test_unsafe_source_urls_are_not_rendered_as_links(self):
         payload = worker.pane_payload([{"title": "Unsafe", "url": "javascript:alert(1)"}])
@@ -517,34 +647,13 @@ class GitHubRepositoryResolutionTests(unittest.TestCase):
                 "repo_project_path": str(bare.resolve()),
             })
 class SessionCreationTests(unittest.TestCase):
-    def test_manifest_requests_unattended_session_creation(self):
+    def test_plugin_manifest_uses_cli_spawning_without_structured_session_grants(self):
         import tomllib
 
         manifest = tomllib.loads((ROOT / "aoe-plugin.toml").read_text())
-        self.assertIn("session.create", manifest["capabilities"])
-        self.assertIn("session.prompt", manifest["capabilities"])
-        self.assertIn("session.unattended", manifest["capabilities"])
-
-    def test_missing_agent_setting_does_not_request_session_creation(self):
-        request = {
-            "token": "single-use-token",
-            "session_id": "s1",
-            "action": {
-                "title": "Attention: Review PR",
-                "project_path": "/repos/app",
-            },
-        }
-        cli_sessions = json.dumps([{"id": "s1", "profile": "test-profile", "group": ""}])
-        with patch.dict(worker.live_sessions_by_id, {"s1": {"id": "s1"}}):
-            with patch.object(worker.subprocess, "run", return_value=subprocess.CompletedProcess(
-                args=["aoe"], returncode=0, stdout=cli_sessions, stderr="",
-            )) as run:
-                with patch.object(worker, "rpc", return_value={"value": None}) as rpc:
-                    with self.assertRaisesRegex(RuntimeError, "Choose an ACP agent"):
-                        worker.create_session(request)
-        rpc.assert_called_once_with("config.get", {"key": "agent_id"})
-        run.assert_called_once()
-
+        self.assertIn("process.spawn", manifest["capabilities"])
+        for capability in ("session.create", "session.prompt", "session.unattended"):
+            self.assertNotIn(capability, manifest["capabilities"])
 
 class AttentionSourceTests(unittest.TestCase):
     def test_real_attention_module_reads_config_without_stale_module_cache(self):
@@ -679,6 +788,42 @@ class InteractiveActionTests(unittest.TestCase):
         run_terminal.assert_called_once_with(command)
         run_cmd.assert_not_called()
 
+    def test_configured_terminal_setting_runs_through_the_terminal_action(self):
+        config = [{
+            "key": "l",
+            "label": "Lumen",
+            "command": ["lumen", "diff", "{url}"],
+            "terminal": True,
+        }]
+        action = self.util.resolve_configured_actions(
+            config, {"url": "https://example.com/compare/main"},
+        )[0]
+        command = ["lumen", "diff", "https://example.com/compare/main"]
+        with patch.object(self.util, "run_terminal", return_value=True) as run_terminal, \
+             patch.object(self.util, "run_cmd") as run_cmd:
+            self.assertTrue(self.util.run_configured_action(action["payload"]))
+        run_terminal.assert_called_once_with(command)
+        run_cmd.assert_not_called()
+
+    def test_run_cmd_handles_redirected_output_and_failures(self):
+        import contextlib
+        import io
+
+        output = io.StringIO()
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
+            self.assertTrue(self.util.run_cmd([
+                sys.executable, "-c", "print('command output')",
+            ]))
+            self.assertFalse(self.util.run_cmd([
+                sys.executable, "-c",
+                "import sys; print('partial output'); print('failure detail', file=sys.stderr); sys.exit(7)",
+            ]))
+        self.assertIn("command output", output.getvalue())
+        self.assertIn("partial output", output.getvalue())
+        self.assertIn("Command failed:", output.getvalue())
+        self.assertIn("failure detail", diagnostics.getvalue())
+
     def test_macos_terminal_shell_quotes_configured_arguments(self):
         url = "https://example.com/compare/main; touch /tmp/marker"
         with patch.object(self.util.sys, "platform", "darwin"), \
@@ -710,191 +855,299 @@ class InteractiveActionTests(unittest.TestCase):
 
 
 class WorkerProtocolTests(unittest.TestCase):
-    def test_pr_session_refuses_missing_repository_or_head_branch(self):
+    def test_pr_session_requires_repository_path_and_valid_head_branch(self):
         cases = (
             (
-                "missing repository",
-                {"is_pull_request": True, "head_branch": "feature/pr-42"},
-                "no AoE project path",
+                {"title": "PR", "path": "", "scratch": False,
+                 "is_pull_request": True, "worktree_branch": "feature/pr-42"},
+                "no repository path",
             ),
             (
-                "missing head branch",
-                {"is_pull_request": True, "project_path": "/repos/app"},
+                {"title": "PR", "path": "/repos/app", "scratch": False,
+                 "is_pull_request": True},
                 "no valid head branch",
             ),
             (
-                "malformed head branch",
-                {
-                    "is_pull_request": True,
-                    "project_path": "/repos/app",
-                    "head_branch": "feature/pr-42 ",
-                },
+                {"title": "PR", "path": "/repos/app", "scratch": False,
+                 "is_pull_request": True, "worktree_branch": "feature/pr-42 "},
                 "no valid head branch",
+            ),
+            (
+                {"title": "PR", "path": "/repos/app", "scratch": False,
+                 "is_pull_request": True, "worktree_branch": "feature/pr-42",
+                 "base_branch": "main "},
+                "no valid target branch",
             ),
         )
-        with patch.object(worker, "rpc") as rpc:
-            for label, action, message in cases:
-                with self.subTest(label=label):
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        worker.create_session({
-                            "action": action, "session_id": "s1", "token": "token",
-                        })
-            rpc.assert_not_called()
+        for options, message in cases:
+            with self.subTest(options=options):
+                self.assertIn(message, worker._session_options_error(options))
 
-    def test_new_session_action_creates_an_isolated_worktree_session(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            attention = root / "attention"
-            repo = root / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "README").write_text("fixture\n")
-            subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "fixture"], check=True, capture_output=True)
-            state_path = root / "aoe-state.json"
-            worktrees = root / "worktrees"
-            state_path.write_text(json.dumps({
-                "sessions": [{"id": "s1", "profile": "test-profile", "group": "test-group"}],
-                "repo": str(repo), "worktrees": str(worktrees),
-            }))
-            bin_dir = root / "bin"
-            bin_dir.mkdir()
-            aoe = bin_dir / "aoe"
-            aoe.write_text("""#!/usr/bin/env python3
-import json, os, subprocess, sys
-state_path = os.environ["ATTENTION_AOE_STATE"]
-state = json.load(open(state_path))
-args = sys.argv[1:]
-profile = None
-if args[:1] == ["--profile"]:
-    profile, args = args[1], args[2:]
-if args[:3] == ["list", "--all", "--json"]:
-    print(json.dumps(state["sessions"]))
-elif args[:3] == ["project", "list", "--json"]:
-    print(json.dumps([{"path": state["repo"]}]) if profile == "test-profile" else "[]")
-elif args[:1] == ["add"]:
-    repo = args[1]
-    branch = args[args.index("--worktree") + 1]
-    title = args[args.index("--title") + 1]
-    group = args[args.index("--group") + 1]
-    agent = args[args.index("--agent") + 1]
-    path = os.path.join(state["worktrees"], branch.replace("/", "_"))
-    os.makedirs(state["worktrees"], exist_ok=True)
-    subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, path], check=True, capture_output=True)
-    state["created"] = {"path": path, "branch": branch, "title": title, "group": group,
-                        "agent": agent, "profile": profile, "repo": repo}
-    state["sessions"].append({"id": "created-session", "profile": profile,
-                              "worktree": {"branch": branch, "main_repo_path": os.path.realpath(repo)}})
-    with open(state_path, "w") as f: json.dump(state, f)
-elif args[:2] == ["acp", "status"]:
-    pass
-elif args[:2] == ["acp", "prompt"]:
-    state["prompt_attempts"] = state.get("prompt_attempts", 0) + 1
-    with open(state_path, "w") as f: json.dump(state, f)
-    if state["prompt_attempts"] == 1:
-        print("structured view session not found on the daemon", file=sys.stderr)
-        raise SystemExit(1)
-    state["prompt"] = args[-1]
-    with open(state_path, "w") as f: json.dump(state, f)
-else:
-    raise SystemExit("unexpected aoe command: " + repr(args))
-""")
-            aoe.chmod(0o755)
-            attention.write_text(
-                "import os\n"
-                "def load_config(): return {}\n"
-                "def build_prioritized_items(config):\n"
-                "    assert os.environ.get('AGENT_OF_EMPIRES_PROFILE') == 'test-profile'\n"
-                "    return [{'status':'now','context':'repo','title':'Fix regression','details':'ready',"
-                "'_plugin':'github','kind':'pull_request','head_branch':'feature/pr-42',"
-                "'base_branch':'main','repo_path':" + repr(str(repo)) + ","
-                "'repo_project_path':" + repr(str(repo)) + ","
-                "'session_prompt':'Review this PR; check out feature/pr-42.'}]\n"
-            )
-            source = (ROOT / "aoe_worker.py").read_text().replace(
-                'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
-                f'ATTENTION_PATH = Path({str(attention)!r})',
-            )
-            worker_path = root / "aoe_worker.py"
-            worker_path.write_text(source)
-            env = os.environ.copy()
-            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
-            env["ATTENTION_AOE_STATE"] = str(state_path)
-            proc = subprocess.Popen(
-                [sys.executable, str(worker_path)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-            )
-            stdout_buffer = bytearray()
+    def test_github_repository_resolution_failure_is_fail_closed(self):
+        action = worker._new_session_action({
+            "_plugin": "github",
+            "kind": "issue",
+            "title": "Issue",
+            "repo_path": "",
+            "repo_project_path": "",
+            "repo_resolution_error": "No unique local GitHub checkout for repo.",
+        })
+        self.assertFalse(action["params"]["scratch"])
+        self.assertEqual(action["params"]["repo_resolution_error"],
+                         "No unique local GitHub checkout for repo.")
+        self.assertIn("No unique local GitHub checkout",
+                      worker._session_options_error(action["params"]))
+        results = queue.Queue()
+        with patch.object(worker.subprocess, "run") as run:
+            worker.start_new_session("token", action["params"], results)
+            event = results.get(timeout=3)
+        run.assert_not_called()
+        self.assertFalse(event["completed"])
+        self.assertIn("No unique local GitHub checkout", event["error"])
 
-            def receive(timeout=3):
-                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not complete session creation")
+    def test_session_options_allow_project_and_scratch_creation(self):
+        self.assertIsNone(worker._session_options_error({
+            "title": "Project session", "path": "/repo", "scratch": False,
+        }))
+        self.assertIsNone(worker._session_options_error({
+            "title": "Scratch session", "path": "", "scratch": True,
+        }))
+        self.assertIn("project path", worker._session_options_error({
+            "title": "", "path": "", "scratch": False,
+        }))
 
-            def reply(request, result=None):
-                proc.stdin.write((json.dumps({
-                    "jsonrpc": "2.0", "id": request["id"], "result": result or {},
-                }) + "\n").encode())
-                proc.stdin.flush()
 
-            try:
-                listing = receive()
-                self.assertEqual(listing["method"], "sessions.list")
-                reply(listing, {"sessions": [{"id": "s1", "project_path": str(repo)}]})
-                loading = receive()
-                self.assertEqual(loading["method"], "ui.state.set")
-                reply(loading)
-                proc.stdin.write((json.dumps({
-                    "jsonrpc": "2.0", "id": "initial-refresh",
-                    "method": "attention.refresh", "params": {"session_id": "s1"},
-                }) + "\n").encode())
-                proc.stdin.flush()
-                self.assertTrue(receive()["result"]["ok"])
-                snapshot = receive()
-                button = next(
-                    block for block in worker._walk_blocks(snapshot["params"]["payload"]["blocks"])
-                    if block.get("label") == "New session"
-                )
-                reply(snapshot)
-                proc.stdin.write((json.dumps({
-                    "jsonrpc": "2.0", "id": "create-session-action", "method": button["method"],
-                    "params": {**button["params"], "session_id": "s1"},
-                }) + "\n").encode())
-                proc.stdin.flush()
-                self.assertTrue(receive()["result"]["ok"])
-                creating = receive()
-                self.assertIn("Creating session: Attention: Fix regression",
-                              json.dumps(creating["params"]["payload"]))
-                reply(creating)
-                settings = receive()
-                self.assertEqual((settings["method"], settings["params"]),
-                                 ("config.get", {"key": "agent_id"}))
-                reply(settings, {"value": "omp"})
-                completed = receive()
-                self.assertIn("Created session: created-session",
-                              json.dumps(completed["params"]["payload"]))
-                reply(completed)
-                state = json.loads(state_path.read_text())
-                created = state["created"]
-                self.assertEqual(created["repo"], str(repo))
-                self.assertEqual(created["profile"], "test-profile")
-                self.assertEqual(created["group"], "test-group")
-                self.assertEqual(created["agent"], "omp")
-                self.assertEqual(created["branch"], "attention/" + __import__("hashlib").sha256(
-                    button["params"]["token"].encode()).hexdigest()[:20])
-                self.assertEqual(state["prompt_attempts"], 2)
-                self.assertEqual(state["prompt"], "Review this PR; check out feature/pr-42.")
-                self.assertNotEqual(os.path.realpath(created["path"]), os.path.realpath(repo))
-                self.assertEqual(subprocess.run(
-                    ["git", "-C", created["path"], "branch", "--show-current"],
-                    check=True, capture_output=True, text=True,
-                ).stdout.strip(), created["branch"])
-            finally:
-                proc.kill()
-                proc.wait(timeout=5)
-                proc.stdin.close()
-                proc.stdout.close()
-                proc.stderr.close()
+    def test_session_options_accept_cli_profile_group_and_worktree_flags(self):
+        options = {
+            "title": "Worktree session", "path": "/repo", "profile": "qa", "tool": "omp",
+            "group": "reviews", "scratch": False, "worktree_branch": "feature/task",
+            "new_branch": True, "base_branch": "main",
+        }
+        self.assertIsNone(worker._session_options_error(options))
+        self.assertIn("new worktree", worker._session_options_error({
+            **options, "new_branch": False,
+        }))
+        self.assertIn("worktree options", worker._session_options_error({
+            **options, "scratch": True,
+        }))
+
+    def test_new_session_passes_cli_profile_tool_group_and_branch_options(self):
+        commands = []
+        outputs = iter([
+            SimpleNamespace(returncode=0, stdout="ID: created-session\n", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ])
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return next(outputs)
+
+        results = queue.Queue()
+        with patch.object(worker.subprocess, "run", side_effect=run), \
+             patch.object(worker.time, "sleep") as sleep:
+            worker.start_new_session("token", {
+                "profile": "qa", "tool": "omp", "group": "reviews", "title": "Worktree session",
+                "path": "/repo", "scratch": False, "worktree_branch": "feature/task",
+                "new_branch": True, "base_branch": "main", "initial_turn": "Review this task.",
+            }, results)
+            event = results.get(timeout=3)
+        self.assertEqual(commands, [
+            ["aoe", "add", "--profile", "qa", "--tool", "omp",
+             "--title", "Worktree session",
+             "--group", "reviews", "--worktree", "feature/task", "--new-branch",
+             "--base-branch", "main", "/repo"],
+            ["aoe", "session", "start", "--profile", "qa", "created-session"],
+            ["aoe", "send", "--no-revive", "--profile", "qa", "created-session",
+             "Review this task."],
+        ])
+        sleep.assert_called_once_with(worker.INITIAL_MESSAGE_DELAY_SECONDS)
+        self.assertTrue(event["completed"])
+        self.assertEqual(event["session_id"], "created-session")
+    def test_per_item_session_action_is_single_use_and_session_scoped(self):
+        item = {
+            "_plugin": "github", "kind": "pull_request", "title": "Fix regression",
+            "repo_path": "/repositories/target", "head_branch": "feature/pr-42",
+            "session_prompt": "Review this pull request.",
+        }
+        action = worker._new_session_action(item)
+        token = "single-use-session-token"
+        action_tokens = {token: action}
+        consumed = set()
+        requests = queue.Queue()
+        with patch.object(worker, "live_session_ids", {"s1"}, create=True), \
+             patch.object(worker, "action_tokens", action_tokens, create=True), \
+             patch.object(worker, "consumed_session_item_ids", consumed, create=True), \
+             patch.object(worker, "action_requests", requests, create=True), \
+             patch.object(worker, "active_action", None, create=True), \
+             patch.object(worker, "dashboard_active", False, create=True), \
+             patch.object(worker, "send") as send:
+            request = {
+                "jsonrpc": "2.0", "id": "create-session",
+                "method": "attention.new_session",
+                "params": {"token": token, "session_id": "s1"},
+            }
+            worker.dispatch(request)
+            send.assert_called_once_with({
+                "jsonrpc": "2.0", "id": "create-session", "result": {"ok": True},
+            })
+            queued = requests.get_nowait()
+            self.assertEqual(queued["action"]["params"]["worktree_branch"], "feature/pr-42")
+            self.assertEqual(queued["action"]["params"]["initial_turn"], "Review this pull request.")
+            self.assertEqual(consumed, {id(item)})
+
+            send.reset_mock()
+            worker.dispatch(request)
+            self.assertFalse(send.call_args.args[0]["result"]["ok"])
+            self.assertIn("expired", send.call_args.args[0]["result"]["error"])
+
+    def test_new_session_form_routes_cli_options_to_the_worker(self):
+        options = {
+            "title": "Worktree session", "path": "/repo", "profile": "qa", "tool": "omp",
+            "group": "reviews", "worktree_branch": "feature/task",
+            "new_branch": True, "base_branch": "main", "scratch": False,
+        }
+        requests = queue.Queue()
+        with patch.object(worker, "action_tokens", {}, create=True), \
+             patch.object(worker, "action_requests", requests, create=True), \
+             patch.object(worker, "active_action", None, create=True), \
+             patch.object(worker, "dashboard_active", False, create=True), \
+             patch.object(worker, "send") as send:
+            worker.dispatch({
+                "jsonrpc": "2.0", "id": "form",
+                "method": "attention.new_session", "params": options,
+            })
+            send.assert_called_once_with({
+                "jsonrpc": "2.0", "id": "form", "result": {"ok": True},
+            })
+        queued = requests.get_nowait()
+        self.assertEqual(queued["action"]["params"], options)
+
+    def test_pr_worktree_reuses_an_existing_local_head_branch(self):
+        commands = []
+        outputs = iter([
+            SimpleNamespace(returncode=0),
+            SimpleNamespace(returncode=0),
+        ])
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return next(outputs)
+
+        with patch.object(worker.subprocess, "run", side_effect=run):
+            args = worker._pr_worktree_args("/repo", "feature/pr-42", "main")
+        self.assertEqual(args, ["--worktree", "feature/pr-42"])
+        self.assertEqual(commands, [
+            ["git", "-C", "/repo", "check-ref-format", "--branch", "feature/pr-42"],
+            ["git", "-C", "/repo", "show-ref", "--verify", "--quiet",
+             "refs/heads/feature/pr-42"],
+        ])
+
+    def test_pr_worktree_creates_a_missing_head_from_the_target_branch(self):
+        commands = []
+        outputs = iter([
+            SimpleNamespace(returncode=0),
+            SimpleNamespace(returncode=1),
+            SimpleNamespace(returncode=0),
+        ])
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return next(outputs)
+
+        with patch.object(worker.subprocess, "run", side_effect=run):
+            args = worker._pr_worktree_args("/repo", "feature/pr-42", "main")
+        self.assertEqual(args, [
+            "--worktree", "feature/pr-42", "--new-branch",
+            "--base-branch", "main",
+        ])
+        self.assertEqual(commands[-1], [
+            "git", "-C", "/repo", "check-ref-format", "--branch", "main",
+        ])
+
+    def test_pr_worktree_rejects_invalid_head_and_missing_target(self):
+        with patch.object(worker.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(ValueError, "head branch"):
+                worker._pr_worktree_args("/repo", "bad branch", "main")
+
+        outputs = iter([
+            SimpleNamespace(returncode=0),
+            SimpleNamespace(returncode=1),
+        ])
+        with patch.object(worker.subprocess, "run", side_effect=lambda *a, **k: next(outputs)):
+            with self.assertRaisesRegex(ValueError, "target branch"):
+                worker._pr_worktree_args("/repo", "feature/pr-42", "")
+
+    def test_new_session_runs_add_start_and_initial_send_in_cli_order(self):
+        commands = []
+        outputs = iter([
+            SimpleNamespace(returncode=0, stdout="✓ Added session\n  ID: created-session\n", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ])
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return next(outputs)
+
+        options = {
+            "title": "Attention: Fix regression",
+            "path": "/repositories/target",
+            "scratch": False,
+            "is_pull_request": True,
+            "worktree_branch": "feature/pr-42",
+            "base_branch": "main",
+            "initial_turn": "Review this pull request.",
+        }
+        results = queue.Queue()
+        with patch.object(worker, "_pr_worktree_args", return_value=[
+            "--worktree", "feature/pr-42", "--new-branch", "--base-branch", "main",
+        ]) as worktree_args, \
+             patch.object(worker.subprocess, "run", side_effect=run), \
+             patch.object(worker.time, "sleep") as sleep:
+            worker.start_new_session("token", options, results)
+            event = results.get(timeout=3)
+        worktree_args.assert_called_once_with(
+            "/repositories/target", "feature/pr-42", "main",
+        )
+        self.assertEqual(commands, [
+            ["aoe", "add", "--title", "Attention: Fix regression",
+             "--worktree", "feature/pr-42", "--new-branch",
+             "--base-branch", "main", "/repositories/target"],
+            ["aoe", "session", "start", "created-session"],
+            ["aoe", "send", "--no-revive", "created-session",
+             "Review this pull request."],
+        ])
+        sleep.assert_called_once_with(worker.INITIAL_MESSAGE_DELAY_SECONDS)
+        self.assertTrue(event["completed"])
+        self.assertEqual(event["session_id"], "created-session")
+
+    def test_start_failure_reports_created_session_without_sending_initial_turn(self):
+        commands = []
+        outputs = iter([
+            SimpleNamespace(returncode=0, stdout="  ID: created-session\n", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr="tmux unavailable"),
+        ])
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return next(outputs)
+
+        results = queue.Queue()
+        with patch.object(worker.subprocess, "run", side_effect=run):
+            worker.start_new_session("token", {
+                "title": "Attention: Test", "path": "/repo", "scratch": False,
+                "initial_turn": "Do work",
+            }, results)
+            event = results.get(timeout=3)
+        self.assertEqual(commands, [
+            ["aoe", "add", "--title", "Attention: Test", "/repo"],
+            ["aoe", "session", "start", "created-session"],
+        ])
+        self.assertFalse(event["completed"])
+        self.assertIn("Created created-session, but start failed", event["error"])
+
+ 
 
     def test_blocked_source_fetch_does_not_block_loading_or_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1039,7 +1292,16 @@ else:
                         "method": "attention.refresh", "params": {"session_id": "s1"},
                     }) + "\n")
                     proc.stdin.flush()
-                    self.assertEqual(receive()["id"], "refresh")
+                    response = receive(timeout=max(0, deadline - time.monotonic()))
+                    while response.get("id") != "refresh":
+                        if response.get("method") == "sessions.list":
+                            reply(response, {"sessions": [{"id": "s1"}]})
+                        elif response.get("method") == "ui.state.set":
+                            reply(response, {})
+                        else:
+                            self.fail(f"unexpected host RPC before refresh response: {response}")
+                        response = receive(timeout=max(0, deadline - time.monotonic()))
+                    self.assertTrue(response["result"]["ok"])
                     break
 
                 deadline = time.monotonic() + 3
@@ -1184,6 +1446,33 @@ class AttentionActionDispatchTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), {"ok": True})
         self.assertEqual(diagnostics.getvalue(), "provider output\n")
 
+    def test_run_cmd_output_keeps_worker_json_channel_valid(self):
+        import contextlib
+        import io
+
+        loader = importlib.machinery.SourceFileLoader(
+            "attention_redirected_util_test", str(ROOT / "sources" / "_util.py"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        util = importlib.util.module_from_spec(spec)
+        loader.exec_module(util)
+
+        action = {"_plugin": "fake", "key": "o", "payload": {}}
+        output = io.StringIO()
+        diagnostics = io.StringIO()
+        with patch.object(
+                self.core, "dispatch_item_action",
+                side_effect=lambda _: util.run_cmd([
+                    sys.executable, "-c", "print('command output')",
+                ]),
+        ), patch("sys.stdin", io.StringIO(json.dumps(action))), \
+                patch("sys.stderr", diagnostics), contextlib.redirect_stdout(output):
+            self.assertEqual(self.core.worker_action_cli(), 0)
+
+        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
+        self.assertIn("command output", diagnostics.getvalue())
+
+
 
 class WorkerActionProtocolTests(unittest.TestCase):
     def test_action_is_session_scoped_single_use_without_implicit_refresh(self):
@@ -1199,12 +1488,32 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 "def build_prioritized_items(config):\n"
                 "    count = int(FETCHES.read_text()) + 1 if FETCHES.exists() else 1\n"
                 "    FETCHES.write_text(str(count))\n"
-                "    return [{'status':'NOW','context':'QA','title':f'Fetch {count}','details':'ready',"
-                "'weight':10,'_plugin':'generic','actions':[{'key':'o','label':'Run QA','primary':True,"
-                "'_plugin':'generic','_original_key':'o','payload':{'command':['echo','private-command']}}]}]\n"
-                "if len(sys.argv) > 1 and sys.argv[1] == '__worker_action__':\n"
-                "    DISPATCHED.write_text(json.dumps(json.load(sys.stdin)))\n"
-                "    print(json.dumps({'ok': True}))\n"
+                "    return [{'status':'NOW','context':'QA','title':'Fetch','details':'ready',"
+                "'weight':10,'_plugin':'generic','actions':["
+                "{'key':'o','label':'Run QA','primary':True,'_plugin':'generic',"
+                "'_original_key':'o','payload':{'command':['echo','run'] }},"
+                "{'key':'p','label':'Prompt QA','_plugin':'generic',"
+                "'_original_key':'p','payload':{'command':['echo','prompt']}},"
+                "{'key':'x','label':'Oversized QA','_plugin':'generic',"
+                "'_original_key':'x','payload':{'command':['echo','oversized']}}]}]\n"
+                "if len(sys.argv) > 1 and sys.argv[1] in ('__worker_action__', '__worker_action_interactive__'):\n"
+                "    action = json.loads(sys.stdin.readline())\n"
+                "    DISPATCHED.write_text(json.dumps(action))\n"
+                "    command = action['payload']['command'][-1]\n"
+                "    if command == 'prompt':\n"
+                "        print(json.dumps({'prompt': {'text':'Confirm action?', 'choices':['yes','no'], 'default':'yes'}}), flush=True)\n"
+                "        answer = json.loads(sys.stdin.readline())\n"
+                "        if answer.get('value') is None:\n"
+                "            print(json.dumps({'ok':False,'error':'Action canceled.'}))\n"
+                "        else:\n"
+                "            print(json.dumps({'ok':True}))\n"
+                "    elif command == 'oversized':\n"
+                "        choices = ['choice-' + str(i) + '-' + ('界' * 200) for i in range(100)]\n"
+                "        print(json.dumps({'prompt': {'text':'Large choices', 'choices':choices}}), flush=True)\n"
+                "        print(json.dumps({'ok':True}))\n"
+                "    else:\n"
+                "        sys.stderr.write('source action output\\n')\n"
+                "        print(json.dumps({'ok': True}))\n"
             )
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
@@ -1216,6 +1525,7 @@ class WorkerActionProtocolTests(unittest.TestCase):
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             stdout_buffer = bytearray()
+            published_pages = []
 
             def receive(timeout=3):
                 return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not send a protocol message")
@@ -1235,17 +1545,35 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 while time.monotonic() < deadline:
                     message = receive(max(0.01, deadline - time.monotonic()))
                     if message.get("method") == "ui.state.set":
+                        params = message["params"]
+                        if params.get("slot") == "page":
+                            published_pages.append(params["payload"])
                         reply(message)
                     elif message.get("method") == "sessions.list":
                         reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
-                    elif message.get("method") == "config.get":
-                        reply(message, {"value": "omp"})
-                    elif message.get("method") == "sessions.create":
-                        created_params.append(message["params"])
-                        reply(message, {"session_id": "created-session", "created": True})
                     elif message.get("id") == request_id:
                         return message
                 self.fail(f"worker did not reply to {request_id}")
+
+            def wait_page(predicate, timeout=5):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    for index, page in enumerate(published_pages):
+                        if predicate(page):
+                            del published_pages[index]
+                            return page
+                    message = receive(max(0.01, deadline - time.monotonic()))
+                    if message.get("method") == "sessions.list":
+                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
+                    elif message.get("method") == "ui.state.set":
+                        params = message["params"]
+                        page = params["payload"]
+                        reply(message)
+                        if params.get("slot") == "page":
+                            if predicate(page):
+                                return page
+                            published_pages.append(page)
+                self.fail("worker did not publish the expected dashboard state")
 
             try:
                 listing = receive()
@@ -1256,32 +1584,33 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 reply(loading)
                 proc.stdin.write(json.dumps({
                     "jsonrpc": "2.0", "id": "initial-refresh",
-                    "method": "attention.refresh", "params": {"session_id": "s1"},
+                    "method": "attention.refresh", "params": {},
                 }) + "\n")
                 proc.stdin.flush()
                 self.assertEqual(receive()["id"], "initial-refresh")
-                first = receive()
-                while first.get("method") != "ui.state.set":
-                    self.assertEqual(first.get("method"), "sessions.list")
-                    reply(first, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
+                page_payload = None
+                while page_payload is None:
                     first = receive()
-                payload = first["params"]["payload"]
-                card = _first_item_card(payload)
-                button_group = next(child for child in card["children"] if child.get("kind") == "columns")
-                button = next(child for child in button_group["children"] if child.get("method") == "attention.action")
-                token = button["params"]["token"]
-                new_session = next(block for block in worker._walk_blocks(payload["blocks"])
-                                   if block.get("method") == "attention.new_session")
-                new_session_token = new_session["params"]["token"]
-                self.assertNotIn("private-command", json.dumps(payload))
-                reply(first)
+                    if first.get("method") == "sessions.list":
+                        reply(first, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
+                        continue
+                    self.assertEqual(first.get("method"), "ui.state.set")
+                    params = first["params"]
+                    if params.get("slot") == "page":
+                        page_payload = params["payload"]
+                    reply(first)
+                item = page_payload["items"][0]
+                button = next(action for action in item["actions"]
+                              if action["label"] == "Run QA")
+                token = button["token"]
+                self.assertNotIn("private-command", json.dumps(page_payload))
 
                 send_action("wrong-session", token, "other")
                 wrong = wait_response("wrong-session")
                 self.assertFalse(wrong["result"]["ok"])
                 self.assertIn("Unknown session", wrong["result"]["error"])
 
-                send_action("run", token, "s1")
+                send_action("run", token, None)
                 accepted = wait_response("run")
                 self.assertTrue(accepted["result"]["ok"])
                 send_action("duplicate", token, "s1")
@@ -1290,19 +1619,27 @@ class WorkerActionProtocolTests(unittest.TestCase):
 
                 deadline = time.monotonic() + 5
                 completed_seen = False
+                completed_page = None
+                action_output = None
                 while time.monotonic() < deadline and not completed_seen:
                     message = receive(max(0.01, deadline - time.monotonic()))
                     if message.get("method") == "sessions.list":
                         reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
                         continue
                     self.assertEqual(message.get("method"), "ui.state.set")
-                    state = json.dumps(message["params"]["payload"])
-                    completed_seen = "Completed: Run QA" in state
+                    params = message["params"]
+                    page = params["payload"]
+                    if params.get("slot") == "page":
+                        completed_seen = "Completed: Run QA" in json.dumps(page)
+                        if completed_seen:
+                            completed_page = page
+                            action_output = page.get("action_output")
                     reply(message)
                 self.assertTrue(dispatched.exists(), "source action child was not invoked")
                 self.assertEqual(json.loads(dispatched.read_text())["payload"]["command"],
-                                 ["echo", "private-command"])
-                self.assertTrue(completed_seen, "pane omitted action completion feedback")
+                                 ["echo", "run"])
+                self.assertTrue(completed_seen, "page omitted action completion feedback")
+                self.assertEqual(action_output, "source action output")
                 self.assertEqual(fetches.read_text(), "1", "action completion fetched implicitly")
 
                 send_action("stale", token, "s1")
@@ -1334,6 +1671,53 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 duplicate_session = wait_response("duplicate-session")
                 self.assertFalse(duplicate_session["result"]["ok"])
                 self.assertIn("expired", duplicate_session["result"]["error"])
+
+                prompt_button = next(
+                    action for action in completed_page["items"][0]["actions"]
+                    if action["label"] == "Prompt QA"
+                )
+                send_action("prompt", prompt_button["token"], "s1")
+                prompt_response = wait_response("prompt")
+                self.assertTrue(prompt_response["result"]["ok"])
+                prompt_page = wait_page(lambda value: value.get("prompt") is not None)
+                prompt = prompt_page["prompt"]
+                self.assertEqual(prompt["text"], "Confirm action?")
+                self.assertEqual(prompt["choices"], ["yes", "no"])
+
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": "cancel-input",
+                    "method": "attention.input",
+                    "params": {
+                        "token": prompt["token"], "prompt_id": prompt["id"], "value": None,
+                    },
+                }) + "\n")
+                proc.stdin.flush()
+                canceled = wait_response("cancel-input")
+                self.assertTrue(canceled["result"]["ok"])
+                canceled_page = wait_page(
+                    lambda value: "Action canceled." in (value.get("status") or ""),
+                )
+                prompt_again = next(
+                    action for action in canceled_page["items"][0]["actions"]
+                    if action["label"] == "Prompt QA"
+                )
+                self.assertNotEqual(prompt_again["token"], prompt["token"])
+
+                oversized = next(
+                    action for action in canceled_page["items"][0]["actions"]
+                    if action["label"] == "Oversized QA"
+                )
+                send_action("oversized-prompt", oversized["token"], "s1")
+                oversized_response = wait_response("oversized-prompt")
+                self.assertTrue(oversized_response["result"]["ok"])
+                oversized_page = wait_page(
+                    lambda value: "dashboard size limit" in (value.get("status") or ""),
+                )
+                self.assertTrue(any(
+                    action["label"] == "Oversized QA"
+                    for action in oversized_page["items"][0]["actions"]
+                ))
+                self.assertEqual(fetches.read_text(), "1", "actions fetched implicitly")
             finally:
                 proc.kill()
                 proc.wait(timeout=5)

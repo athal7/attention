@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import queue
 from pathlib import Path
 import hashlib
@@ -13,13 +14,17 @@ import select
 import subprocess
 import re
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import quote, urlsplit
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 SESSION_POLL_SECONDS = 60
 MAX_PANE_BYTES = 64 * 1024
+MAX_ACTION_PROMPT_BYTES = 32 * 1024
 ACTION_TIMEOUT_SECONDS = 120
+INITIAL_MESSAGE_DELAY_SECONDS = 5
+DASHBOARD_PATH = "/plugins/athal7.attention/dashboard"
 STATE_VISUALS = (
     ("merge conflict", "triangle-alert", "danger"),
     ("changes requested", "circle-x", "danger"),
@@ -52,8 +57,15 @@ _filter_lock = threading.Lock()
 live_sessions_by_id = {}
 hidden_sources = set()
 hidden_providers = set()
+dashboard_active = False
 filter_refresh_requested = False
+prompt_refresh_requested = False
 snapshot_fetched_at = None
+active_action = None
+active_prompt = None
+action_answers = queue.Queue()
+consumed_action_ids = set()
+consumed_session_item_ids = set()
 
 
 def send(message):
@@ -101,10 +113,30 @@ def attention_items():
     name = "_attention_plugin_" + str(time.monotonic_ns())
     loader = importlib.machinery.SourceFileLoader(name, str(ATTENTION_PATH))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
-    sys.modules[name] = module
     try:
         loader.exec_module(module)
-        return module.build_prioritized_items(module.load_config())
+        config = module.load_config()
+        items = module.build_prioritized_items(config)
+        dashboard_groups = getattr(module, "dashboard_groups", None)
+        if dashboard_groups:
+            groups, group_error = dashboard_groups(config)
+            if group_error:
+                raise RuntimeError(group_error)
+            if groups:
+                fallback = next(group for group in groups if group.get("fallback"))
+                indicator_labels = getattr(module, "_INDICATOR_LABELS", {})
+                for item in items:
+                    group = next((group for group in groups if "match" in group
+                                  and module._group_matches(item, group["match"])), fallback)
+                    columns = group.get("columns") or ["state"]
+                    item["_dashboard_group"] = group["name"]
+                    item["_dashboard_columns"] = columns
+                    item["_dashboard_column_labels"] = {
+                        column: indicator_labels.get(column, column.replace("_", " ").title())
+                        for column in columns
+                    }
+                    item["_dashboard_order"] = groups.index(group)
+        return items
     finally:
         sys.modules.pop(name, None)
 
@@ -165,7 +197,8 @@ def _is_approve_action(action):
 
 def _open_action(item):
     for action in item.get("actions", []):
-        if not isinstance(action, dict) or not _is_open_action(action):
+        if (not isinstance(action, dict) or id(action) in consumed_action_ids
+                or not _is_open_action(action)):
             continue
         payload = action.get("payload")
         if isinstance(payload, dict) and not payload.get("inputs"):
@@ -222,67 +255,88 @@ def _primary_row(item, token_actions, token_factory):
     return row
 
 
-def _web_actions(item, token_actions, token_factory):
-    blocks = []
-    interactive = {
-        "github": {"comment", "label", "merge"},
-        "linear": {"comment", "transition"},
+def _new_session_action(item):
+    title = _display_text(item.get("title"), 120) or "Follow-up"
+    is_github_item = item.get("_plugin") == "github"
+    is_pull_request = is_github_item and item.get("kind") == "pull_request"
+    repo_path = (
+        item.get("repo_project_path") or item.get("repo_path")
+        if is_github_item else item.get("repo_path")
+    )
+    path = repo_path.strip() if isinstance(repo_path, str) else ""
+    options = {
+        "title": f"Attention: {title}",
+        "path": path,
+        "scratch": not path and not is_github_item,
+        "is_pull_request": is_pull_request,
     }
-    for action in item.get("actions", []):
-        if not isinstance(action, dict) or _is_open_action(action):
+    if is_github_item:
+        resolution_error = item.get("repo_resolution_error")
+        if not path and not resolution_error:
+            resolution_error = "No unique local GitHub checkout."
+        if resolution_error:
+            options["repo_resolution_error"] = resolution_error
+    branch = item.get("head_branch")
+    if is_pull_request:
+        options["worktree_branch"] = branch
+        target_branch = item.get("base_branch")
+        if target_branch is not None:
+            options["base_branch"] = target_branch
+    initial_turn = item.get("session_prompt")
+    if isinstance(initial_turn, str) and initial_turn:
+        options["initial_turn"] = initial_turn
+    return {
+        "_aoe_operation": "new_session",
+        "_item_id": id(item),
+        "params": options,
+        "label": "New session",
+    }
+
+
+def _is_session_action(action):
+    """Recognize configured actions that replace the generated session action."""
+    return (
+        isinstance(action, dict)
+        and str(action.get("label", "")).strip().casefold()
+        in {"session", "new session"}
+        and isinstance(action.get("payload"), dict)
+    )
+
+
+def _web_actions(item, token_actions, token_factory):
+    """Expose configured actions not already represented in the primary row."""
+    actions = item.get("actions", [])
+    has_session_action = any(_is_session_action(action) for action in actions)
+    row_open_action = _open_action(item)
+    blocks = []
+    for action in actions:
+        if not isinstance(action, dict) or id(action) in consumed_action_ids:
             continue
-        if (item.get("_is_own_pr") is True or action.get("_is_own_pr") is True) and _is_approve_action(action):
+        if action is row_open_action:
             continue
-        plugin = action.get("_plugin") or item.get("_plugin", "")
-        payload = action.get("payload")
-        if not isinstance(payload, dict) or payload.get("inputs"):
+        if ((item.get("_is_own_pr") is True or action.get("_is_own_pr") is True)
+                and _is_approve_action(action)):
             continue
-        command = payload.get("command")
-        if (isinstance(command, list) and len(command) > 1
-                and Path(str(command[0])).name.casefold() == "lumen"
-                and command[1] == "diff"):
-            continue
-        if str(payload.get("kind", "")).lower() in interactive.get(plugin, set()):
+        if not isinstance(action.get("payload"), dict):
             continue
         token = token_factory()
         token_actions[token] = action
         label = str(action.get("label") or "Action").strip()[:80]
-        label = label[:1].upper() + label[1:]
         blocks.append({
-            "kind": "action",
-            "label": label,
-            "method": "attention.action",
-            "params": {"token": token},
-            "variant": "primary" if action.get("primary") else "secondary",
+            "kind": "action", "label": label[:1].upper() + label[1:],
+            "method": "attention.action", "params": {"token": token},
+            "variant": "secondary",
         })
-        # Reserve one pane-action slot for New session.
-        break
-    token = token_factory()
-    title = _display_text(item.get("title"), 120) or "Follow-up"
-    token_actions[token] = {"_aoe_operation": "new_session", "title": f"Attention: {title}"}
-    repo_path = item.get("repo_path")
-    if isinstance(repo_path, str) and repo_path:
-        token_actions[token]["repo_path"] = repo_path
-    project_path = item.get("repo_project_path")
-    if isinstance(project_path, str) and project_path:
-        token_actions[token]["project_path"] = project_path
-    resolution_error = item.get("repo_resolution_error")
-    if isinstance(resolution_error, str) and resolution_error:
-        token_actions[token]["repo_resolution_error"] = resolution_error
-    if item.get("_plugin") == "github" and item.get("kind") == "pull_request":
-        token_actions[token]["head_branch"] = item.get("head_branch")
-        token_actions[token]["base_branch"] = item.get("base_branch")
-        token_actions[token]["is_pull_request"] = True
-    session_prompt = item.get("session_prompt")
-    if isinstance(session_prompt, str) and session_prompt.strip():
-        token_actions[token]["initial_turn"] = session_prompt
-    blocks.append({
-        "kind": "action",
-        "label": "New session",
-        "method": "attention.new_session",
-        "params": {"token": token},
-        "variant": "secondary",
-    })
+    if not has_session_action and id(item) not in consumed_session_item_ids:
+        action = _new_session_action(item)
+        token = token_factory()
+        token_actions[token] = action
+        blocks.append({
+            "kind": "action", "label": "New session",
+            "method": "attention.new_session", "params": {"token": token},
+            "variant": "secondary",
+        })
+
     return blocks
 
 
@@ -365,8 +419,8 @@ def _item_card(item, token_actions, token_factory):
     row = _primary_row(item, token_actions, token_factory)
     actions = _web_actions(item, token_actions, token_factory)
     children = [row]
-    if actions:
-        children.append({"kind": "columns", "children": actions})
+    for offset in range(0, len(actions), 2):
+        children.append({"kind": "columns", "children": actions[offset:offset + 2]})
     return {"kind": "section", "boxed": True, "children": children}
 
 
@@ -382,7 +436,7 @@ def _tokens_in_payload(payload):
     return {
         block.get("params", {}).get("token")
         for block in _walk_blocks(payload.get("blocks", []))
-        if block.get("method") in {"attention.action", "attention.new_session", "attention.filter"}
+        if block.get("method") in {"attention.action", "attention.filter", "attention.new_session"}
         and isinstance(block.get("params", {}).get("token"), str)
     }
 
@@ -564,145 +618,7 @@ def live_sessions():
     return sessions
 
 
-def create_session(request):
-    action = request["action"]
-    is_pull_request = action.get("is_pull_request") is True
-    resolution_error = action.get("repo_resolution_error")
-    if isinstance(resolution_error, str) and resolution_error:
-        raise RuntimeError(resolution_error)
-    project_path = action.get("project_path")
-    if not isinstance(project_path, str) or not project_path.strip():
-        raise RuntimeError("Attention item has no AoE project path.")
-    head_branch = action.get("head_branch")
-    if is_pull_request and (
-            not isinstance(head_branch, str) or not head_branch
-            or head_branch.strip() != head_branch):
-        raise RuntimeError("GitHub pull request has no valid head branch.")
 
-    def list_sessions():
-        result = subprocess.run(
-            ["aoe", "list", "--all", "--json"], capture_output=True,
-            text=True, timeout=20,
-        )
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or "Could not inspect AoE sessions.")
-        sessions = json.loads(result.stdout)
-        if not isinstance(sessions, list):
-            raise RuntimeError("AoE returned an invalid session list.")
-        return sessions
-
-    sessions = list_sessions()
-    current = [
-        entry for entry in sessions
-        if isinstance(entry, dict) and entry.get("id") == request["session_id"]
-    ]
-    if len(current) != 1 or not isinstance(current[0].get("profile"), str):
-        raise RuntimeError("Could not identify the Attention host profile.")
-    profile = current[0]["profile"]
-    if not profile:
-        raise RuntimeError("Attention host profile is empty.")
-    session = live_sessions_by_id.get(request["session_id"])
-    if session is None:
-        raise RuntimeError("This session is no longer available.")
-    settings = rpc("config.get", {"key": "agent_id"})
-    agent_id = settings.get("value") if isinstance(settings, dict) else None
-    if not isinstance(agent_id, str) or not agent_id.strip():
-        raise RuntimeError("Choose an ACP agent in Attention plugin settings before creating a session.")
-
-    token = request["token"]
-    branch = "attention/" + hashlib.sha256(token.encode()).hexdigest()[:20]
-    root = os.path.realpath(project_path)
-    existing = [
-        entry for entry in sessions
-        if isinstance(entry, dict)
-        and entry.get("profile") == profile
-        and isinstance(entry.get("worktree"), dict)
-        and entry["worktree"].get("branch") == branch
-    ]
-    if len(existing) > 1:
-        raise RuntimeError("More than one AoE worktree matches this action.")
-    if existing:
-        worktree = existing[0]["worktree"]
-        if os.path.realpath(worktree.get("main_repo_path", "")) != root:
-            raise RuntimeError("Action worktree branch already belongs to another project.")
-        return existing[0]["id"]
-
-    title = action["title"]
-    group = current[0].get("group")
-    if not isinstance(group, str):
-        raise RuntimeError("AoE did not report the host session group.")
-    command = [
-        "aoe", "--profile", profile, "add", project_path,
-        "--title", title, "--group", group,
-        "--agent", agent_id.strip(), "--structured-view",
-        "--worktree", branch, "--new-branch", "--launch",
-    ]
-    base_branch = action.get("base_branch")
-    if is_pull_request and isinstance(base_branch, str) and base_branch.strip():
-        command.extend(["--base-branch", base_branch])
-    created = subprocess.run(
-        command, capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS,
-    )
-    if created.returncode:
-        detail = created.stderr.strip() or created.stdout.strip()
-        raise RuntimeError(detail or "AoE failed to create the worktree session.")
-
-    sessions = list_sessions()
-    matches = [
-        entry for entry in sessions
-        if isinstance(entry, dict)
-        and entry.get("profile") == profile
-        and isinstance(entry.get("worktree"), dict)
-        and entry["worktree"].get("branch") == branch
-        and os.path.realpath(entry["worktree"].get("main_repo_path", "")) == root
-    ]
-    if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
-        raise RuntimeError("AoE created a session but its worktree identity was not unique.")
-    session_id = matches[0]["id"]
-    prompt = action.get("initial_turn")
-    if isinstance(prompt, str) and prompt.strip():
-        ready = subprocess.run(
-            ["aoe", "--profile", profile, "acp", "status", "--json", session_id],
-            capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS,
-        )
-        if ready.returncode:
-            raise RuntimeError(
-                f"Created session {session_id}, but its ACP worker is not ready: "
-                f"{ready.stderr.strip() or ready.stdout.strip()}"
-            )
-        deadline = time.monotonic() + 30
-        detail = ""
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"Created session {session_id}, but initial prompt delivery failed: "
-                    f"{detail or 'AoE worker did not become ready within 30 seconds.'}"
-                )
-            try:
-                sent = subprocess.run(
-                    ["aoe", "--profile", profile, "acp", "prompt", session_id, prompt],
-                    capture_output=True, text=True,
-                    timeout=min(ACTION_TIMEOUT_SECONDS, remaining),
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(
-                    f"Created session {session_id}, but initial prompt delivery failed: "
-                    "AoE did not accept the prompt within 30 seconds."
-                ) from exc
-            if sent.returncode == 0:
-                break
-            detail = sent.stderr.strip() or sent.stdout.strip()
-            if (
-                "not found on the daemon" not in detail
-                and "worker_not_ready" not in detail
-            ):
-                raise RuntimeError(
-                    f"Created session {session_id}, but initial prompt delivery failed: "
-                    f"{detail}"
-                )
-            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-    return session_id
 
 
 def status_payload(text):
@@ -734,10 +650,11 @@ def payload_with_notice(base_payload, text, consumed_token=None):
     payload = json.loads(json.dumps(base_payload))
     if consumed_token is not None:
         payload["blocks"] = _remove_action_token(payload["blocks"], consumed_token)
-    blocks = payload["blocks"]
-    insert_at = next((i for i, block in enumerate(blocks)
-                      if block.get("kind") in {"section", "note"}), max(0, len(blocks) - 1))
-    blocks.insert(insert_at, {"kind": "note", "text": text[:200]})
+    if text:
+        blocks = payload["blocks"]
+        insert_at = next((i for i, block in enumerate(blocks)
+                          if block.get("kind") in {"section", "note"}), max(0, len(blocks) - 1))
+        blocks.insert(insert_at, {"kind": "note", "text": text[:200]})
     return _fit_payload(payload)
 
 
@@ -758,19 +675,126 @@ def _fit_payload(payload):
             blocks.insert(toolbar_index, omission)
     return payload
 
-def publish_payload(sessions, payload, only_new=False, items=()):
+def dashboard_payload(items, fetched_at, sessions, token_actions=None):
+    token_actions = {} if token_actions is None else token_actions
+    cards = []
+    titles = [_display_text(item.get("title"), 120) or "Follow-up"
+              for item in items if not item.get("_collector_failure")]
+    for item in _tree_order([item for item in items if not item.get("_collector_failure")]):
+        actions = []
+        for action in item.get("actions", []):
+            if not isinstance(action, dict) or id(action) in consumed_action_ids:
+                continue
+            if ((item.get("_is_own_pr") is True or action.get("_is_own_pr") is True)
+                    and _is_approve_action(action)):
+                continue
+            token = next((key for key, value in token_actions.items() if value is action), None)
+            if token is None:
+                token = secrets.token_urlsafe(18)
+                token_actions[token] = action
+            actions.append({
+                "label": _display_text(action.get("label"), 80) or "Action",
+                "token": token, "method": "attention.action",
+            })
+        has_session_action = any(
+            _is_session_action(action) for action in item.get("actions", [])
+        )
+        if not has_session_action and id(item) not in consumed_session_item_ids:
+            token = next((
+                key for key, value in token_actions.items()
+                if isinstance(value, dict)
+                and value.get("_aoe_operation") == "new_session"
+                and value.get("_item_id") == id(item)
+            ), None)
+            if token is None:
+                token = secrets.token_urlsafe(18)
+                token_actions[token] = _new_session_action(item)
+            actions.append({
+                "label": "New session", "token": token,
+                "method": "attention.new_session",
+            })
+        title = _display_text(item.get("title"), 120) or "Follow-up"
+        matches = _matching_sessions(item, sessions, allow_title=titles.count(title) == 1)
+        cards.append({
+            "title": title, "url": _safe_source_url(item.get("url")),
+            "status": _display_text(item.get("status"), 100),
+            "context": _display_text(item.get("context"), 160),
+            "reason": _display_text(item.get("attention_reason"), 160),
+            "details": _display_text(item.get("details"), 4000),
+            "indicators": {str(k): _display_text(v, 120)
+                           for k, v in (item.get("indicators") or {}).items()},
+            "columns": [
+                _display_text(column, 120)
+                for column in item.get("_dashboard_columns", ["state"])
+                if isinstance(column, str)
+            ],
+            "column_labels": {
+                _display_text(key, 120): _display_text(value, 120)
+                for key, value in item.get("_dashboard_column_labels", {}).items()
+                if isinstance(key, str)
+            } if isinstance(item.get("_dashboard_column_labels", {}), dict) else {},
+            "source": _display_text(item.get("_plugin"), 100),
+            "provider": _display_text(item.get("_provider"), 100),
+            "group": _display_text(item.get("_dashboard_group", "Attention"), 120),
+            "group_order": item.get("_dashboard_order", 0), "actions": actions,
+            "session": ({"id": matches[0]["id"], "title": _display_text(
+                matches[0].get("title"), 120) or matches[0]["id"]} if matches else None),
+        })
+    failures = [{"source": _display_text(item.get("context"), 100),
+                 "error": _display_text(item.get("details"), 200)}
+                for item in items if item.get("_collector_failure")]
+    return {"items": cards, "failures": failures, "fetched_at": fetched_at,
+            "busy": active_action is not None, "prompt": active_prompt,
+            "omitted_items": 0, "omitted_failures": 0}
+
+
+def _fit_dashboard(payload):
+    encoded = lambda: len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    while payload["failures"] and encoded() > MAX_PANE_BYTES:
+        payload["failures"].pop()
+        payload["omitted_failures"] += 1
+    while payload["items"] and encoded() > MAX_PANE_BYTES:
+        payload["items"].pop()
+        payload["omitted_items"] += 1
+    return payload
+
+
+def _notice_text(payload):
+    return next((block.get("text", "") for block in payload.get("blocks", [])
+                 if block.get("kind") == "note" and block.get("text")), "")
+
+def publish_payload(sessions, payload, only_new=False, items=(), action_output=""):
     global action_tokens
-    payload = payload_with_sessions(payload, items, sessions)
-    visible_tokens = _payload_action_tokens(payload)
-    action_tokens = {
-        token: action for token, action in action_tokens.items() if token in visible_tokens
-    }
+    visible = [item for item in items if _filter_item(item, hidden_sources, hidden_providers)]
+    dashboard_tokens = set()
+    if dashboard_active:
+        page = dashboard_payload(
+            visible, snapshot_fetched_at, sessions, action_tokens,
+        )
+        if action_output:
+            page["action_output"] = action_output
+        notice = _display_text(_notice_text(payload), 400)
+        page["status"] = notice
+        page["error"] = notice if ("failed" in notice.casefold()
+                                   or notice.startswith("New session:")) else ""
+        page = _fit_dashboard(page)
+        dashboard_tokens = {
+            action["token"]
+            for card in page.get("items", [])
+            for action in card.get("actions", [])
+            if isinstance(action, dict) and isinstance(action.get("token"), str)
+        }
+        rpc("ui.state.set", {"slot": "page", "id": "dashboard", "payload": page})
+    pane = payload_with_sessions(payload, visible, sessions)
+    visible_tokens = _payload_action_tokens(pane)
+    action_tokens = {token: action for token, action in action_tokens.items()
+                     if token in visible_tokens or token in dashboard_tokens}
     for session in sessions:
         session_id = session["id"]
         if only_new and session_id in published_ids:
             continue
         rpc("ui.state.set", {
-            "slot": "pane", "id": "attention", "session_id": session_id, "payload": payload,
+            "slot": "pane", "id": "attention", "session_id": session_id, "payload": pane,
         })
         published_ids.add(session_id)
 
@@ -805,80 +829,405 @@ def start_fetch(results):
     threading.Thread(target=fetch_snapshot, args=(results,), daemon=True).start()
 
 
+def _read_action_output(output):
+    size = os.fstat(output.fileno()).st_size
+    limit = 4000
+    start = max(0, size - limit)
+    value = os.pread(output.fileno(), size - start, start).decode(
+        "utf-8", errors="replace",
+    )
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    return "".join(
+        char for char in value
+        if char in "\n\t" or ord(char) >= 32 and ord(char) != 127
+    ).strip()
+
+
 def execute_action(token, action, label, results):
+    """Run the CLI dispatcher, forwarding prompts without a second action implementation."""
     completed = False
+    error = "Action failed."
+    action_output = ""
     try:
-        with _source_lock:
-            process = subprocess.run(
-                [sys.executable, str(ATTENTION_PATH), "__worker_action__"],
-                input=json.dumps(action), text=True, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=ACTION_TIMEOUT_SECONDS,
-            )
-        output = process.stdout.splitlines()
-        response = json.loads(output[-1]) if output else {}
-        completed = process.returncode == 0 and response.get("ok") is True
-    except Exception:
-        completed = False
-    results.put((token, label, completed))
+        with _source_lock, tempfile.TemporaryFile() as output:
+            with subprocess.Popen(
+                [sys.executable, str(ATTENTION_PATH), "__worker_action_interactive__"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=output,
+            ) as process:
+                try:
+                    process.stdin.write((json.dumps(action) + "\n").encode())
+                    process.stdin.flush()
+                    deadline = time.monotonic() + ACTION_TIMEOUT_SECONDS
+                    offset = 0
+                    buffer = bytearray()
+                    while True:
+                        ready, _, _ = select.select([process.stdout.fileno()], [], [],
+                                                    max(0, deadline - time.monotonic()))
+                        if not ready:
+                            raise TimeoutError
+                        chunk = os.read(process.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        buffer.extend(chunk)
+                        while b"\n" in buffer:
+                            line, _, remainder = buffer.partition(b"\n")
+                            buffer[:] = remainder
+                            response = json.loads(line)
+                            if "prompt" in response:
+                                prompt_data = response["prompt"]
+                                prompt_id = secrets.token_urlsafe(18)
+                                size = os.fstat(output.fileno()).st_size
+                                context = os.pread(output.fileno(), min(size - offset, 4000),
+                                                   max(offset, size - 4000)).decode("utf-8", errors="replace")
+                                offset = size
+                                prompt = {
+                                    "id": prompt_id, "token": token,
+                                    "text": _display_text(
+                                        prompt_data.get("text") if isinstance(prompt_data, dict)
+                                        else prompt_data, 1000,
+                                    ) or "Input required",
+                                    "context": context,
+                                }
+                                if isinstance(prompt_data, dict):
+                                    choices = prompt_data.get("choices")
+                                    if isinstance(choices, list):
+                                        prompt["choices"] = [
+                                            choice[:200] for choice in choices[:100]
+                                            if isinstance(choice, str)
+                                        ]
+                                    default = prompt_data.get("default")
+                                    if isinstance(default, str):
+                                        prompt["default"] = default[:1000]
+                                if (len(json.dumps(
+                                        prompt, separators=(",", ":")
+                                ).encode("utf-8")) > MAX_ACTION_PROMPT_BYTES):
+                                    error = "Action prompt exceeds the dashboard size limit."
+                                    process.kill()
+                                    process.wait()
+                                    buffer.clear()
+                                    break
+                                results.put({"token": token, "prompt": prompt})
+                                try:
+                                    answer = action_answers.get(
+                                        timeout=max(0.1, deadline - time.monotonic())
+                                    )
+                                except queue.Empty as exc:
+                                    raise TimeoutError from exc
+                                if answer is None:
+                                    error = "Action canceled."
+                                process.stdin.write((json.dumps({"value": answer}) + "\n").encode())
+                                process.stdin.flush()
+                            if response.get("ok") is True:
+                                completed = True
+                            else:
+                                error = _display_text(response.get("error"), 300) or "Action failed."
+                            if response.get("error") == "Action canceled.":
+                                error = "Action canceled."
+                    process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                    action_output = _read_action_output(output)
+                    completed = completed and process.returncode == 0
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+    except TimeoutError:
+        error = "Action timed out waiting for input or completion."
+    except Exception as exc:
+        error = f"Action failed ({type(exc).__name__})."
+    results.put({
+        "token": token, "label": label, "completed": completed,
+        "error": error, "output": action_output,
+    })
 
 
 def start_action(token, action, label, results):
     threading.Thread(target=execute_action, args=(token, action, label, results), daemon=True).start()
 
 
+def _session_options_error(options):
+    if (not isinstance(options, dict)
+            or not isinstance(options.get("title", ""), str)
+            or not isinstance(options.get("path", ""), str)
+            or not isinstance(options.get("profile", ""), str)
+            or not isinstance(options.get("tool", ""), str)
+            or not isinstance(options.get("group", ""), str)
+            or not isinstance(options.get("repo_resolution_error", ""), str)
+            or not isinstance(options.get("scratch", False), bool)
+            or not isinstance(options.get("new_branch", False), bool)
+            or not isinstance(options.get("is_pull_request", False), bool)
+            or not isinstance(options.get("initial_turn", ""), str)):
+        return "Invalid session options."
+    resolution_error = options.get("repo_resolution_error", "").strip()
+    if resolution_error:
+        return _display_text(resolution_error, 300) or "GitHub repository resolution failed."
+    path = options.get("path", "").strip()
+    scratch = options.get("scratch", False)
+    is_pull_request = options.get("is_pull_request", False)
+    new_branch = options.get("new_branch", False)
+    branch = options.get("worktree_branch")
+    base_branch = options.get("base_branch")
+    if is_pull_request and not path:
+        return "This pull request has no repository path."
+    if is_pull_request and (
+        not isinstance(branch, str) or not branch or branch != branch.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in branch)
+    ):
+        return "This pull request has no valid head branch."
+    if is_pull_request and base_branch is not None and (
+        not isinstance(base_branch, str) or base_branch != base_branch.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in base_branch)
+    ):
+        return "This pull request has no valid target branch."
+    if branch is not None and (
+        not isinstance(branch, str) or not branch or branch != branch.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in branch)
+    ):
+        return "Invalid worktree branch."
+    if base_branch is not None and (
+        not isinstance(base_branch, str) or not base_branch
+        or base_branch != base_branch.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in base_branch)
+    ):
+        return "Invalid worktree base branch."
+    if new_branch and not branch:
+        return "Choose a worktree branch before creating it."
+    if base_branch and not (new_branch or is_pull_request):
+        return "A base branch requires a new worktree branch."
+    if scratch and (branch or new_branch or base_branch):
+        return "Scratch sessions cannot use worktree options."
+    if not scratch and not path:
+        return "Choose a project path or create a scratch session."
+    if len(options.get("initial_turn", "")) > 10000:
+        return "The initial session message is too long."
+    return None
+
+
+def _pr_worktree_args(path, head_branch, base_branch):
+    head_ref = subprocess.run(
+        ["git", "-C", path, "check-ref-format", "--branch", head_branch],
+        capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS, check=False,
+    )
+    if head_ref.returncode:
+        raise ValueError("Invalid pull request head branch.")
+    local_head = subprocess.run(
+        ["git", "-C", path, "show-ref", "--verify", "--quiet",
+         f"refs/heads/{head_branch}"],
+        capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS, check=False,
+    )
+    if local_head.returncode == 0:
+        return ["--worktree", head_branch]
+    if local_head.returncode != 1:
+        raise RuntimeError("Could not inspect local pull request branches.")
+    if not base_branch:
+        raise ValueError("Pull request target branch is unavailable.")
+    base_ref = subprocess.run(
+        ["git", "-C", path, "check-ref-format", "--branch", base_branch],
+        capture_output=True, text=True, timeout=ACTION_TIMEOUT_SECONDS, check=False,
+    )
+    if base_ref.returncode:
+        raise ValueError("Invalid pull request target branch.")
+    return [
+        "--worktree", head_branch, "--new-branch",
+        "--base-branch", base_branch,
+    ]
+
+
+def start_new_session(token, params, results):
+    def create():
+        option_error = _session_options_error(params)
+        if option_error:
+            results.put({"token": token, "label": "New session",
+                         "completed": False, "error": option_error})
+            return
+        title = params.get("title", "").strip()
+        path = params.get("path", "").strip()
+        profile = params.get("profile", "").strip()
+        tool_name = params.get("tool", "").strip()
+        group = params.get("group", "").strip()
+        branch = params.get("worktree_branch")
+        base_branch = params.get("base_branch")
+        initial_turn = params.get("initial_turn", "")
+        command = ["aoe", "add"]
+        if profile:
+            command.extend(["--profile", profile])
+        if tool_name:
+            command.extend(["--tool", tool_name])
+        if title:
+            command.extend(["--title", title])
+        if group:
+            command.extend(["--group", group])
+        try:
+            if branch:
+                if params.get("is_pull_request"):
+                    command.extend(_pr_worktree_args(path, branch, base_branch))
+                else:
+                    command.extend(["--worktree", branch])
+                    if params.get("new_branch"):
+                        command.append("--new-branch")
+                        if base_branch:
+                            command.extend(["--base-branch", base_branch])
+            if params.get("scratch") is True:
+                command.append("--scratch")
+            else:
+                if path.startswith("-"):
+                    command.append("--")
+                command.append(path)
+            created = subprocess.run(command, capture_output=True, text=True,
+                                     timeout=ACTION_TIMEOUT_SECONDS, check=False)
+            if created.returncode:
+                error = (created.stderr or created.stdout or "aoe add failed").strip()[:300]
+                results.put({"token": token, "label": "New session",
+                             "completed": False, "error": error})
+                return
+            match = re.search(r"(?m)^\s*ID:\s*(\S+)\s*$", created.stdout)
+            if not match:
+                results.put({"token": token, "label": "New session",
+                             "completed": False, "error": "aoe add did not report a session ID"})
+                return
+            session_id = match.group(1)
+            start_command = ["aoe", "session", "start"]
+            if profile:
+                start_command.extend(["--profile", profile])
+            start_command.append(session_id)
+            started = subprocess.run(start_command, capture_output=True, text=True,
+                                     timeout=ACTION_TIMEOUT_SECONDS, check=False)
+            if started.returncode:
+                error = (started.stderr or started.stdout or "aoe session start failed").strip()[:300]
+                results.put({"token": token, "label": "New session",
+                             "completed": False,
+                             "error": f"Created {session_id}, but start failed: {error}",
+                             "session_id": session_id})
+                return
+            if initial_turn:
+                time.sleep(INITIAL_MESSAGE_DELAY_SECONDS)
+                send_command = ["aoe", "send", "--no-revive"]
+                if profile:
+                    send_command.extend(["--profile", profile])
+                send_command.extend([session_id, initial_turn])
+                sent = subprocess.run(send_command, capture_output=True, text=True,
+                                      timeout=ACTION_TIMEOUT_SECONDS, check=False)
+                if sent.returncode:
+                    error = (sent.stderr or sent.stdout or "aoe send failed").strip()[:300]
+                    results.put({
+                        "token": token, "label": "New session", "completed": False,
+                        "error": f"Created {session_id}, but initial message failed: {error}",
+                        "session_id": session_id,
+                    })
+                    return
+            results.put({"token": token, "label": "New session",
+                         "completed": True, "error": "", "session_id": session_id})
+        except Exception as exc:
+            detail = str(exc).strip()[:300] or type(exc).__name__
+            results.put({"token": token, "label": "New session",
+                         "completed": False,
+                         "error": f"Session creation failed: {detail}"})
+
+    threading.Thread(target=create, daemon=True).start()
+
+
 def dispatch(message):
-    global refresh_requested, active_action, active_session_create, filter_refresh_requested
+    global refresh_requested, active_action, active_prompt, filter_refresh_requested
+    global dashboard_active, prompt_refresh_requested
     method = message.get("method", "")
     request_id = message.get("id")
     params = message.get("params")
     if not isinstance(params, dict):
         params = {}
-    if method == "attention.refresh":
+    session_id = params.get("session_id")
+    if (session_id is None
+            and method in {"attention.refresh", "attention.input", "attention.filter",
+                           "attention.action", "attention.new_session"}):
+        dashboard_active = True
+    result = {"ok": False, "error": "Unknown session."}
+    if session_id is not None and session_id not in live_session_ids:
+        pass
+    elif method == "attention.refresh":
         refresh_requested = True
         result = {"ok": True}
+    elif method == "attention.input":
+        if (not active_prompt or params.get("token") != active_prompt["token"]
+                or params.get("prompt_id") != active_prompt["id"]
+                or not (params.get("value") is None or isinstance(params.get("value"), str))):
+            result = {"ok": False, "error": "This prompt expired."}
+        else:
+            active_prompt = None
+            action_answers.put(params.get("value"))
+            prompt_refresh_requested = True
+            result = {"ok": True}
     elif method == "attention.filter":
         token = params.get("token")
-        if params.get("session_id") not in live_session_ids:
-            result = {"ok": False, "error": "Unknown session."}
-        else:
-            action = action_tokens.get(token) if isinstance(token, str) else None
-            kind = action.get("filter_kind") if isinstance(action, dict) else None
-            value = action.get("value") if isinstance(action, dict) else None
-            if (not isinstance(action, dict) or action.get("_aoe_operation") != "filter"
-                    or kind not in {"source", "provider"} or not isinstance(value, str)):
-                result = {"ok": False, "error": "This filter expired. Refresh the pane and try again."}
-            else:
-                action_tokens.pop(token, None)
-                with _filter_lock:
-                    filters = hidden_sources if kind == "source" else hidden_providers
-                    if value in filters:
-                        filters.remove(value)
-                    else:
-                        filters.add(value)
-                filter_refresh_requested = True
-                result = {"ok": True}
-    elif method in {"attention.action", "attention.new_session"}:
-        token = params.get("token")
-        session_id = params.get("session_id")
-        if session_id not in live_session_ids:
-            result = {"ok": False, "error": "Unknown session."}
-        elif active_action is not None or active_session_create is not None:
+        action = action_tokens.get(token) if isinstance(token, str) else None
+        kind = action.get("filter_kind") if isinstance(action, dict) else None
+        value = action.get("value") if isinstance(action, dict) else None
+        if (not isinstance(action, dict) or action.get("_aoe_operation") != "filter"
+                or kind not in {"source", "provider"} or not isinstance(value, str)):
+            result = {"ok": False, "error": "This filter expired. Refresh and try again."}
+        elif active_action is not None:
             result = {"ok": False, "error": "Another action is already running."}
         else:
-            action = action_tokens.get(token) if isinstance(token, str) else None
-            is_new_session = method == "attention.new_session"
-            valid = isinstance(action, dict) and (action.get("_aoe_operation") == "new_session") == is_new_session
-            if not valid:
-                result = {"ok": False, "error": "This action expired. Refresh the pane and try again."}
-            else:
-                action_tokens.pop(token, None)
-                request = {"token": token, "action": action, "session_id": session_id}
-                if is_new_session:
-                    active_session_create = request
-                    session_create_requests.put(request)
+            action_tokens.pop(token, None)
+            with _filter_lock:
+                filters = hidden_sources if kind == "source" else hidden_providers
+                if value in filters:
+                    filters.remove(value)
                 else:
-                    active_action = request
-                    action_requests.put(request)
+                    filters.add(value)
+            filter_refresh_requested = True
+            result = {"ok": True}
+    elif method == "attention.action":
+        token = params.get("token")
+        action = action_tokens.get(token) if isinstance(token, str) else None
+        if active_action is not None:
+            result = {"ok": False, "error": "Another action is already running."}
+        elif not isinstance(action, dict) or action.get("_aoe_operation"):
+            result = {"ok": False, "error": "This action expired. Refresh and try again."}
+        else:
+            action_tokens.pop(token)
+            consumed_action_ids.add(id(action))
+            active_action = {"token": token, "action": action, "session_id": session_id}
+            action_requests.put(active_action)
+            result = {"ok": True}
+    elif method == "attention.new_session":
+        token = params.get("token")
+        session_action = action_tokens.get(token) if isinstance(token, str) else None
+        item_id = None
+        if token is not None and (
+            not isinstance(session_action, dict)
+            or session_action.get("_aoe_operation") != "new_session"
+        ):
+            result = {"ok": False, "error": "This session action expired. Refresh and try again."}
+        else:
+            if token is not None:
+                options = session_action.get("params")
+                item_id = session_action.get("_item_id")
+            else:
+                options = {
+                    "title": params.get("title", ""),
+                    "path": params.get("path", ""),
+                    "profile": params.get("profile", ""),
+                    "tool": params.get("tool", ""),
+                    "group": params.get("group", ""),
+                    "worktree_branch": params.get("worktree_branch"),
+                    "new_branch": params.get("new_branch", False),
+                    "base_branch": params.get("base_branch"),
+                    "scratch": params.get("scratch", False),
+                }
+            error = _session_options_error(options)
+            if error:
+                result = {"ok": False, "error": error}
+            elif active_action is not None:
+                result = {"ok": False, "error": "Another action is already running."}
+            else:
+                active_token = token or secrets.token_urlsafe(18)
+                if token is not None:
+                    action_tokens.pop(token, None)
+                    if isinstance(item_id, int):
+                        consumed_session_item_ids.add(item_id)
+                active_action = {"token": active_token, "action": {
+                    "_aoe_operation": "new_session", "_item_id": item_id,
+                    "params": options, "label": "New session",
+                }, "session_id": session_id}
+                action_requests.put(active_action)
                 result = {"ok": True}
     else:
         result = {"ok": False, "error": f"Unsupported method: {method}"}
@@ -886,27 +1235,29 @@ def dispatch(message):
         send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
-
 def main():
 
     global published_ids, refresh_requested, action_tokens, live_session_ids
     global action_requests, action_results, active_action
-    global session_create_requests, active_session_create, live_sessions_by_id
-    global filter_refresh_requested, hidden_sources, hidden_providers, snapshot_fetched_at
-    filter_refresh_requested = False
+    global filter_refresh_requested, hidden_sources, hidden_providers, snapshot_fetched_at, dashboard_active
+    global action_answers, active_prompt, prompt_refresh_requested, consumed_action_ids
+    global consumed_session_item_ids
+    dashboard_active = False
     hidden_sources = set()
     hidden_providers = set()
     snapshot_fetched_at = None
     published_ids = set()
     refresh_requested = False
+    prompt_refresh_requested = False
     action_tokens = {}
+    consumed_action_ids = set()
+    consumed_session_item_ids = set()
     live_session_ids = set()
-    live_sessions_by_id.clear()
     action_requests = queue.Queue()
     action_results = queue.Queue()
-    session_create_requests = queue.Queue()
+    action_answers = queue.Queue()
     active_action = None
-    active_session_create = None
+    active_prompt = None
     results = queue.Queue(maxsize=1)
     base_payload = status_payload("Select Refresh to load attention items.")
     payload = base_payload
@@ -923,6 +1274,10 @@ def main():
             message = read_message(max(0, min(0.25, next_sessions - time.monotonic())))
             if isinstance(message, dict) and "method" in message:
                 dispatch(message)
+            if prompt_refresh_requested:
+                prompt_refresh_requested = False
+                payload = payload_with_notice(base_payload, "Action running.")
+                publish_payload(sessions, payload, items=snapshot_items)
             if filter_refresh_requested:
                 filter_refresh_requested = False
                 with _filter_lock:
@@ -955,55 +1310,58 @@ def main():
             if request is not None:
                 label = request["action"].get("label", "Action")
                 payload = payload_with_notice(base_payload, f"Running: {label}", request["token"])
-                action_tokens = {
-                    token: action for token, action in action_tokens.items()
-                    if token in _payload_action_tokens(payload)
-                }
+                base_payload = payload_with_notice(base_payload, "", request["token"])
                 publish_payload(sessions, payload, items=snapshot_items)
-                start_action(request["token"], request["action"], label, action_results)
+                if request["action"].get("_aoe_operation") == "new_session":
+                    start_new_session(request["token"], request["action"]["params"], action_results)
+                else:
+                    start_action(request["token"], request["action"], label, action_results)
                 action_in_flight = True
 
             try:
-                finished_token, finished_label, completed = action_results.get_nowait()
+                event = action_results.get_nowait()
             except queue.Empty:
-                finished_token = None
-            if finished_token is not None and active_action and active_action["token"] == finished_token:
-                action_in_flight = False
-                active_action = None
-                message_text = f"Completed: {finished_label}" if completed else f"Action failed: {finished_label}"
-                payload = payload_with_notice(base_payload, message_text, finished_token)
-                action_tokens = {
-                    token: action for token, action in action_tokens.items()
-                    if token in _payload_action_tokens(payload)
-                }
-                publish_payload(sessions, payload, items=snapshot_items)
-
-            try:
-                session_request = session_create_requests.get_nowait()
-            except queue.Empty:
-                session_request = None
-            if session_request is not None:
-                token = session_request["token"]
-                title = session_request["action"]["title"]
-                payload = payload_with_notice(base_payload, f"Creating session: {title}", token)
-                action_tokens = {
-                    token: action for token, action in action_tokens.items()
-                    if token in _payload_action_tokens(payload)
-                }
-                publish_payload(sessions, payload, items=snapshot_items)
-                try:
-                    created_id = create_session(session_request)
-                    message_text = f"Created session: {created_id}"
-                except Exception as exc:
-                    message_text = f"Session creation failed: {str(exc)[:160]}"
-                payload = payload_with_notice(base_payload, message_text, token)
-                action_tokens = {
-                    token: action for token, action in action_tokens.items()
-                    if token in _payload_action_tokens(payload)
-                }
-                publish_payload(sessions, payload, items=snapshot_items)
-                active_session_create = None
-                next_sessions = time.monotonic()
+                event = None
+            if event is not None and active_action and active_action["token"] == event["token"]:
+                if "prompt" in event:
+                    active_prompt = event["prompt"]
+                    payload = payload_with_notice(
+                        base_payload, "Input required. Continue in the Attention dashboard."
+                    )
+                    action_in_flight = False
+                    publish_payload(sessions, payload, items=snapshot_items)
+                else:
+                    completed_action = active_action["action"]
+                    if completed_action.get("_aoe_operation") == "new_session":
+                        item_id = completed_action.get("_item_id")
+                        if not event["completed"] and not event.get("session_id"):
+                            if isinstance(item_id, int):
+                                consumed_session_item_ids.discard(item_id)
+                    else:
+                        consumed_action_ids.discard(id(completed_action))
+                    active_action = None
+                    active_prompt = None
+                    action_in_flight = False
+                    message_text = (
+                        f"Created session: {event['session_id']}"
+                        if event["completed"] and event.get("session_id")
+                        else f"Completed: {event['label']}" if event["completed"]
+                        else f"{event['label']}: {event['error']}"
+                    )
+                    with _filter_lock:
+                        current_hidden_sources = set(hidden_sources)
+                        current_hidden_providers = set(hidden_providers)
+                    base_payload, action_tokens = build_pane(
+                        snapshot_items, fetched_at=snapshot_fetched_at,
+                        hidden_sources=current_hidden_sources,
+                        hidden_providers=current_hidden_providers,
+                    )
+                    payload = payload_with_notice(base_payload, message_text)
+                    next_sessions = time.monotonic()
+                    publish_payload(
+                        sessions, payload, items=snapshot_items,
+                        action_output=event.get("output", ""),
+                    )
 
             if refresh_requested:
                 refresh_requested = False
@@ -1026,6 +1384,8 @@ def main():
                     base_payload = updated_payload
                     payload = base_payload
                     action_tokens = updated_actions
+                    consumed_action_ids.clear()
+                    consumed_session_item_ids.clear()
                     snapshot_items = updated_items
                     snapshot_fetched_at = fetched_at
                 else:

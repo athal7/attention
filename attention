@@ -1059,16 +1059,59 @@ def act(key, line):
         return False
 
 
-def worker_action_cli():
-    """Internal JSON bridge for the isolated AoE worker action process."""
+def worker_action_cli(interactive=False):
+    """Internal JSON bridge; interactive callers answer one prompt at a time."""
+    import builtins
+
+    channel = sys.stdout
+    original_input = builtins.input
+
+    def emit(message):
+        channel.write(json.dumps(message, separators=(",", ":")) + "\n")
+        channel.flush()
+
+    def request_input(prompt):
+        sys.stderr.flush()
+        emit({"prompt": prompt})
+        line = sys.stdin.readline()
+        answer = json.loads(line) if line else None
+        if not isinstance(answer, dict) or "value" not in answer:
+            raise EOFError
+        value = answer["value"]
+        if value is None or not isinstance(value, str):
+            raise EOFError
+        return value
+
+    class InteractiveInput:
+        def __call__(self, text=""):
+            return request_input(str(text))
+
+        def prompt_spec(self, spec):
+            prompt = {"text": str(spec.get("prompt") or "Input")}
+            choices = spec.get("choices")
+            if isinstance(choices, list) and choices:
+                prompt["choices"] = [str(choice) for choice in choices]
+            default = spec.get("default")
+            if default is not None:
+                prompt["default"] = str(default)
+            value = request_input(prompt)
+            if choices:
+                if value not in prompt["choices"]:
+                    raise ValueError("Invalid choice.")
+                return value
+            value = value.strip()
+            if value:
+                return value
+            if default is not None:
+                return str(default)
+            raise EOFError
+
     try:
-        action = json.load(sys.stdin)
-        previous_stdout = sys.stdout
+        action = json.loads(sys.stdin.readline()) if interactive else json.load(sys.stdin)
         sys.stdout = sys.stderr
-        try:
-            completed = dispatch_item_action(action)
-        finally:
-            sys.stdout = previous_stdout
+        if interactive:
+            builtins.input = InteractiveInput()
+        completed = dispatch_item_action(action)
         result = {"ok": completed}
         if not completed:
             result["error"] = "Action did not complete."
@@ -1076,8 +1119,10 @@ def worker_action_cli():
         result = {"ok": False, "error": "Action canceled."}
     except Exception as exc:
         result = {"ok": False, "error": str(exc)[:400]}
-    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    finally:
+        builtins.input = original_input
+        sys.stdout = channel
+    emit(result)
     return 0 if result["ok"] else 1
 
 def acknowledge_action():
@@ -1133,6 +1178,8 @@ def run_dashboard():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "__worker_action__":
         sys.exit(worker_action_cli())
+    elif len(sys.argv) > 1 and sys.argv[1] == "__worker_action_interactive__":
+        sys.exit(worker_action_cli(interactive=True))
     elif len(sys.argv) > 3 and sys.argv[1] == "act":
         act(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 1 and sys.argv[1] == "expect-keys":

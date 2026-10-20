@@ -1472,6 +1472,8 @@ def fetch(config):
             "number": number,
             "id": number,
             "repo_path": repo_path,
+            "head_branch": g.get("headRefName") or "",
+            "base_branch": g.get("baseRefName") or "",
             "slug": slug,
             "repo_project_path": repo_project_path,
             "repo": repo_name,

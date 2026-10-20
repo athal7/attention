@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attention</title>
+  <style>
+    :root { color-scheme: dark light; font: 14px system-ui, sans-serif; --fg: #222; --surface: #fff; --border: #bbb; --muted: #666; --accent: #5865c3; --warning: #a55b00; --error: #b42318; --success: #18794e; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 1rem; color: var(--fg); background: var(--surface); }
+    button, input, select, textarea { font: inherit; color: inherit; }
+    button { border: 1px solid var(--border); border-radius: .45rem; padding: .45rem .7rem; background: transparent; cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    button:disabled { opacity: .55; cursor: wait; }
+    header { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    h1 { font-size: 1.4rem; margin: 0 auto 0 0; }
+    h2 { font-size: 1.05rem; border-bottom: 1px solid var(--border); padding-bottom: .4rem; }
+    input[type="search"] { min-width: 12rem; padding: .45rem; border: 1px solid var(--border); border-radius: .45rem; background: transparent; }
+    #group-filter { padding: .45rem; border: 1px solid var(--border); border-radius: .45rem; background: transparent; }
+    #new-session-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: .75rem 1rem; align-items: end; }
+    #new-session-form > label { display: grid; gap: .3rem; min-width: 0; }
+    #new-session-form input[type="text"] { width: 100%; min-width: 0; padding: .45rem; border: 1px solid var(--border); border-radius: .45rem; background: transparent; }
+    #new-session-form .checkbox-field { display: flex; align-items: center; gap: .5rem; min-height: 2.4rem; }
+    #new-session-form .checkbox-field input { margin: 0; }
+    #new-session-form .actions { grid-column: 1 / -1; margin: .2rem 0 0; }
+    @media (max-width: 42rem) {
+      #new-session-form { grid-template-columns: minmax(0, 1fr); }
+    }
+    #filters, .indicators, .actions { display: flex; gap: .4rem; flex-wrap: wrap; margin: .6rem 0; }
+    .filter[data-hidden="true"] { opacity: .55; text-decoration: line-through; }
+    .muted { color: var(--muted); }
+    .notice, .card { border: 1px solid var(--border); border-radius: .6rem; padding: .75rem; margin: .6rem 0; }
+    .error { color: var(--error); }
+    .group { margin: 1rem 0; }
+    .title { font-weight: 650; }
+    .summary, .details { white-space: pre-wrap; overflow-wrap: anywhere; margin: .45rem 0; }
+    .indicator { border: 1px solid var(--border); border-radius: 1rem; padding: .2rem .5rem; }
+    .session { font-size: .85rem; }
+    .prompt { position: sticky; bottom: 0; background: var(--surface); border: 2px solid var(--accent); border-radius: .6rem; padding: .8rem; box-shadow: 0 0 1rem #0003; }
+    .prompt textarea { display: block; width: 100%; min-height: 5rem; margin: .6rem 0; background: transparent; border: 1px solid var(--border); border-radius: .4rem; padding: .5rem; }
+    .prompt select { margin: .6rem 0; max-width: 100%; padding: .4rem; }
+    .prompt pre { white-space: pre-wrap; max-height: 10rem; overflow: auto; color: var(--muted); }
+    .action-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: .7rem; border: 1px solid var(--border); border-radius: .45rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Attention</h1>
+    <input id="search" type="search" placeholder="Filter items" aria-label="Filter items">
+    <label for="group-filter">Group
+      <select id="group-filter"><option value="">All groups</option></select>
+    </label>
+    <button id="show-new-session" type="button">New session</button>
+    <button id="refresh">Refresh</button>
+    <span id="updated" class="muted"></span>
+  </header>
+  <section id="new-session" class="card" hidden>
+    <h2>New session</h2>
+    <div id="new-session-form">
+      <label>Project path <input id="session-path" type="text" placeholder="/path/to/project" aria-required="true"></label>
+      <label>Profile <input id="session-profile" type="text" placeholder="Optional"></label>
+      <label>Tool <input id="session-tool" type="text" placeholder="Optional AoE tool, e.g. omp"></label>
+      <label>Group <input id="session-group" type="text" placeholder="Optional"></label>
+      <label>Title <input id="session-title" type="text" placeholder="Optional"></label>
+      <label>Worktree branch <input id="session-worktree" type="text" placeholder="Optional"></label>
+      <label class="checkbox-field"><input id="session-new-branch" type="checkbox"> Create a new worktree branch</label>
+      <label>Base branch <input id="session-base-branch" type="text" placeholder="For a new branch"></label>
+      <label class="checkbox-field"><input id="session-scratch" type="checkbox"> Create a scratch session</label>
+      <div class="actions"><button id="create-session" type="button">Create and start</button></div>
+    </div>
+  </section>
+  <div id="filters" aria-label="Source filters"></div>
+  <main id="items" aria-live="polite"></main>
+  <div id="prompt-root"></div>
+  <script>
+    (() => {
+      'use strict';
+      let port, nextId = 0, state = null, selectedGroup = '';
+      const pending = new Map();
+      const pendingActions = new Set();
+      const hidden = new Set();
+      const byId = id => document.getElementById(id);
+
+      function call(method, params = {}) {
+        if (!port) return Promise.reject(Error('Dashboard bridge is not ready'));
+        const id = ++nextId;
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject });
+          port.postMessage({ aoeBridge: 1, id, method, params });
+        });
+      }
+
+      function text(tag, value, className) {
+        const element = document.createElement(tag);
+        if (value !== undefined && value !== null) element.textContent = String(value);
+        if (className) element.className = className;
+        return element;
+      }
+
+      function showError(error) {
+        const message = error && error.message ? error.message : String(error);
+        byId('items').prepend(text('div', message, 'notice error'));
+      }
+
+      function runAction(method, params) {
+        return call('action', { method, params }).then(result => {
+          if (!result || result.ok !== true) throw Error(result && result.error || 'Action failed.');
+          return result;
+        });
+      }
+
+      function renderFilters(items) {
+        const names = new Map();
+        for (const item of items) {
+          if (item.source) names.set(`source:${item.source}`, { kind: 'source', name: item.source });
+          if (item.provider) names.set(`provider:${item.provider}`, { kind: 'provider', name: item.provider });
+        }
+        const filters = [...names.values()].sort((a, b) =>
+          a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+        const buttons = filters.map(({ kind, name }) => {
+          const key = `${kind}:${name}`;
+          const button = text('button', `${kind}: ${name}`, 'filter');
+          button.dataset.hidden = hidden.has(key);
+          button.onclick = () => {
+            hidden.has(key) ? hidden.delete(key) : hidden.add(key);
+            render();
+          };
+          return button;
+        });
+        const groupNames = [...new Set(items.map(item => item.group || 'Attention'))]
+          .sort((a, b) => a.localeCompare(b));
+        if (selectedGroup && !groupNames.includes(selectedGroup)) selectedGroup = '';
+        const groupFilter = byId('group-filter');
+        const options = [text('option', 'All groups')];
+        options[0].value = '';
+        for (const name of groupNames) {
+          const option = text('option', name);
+          option.value = name;
+          options.push(option);
+        }
+        groupFilter.replaceChildren(...options);
+        groupFilter.value = selectedGroup;
+        byId('filters').replaceChildren(...buttons);
+      }
+
+      function renderItems() {
+        const root = byId('items');
+        root.replaceChildren();
+        const items = state.items || [];
+        const failures = state.failures || [];
+        byId('updated').textContent = state.fetched_at ? `Updated ${state.fetched_at}` : '';
+        byId('create-session').disabled = !!state.busy;
+        if (state.error) root.append(text('div', state.error, 'notice error'));
+        for (const failure of failures) {
+          root.append(text('div', `${failure.source || 'Attention'} collector failed: ${failure.error}`, 'notice error'));
+        }
+        if (state.status && state.status !== state.error) {
+          root.append(text('div', state.status, 'notice'));
+        }
+        if (state.action_output) root.append(text('pre', state.action_output, 'action-output'));
+        const omitted = (state.omitted_items || 0) + (state.omitted_failures || 0);
+        if (omitted) root.append(text('div', `${omitted} dashboard entries were omitted to fit the page size limit.`, 'notice'));
+        if (state.busy && !state.prompt) root.append(text('div', 'Action running…', 'notice'));
+        const query = byId('search').value.trim().toLocaleLowerCase();
+        const groups = new Map();
+        let visibleItems = 0;
+        for (const item of items) {
+          if (hidden.has(`source:${item.source}`)
+              || (item.provider && hidden.has(`provider:${item.provider}`))) continue;
+          if (selectedGroup && (item.group || 'Attention') !== selectedGroup) continue;
+          const searchable = [item.title, item.status, item.context, item.reason, item.details,
+            item.source, item.provider, ...Object.values(item.indicators || {})]
+            .filter(Boolean).join(' ').toLocaleLowerCase();
+          if (query && !searchable.includes(query)) continue;
+          visibleItems += 1;
+          const name = item.group || 'Attention';
+          if (!groups.has(name)) groups.set(name, []);
+          groups.get(name).push(item);
+        }
+        const ordered = [...groups].sort((a, b) => (a[1][0].group_order || 0) - (b[1][0].group_order || 0));
+        for (const [name, groupedItems] of ordered) {
+          const section = text('section', undefined, 'group');
+          section.append(text('h2', name));
+          for (const item of groupedItems) {
+            const card = text('article', undefined, 'card');
+            if (item.url) {
+              const link = text('a', item.title, 'title');
+              link.href = item.url;
+              link.target = '_blank';
+              link.rel = 'noopener noreferrer';
+              card.append(link);
+            } else {
+              card.append(text('div', item.title, 'title'));
+            }
+            const summary = [item.status, item.context, item.reason].filter(Boolean).join(' · ');
+            if (summary) card.append(text('div', summary, 'summary'));
+            if (item.details) card.append(text('div', item.details, 'details'));
+            const indicators = text('div', undefined, 'indicators');
+            const indicatorValues = item.indicators || {};
+            const columns = Array.isArray(item.columns) ? item.columns : Object.keys(indicatorValues);
+            for (const key of columns) {
+              const label = (item.column_labels || {})[key] || key.toUpperCase();
+              const value = Object.prototype.hasOwnProperty.call(indicatorValues, key)
+                ? indicatorValues[key] : '—';
+              indicators.append(text('span', `${label}: ${value}`, 'indicator'));
+            }
+            if (indicators.childNodes.length) card.append(indicators);
+            if (item.session) {
+              const open = text('button', `Open session: ${item.session.title}`, 'session');
+              open.onclick = () => call('openSession', { id: item.session.id }).catch(showError);
+              card.append(open);
+            }
+            const actions = text('div', undefined, 'actions');
+            for (const action of item.actions || []) {
+              const button = text('button', action.label);
+              button.disabled = !!state.busy || pendingActions.has(action.token);
+              button.onclick = () => {
+                pendingActions.add(action.token);
+                renderItems();
+                runAction(action.method || 'attention.action', { token: action.token }).then(poll).catch(error => {
+                  pendingActions.delete(action.token);
+                  renderItems();
+                  showError(error);
+                });
+              };
+              actions.append(button);
+            }
+            if (actions.childNodes.length) card.append(actions);
+            section.append(card);
+          }
+          root.append(section);
+        }
+        if (!visibleItems && !omitted && !state.error) {
+          let message = '';
+          if (items.length) {
+            message = 'No attention items match the current filters.';
+          } else if (!failures.length) {
+            message = state.fetched_at ? 'No attention items.'
+              : state.status ? '' : 'Loading attention items…';
+          }
+          if (message) root.append(text('div', message, 'muted'));
+        }
+      }
+
+
+      function submitPrompt(value) {
+        const prompt = state && state.prompt;
+        if (!prompt) return;
+        for (const button of byId('prompt-root').querySelectorAll('button')) button.disabled = true;
+        runAction('attention.input', {
+          token: prompt.token, prompt_id: prompt.id, value,
+        }).then(poll).catch(error => {
+          showError(error);
+          if (state && state.prompt && state.prompt.id === prompt.id) {
+            for (const button of byId('prompt-root').querySelectorAll('button')) {
+              button.disabled = false;
+            }
+          }
+        });
+      }
+
+      function renderPrompt() {
+        const root = byId('prompt-root');
+        root.replaceChildren();
+        const prompt = state && state.prompt;
+        if (!prompt) return;
+        const panel = text('section', undefined, 'prompt');
+        panel.append(text('strong', prompt.text || 'Input required'));
+        if (prompt.context) panel.append(text('pre', prompt.context));
+        let field;
+        if (Array.isArray(prompt.choices) && prompt.choices.length) {
+          field = document.createElement('select');
+          for (const choice of prompt.choices) {
+            const option = text('option', choice);
+            option.value = String(choice);
+            field.append(option);
+          }
+          if (prompt.default !== undefined) field.value = String(prompt.default);
+        } else {
+          field = document.createElement('textarea');
+          field.value = prompt.default == null ? '' : String(prompt.default);
+          field.placeholder = 'Enter a response';
+          field.onkeydown = event => {
+            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitPrompt(field.value);
+          };
+        }
+        panel.append(field);
+        const submit = text('button', 'Continue');
+        submit.onclick = () => submitPrompt(field.value);
+        panel.append(submit);
+        const cancel = text('button', 'Cancel');
+        cancel.onclick = () => submitPrompt(null);
+        panel.append(cancel);
+        root.append(panel);
+        field.focus();
+      }
+
+      function render() {
+        if (!state) return;
+        renderFilters(state.items || []);
+        renderItems();
+        renderPrompt();
+      }
+      byId('search').oninput = render;
+      byId('group-filter').onchange = event => {
+        selectedGroup = event.target.value;
+        renderItems();
+      };
+
+      async function poll() {
+        try {
+          const response = await call('plugins.uiState');
+          const entries = Array.isArray(response) ? response : response && response.entries || [];
+          const entry = entries.find(candidate => candidate.plugin_id === 'athal7.attention'
+            && candidate.slot === 'page' && candidate.id === 'dashboard');
+          if (entry && entry.payload && JSON.stringify(entry.payload) !== JSON.stringify(state)) {
+            const tokens = new Set();
+            for (const item of entry.payload.items || []) {
+              for (const action of item.actions || []) tokens.add(action.token);
+            }
+            for (const token of pendingActions) {
+              if (!tokens.has(token)) pendingActions.delete(token);
+            }
+            state = entry.payload;
+            render();
+          }
+        } catch (error) {
+          showError(error);
+        }
+      }
+
+      byId('show-new-session').onclick = () => {
+        byId('new-session').hidden = !byId('new-session').hidden;
+        if (!byId('new-session').hidden) byId('session-path').focus();
+      };
+      byId('session-scratch').onchange = event => {
+        const scratch = event.target.checked;
+        byId('session-path').disabled = scratch;
+        byId('session-path').setAttribute('aria-required', String(!scratch));
+        byId('session-worktree').disabled = scratch;
+        byId('session-new-branch').disabled = scratch;
+        byId('session-base-branch').disabled = scratch;
+        if (scratch) {
+          byId('session-worktree').value = '';
+          byId('session-new-branch').checked = false;
+          byId('session-base-branch').value = '';
+        }
+      };
+      const submitNewSession = () => {
+        const submit = byId('create-session');
+        if (submit.disabled) return;
+        const scratch = byId('session-scratch').checked;
+        const path = byId('session-path').value;
+        if (!scratch && !path.trim()) {
+          byId('session-path').focus();
+          showError(Error('Project path is required unless creating a scratch session.'));
+          return;
+        }
+        submit.disabled = true;
+        const worktreeBranch = byId('session-worktree').value.trim();
+        const baseBranch = byId('session-base-branch').value.trim();
+        const options = {
+          title: byId('session-title').value,
+          path,
+          new_branch: byId('session-new-branch').checked,
+          scratch,
+        };
+        const profile = byId('session-profile').value.trim();
+        const group = byId('session-group').value.trim();
+        const toolName = byId('session-tool').value.trim();
+        if (toolName) options.tool = toolName;
+        if (profile) options.profile = profile;
+        if (group) options.group = group;
+        if (worktreeBranch) options.worktree_branch = worktreeBranch;
+        if (baseBranch) options.base_branch = baseBranch;
+        runAction('attention.new_session', options).then(() => {
+          byId('new-session').hidden = true;
+        }).catch(showError).finally(() => { submit.disabled = false; });
+      };
+      byId('create-session').onclick = submitNewSession;
+      byId('new-session-form').onkeydown = event => {
+        if (event.key === 'Enter' && event.target.tagName === 'INPUT' && event.target.type === 'text') {
+          event.preventDefault();
+          submitNewSession();
+        }
+      };
+      byId('refresh').onclick = () => runAction('attention.refresh', {}).then(poll).catch(showError);
+      const channel = new MessageChannel();
+      channel.port1.onmessage = ({ data }) => {
+        if (data.event) {
+          if (data.event === 'theme' && data.data.cssVars) {
+            for (const [name, value] of Object.entries(data.data.cssVars)) {
+              document.documentElement.style.setProperty(name, String(value));
+            }
+          }
+          return;
+        }
+        const request = pending.get(data.id);
+        if (!request) return;
+        pending.delete(data.id);
+        data.error ? request.reject(Error(data.error.message)) : request.resolve(data.result);
+      };
+      port = channel.port1;
+      const readyId = ++nextId;
+      parent.postMessage({ aoeBridge: 1, id: readyId, method: 'ready',
+        params: { nonce: location.hash.slice(1) } }, '*', [channel.port2]);
+      setTimeout(() => runAction('attention.refresh', {}).then(poll).catch(showError), 250);
+      setInterval(poll, 1000);
+    })();
+  </script>
+</body>
+</html>

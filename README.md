@@ -67,7 +67,8 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
       {
         "key": "l",
         "label": "lumen",
-        "command": ["lumen", "diff", "{url}"]
+        "command": ["lumen", "diff", "{url}"],
+        "terminal": true
       }
     ]
   },
@@ -90,7 +91,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
-| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` template placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}` for a prompted value), optional `"background": true`, optional `"wip": true` to mark or `"wip": "clear"` to unmark the item when it runs successfully, and optional `"input"` to prompt for text or pick-one input before running (see [PLUGINS.md](PLUGINS.md)). |
+| `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}`), optional `"terminal": true` to run in a separate terminal window, optional `"background": true` for fire-and-forget commands, optional `"wip"` to update work-in-progress state, and optional `"input"`/`"inputs"` prompts (see [PLUGINS.md](PLUGINS.md)). GitHub action templates also expose `{head_branch}` and `{base_branch}` for PR worktrees (empty when unavailable). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, and/or `any`) or `fallback: true`. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
@@ -213,61 +214,60 @@ just point `config["plugins"]` at it.
 
 ## Agent of Empires web dashboard
 
-This repository also provides an Agent of Empires community plugin that
-publishes prioritized Attention items in each session's right-hand pane.
-Install from the repository root with `aoe plugin install .`, then enable it with
-`aoe plugin enable athal7.attention`.
-AoE requests the plugin's `session.create`, `session.prompt`, and
-`session.unattended` capabilities. `session.create` enables **New session** for
-AoE-reviewed interactive agents; `session.prompt` lets the plugin send the
-source's initial task when available.
-The plugin needs `session.unattended` for unattended defaults such as `omp`; this
-plugin-wide grant may let any configured agent bypass interactive approval.
-Grant it only if that behavior is acceptable; otherwise choose an AoE-reviewed
-interactive ACP agent in the **New session agent** setting.
+This repository provides an Agent of Empires community plugin with a full
+Attention dashboard page and an Attention pane in each session. Install from the
+repository root with `aoe plugin install .`, then enable it with
+`aoe plugin enable athal7.attention`. The dashboard page requires AoE 1.20 or
+newer.
 
-Each card's **New session** action resolves the GitHub repository by owner/name
-from verified GitHub remotes, including upstream remotes. A unique registered
-project in the host session's profile is preferred over unregistered copies;
-within the chosen candidates, `origin` takes precedence over other remotes.
-For a registered bare repository, the resolver verifies identity through its
-default-branch worktree but passes the registered project path to AoE. Missing
-or ambiguous matches fail closed: Attention does not guess from a same-named
-folder or create a scratch session.
+The dashboard uses the same prioritized items, configured groups and indicator
+columns, source actions, and configured actions as the terminal dashboard. It
+displays details, filters by configured group and source/provider, and links
+matching live sessions. Both the full page and the session pane expose every
+configured action except own-PR approvals. The pane groups action buttons into
+pairs; the primary row represents the first unprompted open action, while other
+open actions remain available as buttons.
+Actions that request input publish their prompts in the full dashboard page;
+open that page from the AoE Pages menu to answer. The page and pane invoke the
+same configured CLI action implementation. `"terminal": true` actions open a
+separate terminal window. Other actions' captured stdout and stderr—including
+configured command output—appear in the full dashboard after completion.
 
-Attention invokes AoE's worktree-aware `add` command with the resolved project
-path, a deterministic action branch, the host session's profile and group, the
-configured agent, and the item title. For pull requests, the source-generated
-initial task tells the agent to check out the PR head branch, while AoE creates
-the worktree from the PR base branch. Attention sends that task with
-`aoe acp prompt`, retrying transient worker-startup responses for up to 30
-seconds. Other prompt errors fail immediately; if AoE cannot create the
-worktree or accept the prompt, Attention reports the failure and never falls
-back to a shared checkout.
+The dashboard's **New session** form creates a normal terminal-mode AoE session
+from a project path or scratch directory, then starts it with `aoe session
+start`. It supports the CLI's profile, tool, group, title, and worktree
+branch/base options. It does not use ACP or require structured-session settings.
+Configured per-item actions labeled `session` or `New session` replace the
+generated session action and run through the source's configured CLI action,
+preserving its command, prompts, resume behavior, and worktree handling.
+
+GitHub session actions resolve the repository by owner/name from verified
+GitHub remotes, including upstream remotes. A unique registered project in the
+host session's profile is preferred over unregistered copies; within the chosen
+candidates, `origin` takes precedence over other remotes. For a registered bare
+repository, the resolver verifies identity through its default-branch worktree
+but passes the registered project path to AoE. Missing or ambiguous matches
+fail closed; Attention does not guess from a same-named folder or create a
+scratch session. Pull requests reuse an existing local head branch, or create
+the worktree branch from the pull request's target with `--new-branch
+--base-branch`. The source's initial review message is sent with `aoe send
+--no-revive` after the session starts.
+
+The plugin needs `process.spawn` to run the same local CLI actions as the
+terminal dashboard, including `aoe add`, `aoe session start`, and `aoe send`. Its
+requested filesystem, clipboard, browser, and network capabilities are used by
+configured actions and sources; grant only capabilities whose behavior is
+acceptable for the actions configured on this machine.
 
 Each card title includes a source icon: a branch for GitHub, a circle for
 Linear, a calendar for calendar events, a checklist for reminders, and an
 inbox for generic or unrecognized sources. A stack's base PR stays visible;
-dependent PRs start folded in a native collapsible **Stacked pull requests**
-section. Expanding it reveals each dependent PR card in parent-first order,
-with its own actions. Missing stack members do not prevent visible children
-from appearing. State indicators use colored icons, including PR review and CI
-state. When exactly one running AoE session matches
-a GitHub PR's repository and head branch, or an Attention-created session's
-unique title, the card also links to that session. The item title and summary
-still open the source directly; no separate **Open** button is shown. Status,
-context, and recommendation are combined into one summary.
-Lumen diff actions and actions requiring prompted input are omitted from the
-web pane; they remain available in the terminal dashboard. Collector failures
-appear as named, sanitized notes alongside healthy items; exception messages
-are never shown. The **Refresh** button stays at the top of the pane; items
-load only when **Refresh** is selected. Expand **Filters** to hide or show
-individual sources and configured generic providers; filter choices update with
-each refresh and selections last for the worker's lifetime. Each result is
-labelled with its UTC fetch time. Session enumeration and actions update pane
-state without fetching attention sources.
+dependent PRs start folded in the pane. State indicators include PR review and
+CI state. Collector failures appear as named, sanitized notes alongside healthy
+items; exception messages are never shown. The **Refresh** button stays at the top
+of the pane. The dashboard page refreshes automatically when opened, and its
+configured-group, source, and provider filters remain active while it is open.
+
 The `attention` GitHub source does not persist a snapshot locally. It uses
-`gh search`; `gh api --cache` covers GET requests and does not cache those searches.
-No stale snapshot is shown as current. At most one source action plus **New
-session** is shown per item; **Approve** is hidden on pull requests authored by
-the current GitHub user.
+`gh search`; `gh api --cache` covers GET requests and does not cache those
+searches. No stale snapshot is shown as current.
