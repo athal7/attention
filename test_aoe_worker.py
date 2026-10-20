@@ -1489,7 +1489,8 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 "    count = int(FETCHES.read_text()) + 1 if FETCHES.exists() else 1\n"
                 "    FETCHES.write_text(str(count))\n"
                 "    return [{'status':'NOW','context':'QA','title':'Fetch','details':'ready',"
-                "'weight':10,'_plugin':'generic','actions':["
+                "'weight':10,'_plugin':'github','kind':'issue',"
+                "'repo_resolution_error':'Attention item has no AoE project path.','actions':["
                 "{'key':'o','label':'Run QA','primary':True,'_plugin':'generic',"
                 "'_original_key':'o','payload':{'command':['echo','run'] }},"
                 "{'key':'p','label':'Prompt QA','_plugin':'generic',"
@@ -1641,6 +1642,11 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 self.assertTrue(completed_seen, "page omitted action completion feedback")
                 self.assertEqual(action_output, "source action output")
                 self.assertEqual(fetches.read_text(), "1", "action completion fetched implicitly")
+                session_button = next(
+                    action for action in completed_page["items"][0]["actions"]
+                    if action["label"] == "New session"
+                )
+                new_session_token = session_button["token"]
 
                 send_action("stale", token, "s1")
                 stale = wait_response("stale")
@@ -1648,29 +1654,16 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 self.assertIn("expired", stale["result"]["error"])
                 self.assertIsNotNone(new_session_token)
                 send_action("create-session", new_session_token, "s1", method="attention.new_session")
-                accepted = wait_response("create-session")
-                self.assertTrue(accepted["result"]["ok"])
-                created_notice_seen = False
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline and not created_notice_seen:
-                    message = receive(max(0.01, deadline - time.monotonic()))
-                    if message.get("method") == "ui.state.set":
-                        state = json.dumps(message["params"]["payload"])
-                        created_notice_seen = (
-                            "Session creation failed: Attention item has no AoE project path."
-                            in state
-                        )
-                        reply(message)
-                    elif message.get("method") == "sessions.list":
-                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
-                    else:
-                        self.fail(f"unexpected host RPC during create: {message}")
-                self.assertTrue(created_notice_seen, "pane did not fail closed for an unmapped repository")
+                rejected = wait_response("create-session")
+                self.assertFalse(rejected["result"]["ok"])
+                self.assertIn("Attention item has no AoE project path.",
+                              rejected["result"]["error"])
                 self.assertEqual(fetches.read_text(), "1", "session creation fetched implicitly")
                 send_action("duplicate-session", new_session_token, "s1", method="attention.new_session")
                 duplicate_session = wait_response("duplicate-session")
                 self.assertFalse(duplicate_session["result"]["ok"])
-                self.assertIn("expired", duplicate_session["result"]["error"])
+                self.assertIn("Attention item has no AoE project path.",
+                              duplicate_session["result"]["error"])
 
                 prompt_button = next(
                     action for action in completed_page["items"][0]["actions"]
