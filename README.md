@@ -232,6 +232,8 @@ open that page from the AoE Pages menu to answer. The page and pane invoke the
 same configured CLI action implementation. `"terminal": true` actions open a
 separate terminal window. Other actions' captured stdout and stderr—including
 configured command output—appear in the full dashboard after completion.
+The page treats a resolved action-bridge reply as delivery acknowledgment;
+completion and asynchronous outcomes come from updated dashboard state.
 
 The dashboard's **New session** form creates a normal terminal-mode AoE session
 from a project path or scratch directory, then starts it with `aoe session

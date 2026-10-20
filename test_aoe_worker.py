@@ -6,6 +6,7 @@ import os
 import queue
 import select
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -49,6 +50,85 @@ def _receive_json_line(stream, buffer, timeout, timeout_message):
         if not chunk:
             raise AssertionError("worker exited before replying")
         buffer.extend(chunk)
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard page tests")
+class DashboardPageTests(unittest.TestCase):
+    def test_page_accepts_delivery_ack_and_shows_worker_or_bridge_errors(self):
+        harness = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const html = fs.readFileSync(process.argv[1], "utf8");
+const source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+
+async function run(actionReply) {
+  const elements = new Map();
+  const makeElement = tag => ({
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    style: { setProperty() {} },
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    prepend(child) { this.children.unshift(child); },
+    setAttribute() {},
+    focus() {},
+    querySelectorAll() { return []; },
+    hidden: false,
+    disabled: false,
+    value: "",
+  });
+  const document = {
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeElement("div"));
+      return elements.get(id);
+    },
+    createElement: makeElement,
+    documentElement: makeElement("html"),
+  };
+  document.getElementById("items");
+  const timers = [];
+  const port1 = {
+    onmessage: null,
+    postMessage(message) {
+      const reply = message.method === "action" ? actionReply : { result: [] };
+      queueMicrotask(() => this.onmessage({ data: { id: message.id, ...reply } }));
+    },
+  };
+  vm.runInNewContext(source, {
+    document,
+    MessageChannel: function MessageChannel() { return { port1, port2: {} }; },
+    parent: { postMessage() {} },
+    location: { hash: "#nonce" },
+    setTimeout(callback) { timers.push(callback); },
+    setInterval() {},
+  });
+  await timers[0]();
+  return elements.get("items").children
+    .filter(child => child.className === "notice error")
+    .map(child => child.textContent);
+}
+
+(async () => {
+  const errors = await run({ result: { accepted: true } });
+  if (errors.length) throw new Error(`delivery acknowledgement rejected: ${errors}`);
+  const workerRejected = await run({ result: { ok: false, error: "busy" } });
+  if (workerRejected[0] !== "busy") {
+    throw new Error(`worker rejection was not shown: ${workerRejected}`);
+  }
+  const rejected = await run({ error: { message: "bridge unavailable" } });
+  if (rejected[0] !== "bridge unavailable") {
+    throw new Error(`bridge rejection was not shown: ${rejected}`);
+  }
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", harness, str(ROOT / "attention.html")],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class PanePayloadTests(unittest.TestCase):

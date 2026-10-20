@@ -103,8 +103,9 @@
       }
 
       function runAction(method, params) {
+        // The bridge acknowledges delivery; worker outcomes are also published through uiState.
         return call('action', { method, params }).then(result => {
-          if (!result || result.ok !== true) throw Error(result && result.error || 'Action failed.');
+          if (result && result.ok === false) throw Error(result.error || 'Action failed.');
           return result;
         });
       }
