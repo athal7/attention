@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Attention</title>
   <style>
-    :root { color-scheme: dark light; font: 14px system-ui, sans-serif; --fg: #222; --surface: #fff; --border: #bbb; --muted: #666; --accent: #5865c3; --warning: #a55b00; --error: #b42318; --success: #18794e; }
+    :root { color-scheme: light dark; font: 14px system-ui, sans-serif; --fg: CanvasText; --surface: Canvas; --border: color-mix(in srgb, CanvasText 20%, Canvas); --muted: GrayText; --accent: AccentColor; --warning: #a55b00; --error: #b42318; --success: #18794e; }
     * { box-sizing: border-box; }
     body { margin: 0; padding: 1rem; color: var(--fg); background: var(--surface); }
     button, input, select, textarea { font: inherit; color: inherit; }
@@ -41,6 +41,12 @@
     .prompt select { margin: .6rem 0; max-width: 100%; padding: .4rem; }
     .prompt pre { white-space: pre-wrap; max-height: 10rem; overflow: auto; color: var(--muted); }
     .action-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; padding: .7rem; border: 1px solid var(--border); border-radius: .45rem; }
+    summary { cursor: pointer; }
+    #filter-menu > summary, .action-menu > summary { color: var(--muted); font-size: .9rem; }
+    .action-menu { margin-top: .55rem; }
+    @media (prefers-color-scheme: dark) {
+      :root { --warning: #ffb86c; --error: #ff6b6b; --success: #54d390; }
+    }
   </style>
 </head>
 <body>
@@ -69,7 +75,10 @@
       <div class="actions"><button id="create-session" type="button">Create and start</button></div>
     </div>
   </section>
-  <div id="filters" aria-label="Source filters"></div>
+  <details id="filter-menu" class="card">
+    <summary>Source filters</summary>
+    <div id="filters" aria-label="Source filters"></div>
+  </details>
   <main id="items" aria-live="polite"></main>
   <div id="prompt-root"></div>
   <script>
@@ -142,6 +151,7 @@
         groupFilter.replaceChildren(...options);
         groupFilter.value = selectedGroup;
         byId('filters').replaceChildren(...buttons);
+        byId('filter-menu').hidden = filters.length === 0;
       }
 
       function renderItems() {
@@ -206,29 +216,38 @@
               indicators.append(text('span', `${label}: ${value}`, 'indicator'));
             }
             if (indicators.childNodes.length) card.append(indicators);
-            if (item.session) {
-              const open = text('button', `Open session: ${item.session.title}`, 'session');
-              open.onclick = () => call('openSession', { id: item.session.id }).catch(showError);
-              card.append(open);
-            }
-            const actions = text('div', undefined, 'actions');
-            for (const action of item.actions || []) {
-              const button = text('button', action.label);
-              button.disabled = !!state.busy || pendingActions.has(action.token);
-              button.onclick = () => {
-                pendingActions.add(action.token);
-                renderItems();
-                runAction(action.method || 'attention.action', { token: action.token }).then(poll).catch(error => {
-                  pendingActions.delete(action.token);
+            const itemActions = item.actions || [];
+            const actionCount = itemActions.length + (item.session ? 1 : 0);
+            if (actionCount) {
+              const actionMenu = document.createElement('details');
+              actionMenu.className = 'action-menu';
+              actionMenu.open = itemActions.some(action => pendingActions.has(action.token));
+              actionMenu.append(text('summary', `Actions (${actionCount})`));
+              const actions = text('div', undefined, 'actions');
+              if (item.session) {
+                const open = text('button', `Open session: ${item.session.title}`, 'session');
+                open.onclick = () => call('openSession', { id: item.session.id }).catch(showError);
+                actions.append(open);
+              }
+              for (const action of itemActions) {
+                const button = text('button', action.label);
+                button.disabled = !!state.busy || pendingActions.has(action.token);
+                button.onclick = () => {
+                  pendingActions.add(action.token);
                   renderItems();
-                  showError(error);
-                });
-              };
-              actions.append(button);
+                  runAction(action.method || 'attention.action', { token: action.token }).then(poll).catch(error => {
+                    pendingActions.delete(action.token);
+                    renderItems();
+                    showError(error);
+                  });
+                };
+                actions.append(button);
+              }
+              actionMenu.append(actions);
+              card.append(actionMenu);
             }
-            if (actions.childNodes.length) card.append(actions);
             section.append(card);
-          }
+}
           root.append(section);
         }
         if (!visibleItems && !omitted && !state.error) {

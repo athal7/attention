@@ -21,17 +21,7 @@ worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
 
 
-def _first_item_card(payload):
-    return next(
-        block for block in worker._walk_blocks(payload["blocks"])
-        if block.get("kind") == "section" and block.get("collapsible") is not True
-    )
 
-def _item_action_blocks(card):
-    return [
-        block for block in worker._walk_blocks(card["children"])
-        if block.get("kind") == "action"
-    ]
 
 
 def _receive_json_line(stream, buffer, timeout, timeout_message):
@@ -131,99 +121,143 @@ async function run(actionReply) {
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
-class PanePayloadTests(unittest.TestCase):
-    def test_empty_items_have_explicit_empty_state_and_refresh(self):
-        payload = worker.pane_payload([])
-        self.assertEqual(payload["default_location"], "right")
-        toolbar = payload["blocks"][0]
-        self.assertEqual(toolbar["kind"], "columns")
-        self.assertEqual([action["label"] for action in toolbar["children"]], ["Refresh"])
-        self.assertEqual(toolbar["children"][0]["method"], "attention.refresh")
-        self.assertEqual(payload["blocks"][1], {"kind": "note", "text": "No attention items."})
-
-    def test_status_notice_precedes_cards_without_repeating_the_pane_heading(self):
-        payload = worker.status_payload("Source refresh failed; showing cached items.")
-        self.assertEqual(payload["blocks"][0]["kind"], "columns")
-        self.assertEqual(payload["blocks"][1], {
-            "kind": "note", "text": "Source refresh failed; showing cached items."
-        })
-
-    def test_cards_expose_every_action_and_primary_row_opens_the_source(self):
-        item = {
-            "_plugin": "github", "status": "NEEDS ATTENTION", "context": "private-repo",
-            "title": "Ship release", "details": "Review required", "weight": 99,
-            "repo_path": "/repositories/private-repo",
-            "repo_project_path": "/registered/private-repo",
-            "actions": [
-                {"_plugin": "github", "key": "o", "label": "open", "primary": True,
-                 "payload": {"kind": "open", "url": "https://example.com/issue", "token": "secret-token"}},
-                {"_plugin": "github", "key": "m", "label": "Merge", "payload": {"kind": "merge", "command": "secret-merge"}},
-                {"_plugin": "github", "key": "c", "label": "Comment", "payload": {"kind": "comment"}},
-                {"_plugin": "generic", "key": "2", "label": "Prompt", "payload": {"command": ["echo"], "inputs": [{"prompt": "secret-prompt"}]}},
-                {"_plugin": "generic", "key": "3", "label": "Run", "payload": {"command": ["echo", "secret-command"]}},
-                {"_plugin": "github", "key": "l", "label": "Lumen",
-                 "payload": {"command": ["/opt/homebrew/bin/lumen", "diff", "https://private.example/issue"], "terminal": True}},
-            ],
-        }
-        tokens = iter(f"opaque-{index}" for index in range(20))
-        payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
-        card = _first_item_card(payload)
-        self.assertEqual(set(card), {"kind", "boxed", "children"})
-        self.assertTrue(card["boxed"])
-        row = card["children"][0]
-        self.assertEqual(row["icon"], "git-branch")
-        self.assertEqual(row["href"], "https://example.com/issue")
-        buttons = _item_action_blocks(card)
-        self.assertEqual([button["label"] for button in buttons], [
-            "Merge", "Comment", "Prompt", "Run", "Lumen", "New session",
-        ])
-        self.assertEqual(
-            [button["method"] for button in buttons],
-            ["attention.action"] * 5 + ["attention.new_session"],
+    def test_lumen_page_action_dispatches_its_configured_token(self):
+        harness = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const html = fs.readFileSync(process.argv[1], "utf8");
+const source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const sent = [];
+const timers = [];
+const payload = {
+  items: [{
+    title: "Review pull request",
+    source: "github",
+    provider: "github",
+    group: "Pull requests",
+    actions: [{ label: "Lumen", token: "lumen-action-token", method: "attention.action" }],
+  }],
+  failures: [],
+  fetched_at: "2026-10-21 12:00 UTC",
+  busy: false,
+  status: "",
+  error: "",
+  prompt: null,
+};
+const elements = new Map();
+function descendants(node) {
+  return [node, ...node.children.flatMap(descendants)];
+}
+function makeElement(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    dataset: {},
+    style: { setProperty() {} },
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    prepend(child) { this.children.unshift(child); },
+    setAttribute() {},
+    focus() {},
+    querySelectorAll(selector) {
+      return selector === "button"
+        ? descendants(this).filter(child => child.tagName === "BUTTON")
+        : [];
+    },
+    hidden: false,
+    disabled: false,
+    value: "",
+  };
+  Object.defineProperty(node, "childNodes", { get() { return this.children; } });
+  return node;
+}
+const document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, makeElement("div"));
+    return elements.get(id);
+  },
+  createElement: makeElement,
+  documentElement: makeElement("html"),
+};
+document.getElementById("new-session").hidden = true;
+const port1 = {
+  onmessage: null,
+  postMessage(message) {
+    sent.push(message);
+    const result = message.method === "plugins.uiState"
+      ? [{ plugin_id: "athal7.attention", slot: "page", id: "dashboard", payload }]
+      : { accepted: true };
+    queueMicrotask(() => this.onmessage({ data: { id: message.id, result } }));
+  },
+};
+vm.runInNewContext(source, {
+  document,
+  MessageChannel: function MessageChannel() { return { port1, port2: {} }; },
+  parent: { postMessage() {} },
+  location: { hash: "#nonce" },
+  setTimeout(callback) { timers.push(callback); },
+  setInterval() {},
+});
+function find(node, predicate) {
+  return descendants(node).find(predicate);
+}
+(async () => {
+  await timers[0]();
+  const action = find(document.getElementById("items"),
+    node => node.tagName === "BUTTON" && node.textContent === "Lumen");
+  if (!action) throw new Error("Lumen action was not rendered");
+  const actionMenu = find(document.getElementById("items"),
+    node => node.tagName === "DETAILS");
+  if (!actionMenu || actionMenu.open !== false) {
+    throw new Error("Configured actions should stay inside a collapsed menu");
+  }
+  action.onclick();
+  const dispatch = sent.find(message => message.method === "action"
+    && message.params.method === "attention.action");
+  if (!dispatch || dispatch.params.params.token !== "lumen-action-token") {
+    throw new Error(`Lumen action did not reach the configured worker route: ${JSON.stringify(sent)}`);
+  }
+  document.getElementById("show-new-session").onclick();
+  if (document.getElementById("new-session").hidden) {
+    throw new Error("New session form is not accessible from the unified page");
+  }
+  const filter = find(document.getElementById("filters"),
+    node => node.tagName === "BUTTON" && node.textContent === "source: github");
+  if (!filter) throw new Error("Source filter was not rendered");
+  filter.onclick();
+  const remainingAction = find(document.getElementById("items"),
+    node => node.tagName === "BUTTON" && node.textContent === "Lumen");
+  if (remainingAction) throw new Error("Source filter did not hide the item's actions");
+  const empty = find(document.getElementById("items"),
+    node => node.textContent === "No attention items match the current filters.");
+  if (!empty) throw new Error("Filtered empty state was not shown");
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", harness, str(ROOT / "attention.html")],
+            capture_output=True, text=True, check=False,
         )
-        action_tokens = [button["params"]["token"] for button in buttons]
-        self.assertEqual([actions[token] for token in action_tokens[:5]],
-                         item["actions"][1:])
-        self.assertEqual(actions[action_tokens[-1]]["_aoe_operation"], "new_session")
-        session_action = actions[action_tokens[-1]]
-        self.assertEqual(session_action["label"], "New session")
-        self.assertEqual(session_action["params"], {
-            "title": "Attention: Ship release",
-            "path": "/registered/private-repo",
-            "scratch": False,
-            "is_pull_request": False,
-        })
-        self.assertTrue(any(action.get("filter_kind") == "source"
-                            for action in actions.values()))
-        rendered = json.dumps(payload)
-        for secret in ("secret-token", "secret-merge", "secret-command", "secret-prompt", "private.example"):
-            self.assertNotIn(secret, rendered)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_new_session_selects_registered_project_for_github_items(self):
-        items = [
-            {
-                "_plugin": "github", "kind": "pull_request", "title": "PR",
-                "repo_path": "/worktrees/repo", "repo_project_path": "/registered/repo",
-                "head_branch": "feature/pr-42", "base_branch": "main",
-            },
-            {
-                "_plugin": "github", "kind": "issue", "title": "Issue",
-                "repo_path": "/worktrees/repo", "repo_project_path": "/registered/repo",
-            },
-        ]
-        tokens = iter(str(index) for index in range(20))
-        _, actions = worker.build_pane(items, token_factory=lambda: next(tokens))
-        sessions = {
-            action["params"]["title"]: action for action in actions.values()
-            if action.get("_aoe_operation") == "new_session"
-        }
-        pr_action = sessions["Attention: PR"]
-        self.assertEqual(pr_action["params"]["path"], "/registered/repo")
-        self.assertEqual(sessions["Attention: Issue"]["params"]["path"], "/registered/repo")
-        self.assertTrue(pr_action["params"]["is_pull_request"])
-        self.assertEqual(pr_action["params"]["worktree_branch"], "feature/pr-42")
-        self.assertEqual(pr_action["params"]["base_branch"], "main")
-        self.assertNotIn("worktree_branch", sessions["Attention: Issue"]["params"])
+class DashboardPayloadTests(unittest.TestCase):
+    def test_native_pane_opens_dashboard_and_renders_status(self):
+        payload = worker.status_payload()
+        self.assertEqual(payload["default_location"], "right")
+        self.assertEqual(payload["blocks"], [{
+            "kind": "row",
+            "label": "Open Attention dashboard",
+            "icon": "inbox",
+            "href": worker.DASHBOARD_PATH,
+        }])
+
+        notice = worker.status_payload("Lumen: Could not open Terminal.")
+        self.assertEqual(notice["blocks"][0], payload["blocks"][0])
+        self.assertEqual(notice["blocks"][1], {
+            "kind": "note", "text": "Lumen: Could not open Terminal.",
+        })
 
     def test_dashboard_page_trims_low_priority_entries_to_payload_limit(self):
         items = [
@@ -232,11 +266,11 @@ class PanePayloadTests(unittest.TestCase):
             {"title": "Lowest priority", "details": "l" * 4000, "weight": 1},
         ]
         page = worker.dashboard_payload(items, "2026-10-19 12:00:00 UTC", [])
-        with patch.object(worker, "MAX_PANE_BYTES", 6000):
+        with patch.object(worker, "MAX_DASHBOARD_BYTES", 6000):
             fitted = worker._fit_dashboard(page)
         self.assertLessEqual(
             len(json.dumps(fitted, separators=(",", ":")).encode("utf-8")),
-            worker.MAX_PANE_BYTES,
+            worker.MAX_DASHBOARD_BYTES,
         )
         self.assertEqual([item["title"] for item in fitted["items"]],
                          ["Highest priority"])
@@ -252,403 +286,128 @@ class PanePayloadTests(unittest.TestCase):
             ],
         }
         page = worker.dashboard_payload([item], "2026-10-19 12:00:00 UTC", [])
-        with patch.object(worker, "MAX_PANE_BYTES", 6000):
+        with patch.object(worker, "MAX_DASHBOARD_BYTES", 6000):
             fitted = worker._fit_dashboard(page)
         encoded = json.dumps(fitted, separators=(",", ":")).encode("utf-8")
-        self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
+        self.assertLessEqual(len(encoded), worker.MAX_DASHBOARD_BYTES)
         self.assertEqual(fitted["items"], [])
         self.assertEqual(fitted["omitted_items"], 1)
 
-    def test_configured_session_action_replaces_generated_session_action(self):
-        for label in ("session", "New session"):
-            with self.subTest(label=label):
-                session_action = {
-                    "_plugin": "generic", "key": "s", "label": label,
-                    "payload": {"command": ["aoe", "add"]},
-                }
-                item = {
-                    "_plugin": "generic", "title": "Existing session flow",
-                    "repo_path": "/repo", "actions": [session_action],
-                }
-                tokens = iter(str(index) for index in range(20))
-                payload, action_tokens = worker.build_pane(
-                    [item], token_factory=lambda: next(tokens),
-                )
-                card = _first_item_card(payload)
-                buttons = _item_action_blocks(card)
-                pane_label = label[:1].upper() + label[1:]
-                self.assertEqual([button["label"] for button in buttons], [pane_label])
-                self.assertEqual(buttons[0]["method"], "attention.action")
-                self.assertIs(action_tokens[buttons[0]["params"]["token"]], session_action)
-                self.assertFalse(any(
-                    action.get("_aoe_operation") == "new_session"
-                    for action in action_tokens.values()
-                ))
-
-                page = worker.dashboard_payload(
-                    [item], "2026-10-19 12:00:00 UTC", [], action_tokens,
-                )
-                self.assertEqual([action["label"] for action in page["items"][0]["actions"]],
-                                 [label])
-                self.assertEqual(page["items"][0]["actions"][0]["method"], "attention.action")
-
-    def test_dashboard_page_exposes_actions_with_prompts(self):
-        item = {
-            "_plugin": "github", "kind": "pull_request", "title": "Review PR",
-            "_is_own_pr": False,
-            "actions": [
-                {"label": "Open", "payload": {"kind": "open"}},
-                {"label": "Approve", "payload": {"kind": "approve"}},
-                {"label": "Comment", "payload": {"kind": "comment"}},
-                {"label": "Prompt", "payload": {"command": ["echo"], "inputs": [
-                    {"name": "comment", "prompt": "Review note"},
-                ]}},
-                {"label": "Session", "payload": {"command": ["aoe", "add"]}},
-            ],
+    def test_dashboard_page_exposes_lumen_and_prompt_actions_as_opaque_tokens(self):
+        lumen_action = {
+            "_plugin": "github", "label": "Lumen",
+            "payload": {
+                "command": [
+                    "/opt/homebrew/bin/lumen", "diff",
+                    "https://github.com/example/repo/pull/42",
+                ],
+                "terminal": True,
+            },
         }
-        page = worker.dashboard_payload([item], "2026-10-19 12:00:00 UTC", [])
+        prompt_action = {
+            "label": "Comment",
+            "payload": {"command": ["echo"], "inputs": [{"prompt": "Review note"}]},
+        }
+        token_actions = {}
+        page = worker.dashboard_payload([{
+            "_plugin": "github", "kind": "pull_request", "title": "Review PR",
+            "actions": [lumen_action, prompt_action],
+        }], "2026-10-19 12:00:00 UTC", [], token_actions)
+
         actions = page["items"][0]["actions"]
         self.assertEqual([action["label"] for action in actions],
-                         ["Open", "Approve", "Comment", "Prompt", "Session"])
-        self.assertTrue(all(action["method"] == "attention.action" for action in actions))
+                         ["Lumen", "Comment", "New session"])
+        lumen_button = actions[0]
+        self.assertEqual(lumen_button["method"], "attention.action")
+        dispatched_action = token_actions[lumen_button["token"]]
+        self.assertIs(dispatched_action, lumen_action)
+        self.assertEqual(dispatched_action["payload"]["command"], [
+            "/opt/homebrew/bin/lumen", "diff",
+            "https://github.com/example/repo/pull/42",
+        ])
+        self.assertNotIn("/opt/homebrew/bin/lumen", json.dumps(page))
 
-    def test_source_and_provider_filters_hide_only_matching_items(self):
-        items = [
-            {"_plugin": "github", "title": "PR"},
-            {"_plugin": "linear", "title": "Issue"},
-            {"_plugin": "generic", "_provider": "alpha", "title": "Alpha item"},
-            {"_plugin": "generic", "_provider": "beta", "title": "Beta item"},
-        ]
-        token = iter(range(20))
-        payload, actions = worker.build_pane(
-            items, token_factory=lambda: str(next(token)),
-            hidden_sources={"github"}, hidden_providers={"alpha"},
-        )
-        cards = [
-            block for block in payload["blocks"]
-            if block.get("kind") == "section" and block.get("collapsible") is not True
-        ]
-        labels = [card["children"][0]["label"] for card in cards]
-        self.assertEqual(labels, ["Issue", "Beta item"])
-        controls = next(
-            block for block in payload["blocks"]
-            if block.get("kind") == "section" and block.get("title") == "Filters"
-        )
-        filter_labels = {block["label"] for block in controls["children"]}
-        self.assertIn("Show source: github", filter_labels)
-        self.assertIn("Show provider: alpha", filter_labels)
-        self.assertIn("Hide source: linear", filter_labels)
-        self.assertIn("Hide provider: beta", filter_labels)
-        self.assertEqual(set(actions), worker._payload_action_tokens(payload))
-
-    def test_filter_action_toggles_source_and_rejects_stale_session(self):
-        names = ("live_session_ids", "action_tokens", "hidden_sources", "filter_refresh_requested")
-        original = {name: getattr(worker, name, None) for name in names}
-        try:
-            worker.live_session_ids = {"s1"}
-            worker.action_tokens = {
-                "filter": {
-                    "_aoe_operation": "filter",
-                    "filter_kind": "source",
-                    "value": "github",
-                },
-            }
-            worker.hidden_sources = set()
-            worker.filter_refresh_requested = False
-            worker.dispatch({
-                "method": "attention.filter",
-                "params": {"token": "filter", "session_id": "s1"},
-            })
-            self.assertEqual(worker.hidden_sources, {"github"})
-            self.assertTrue(worker.filter_refresh_requested)
-            self.assertNotIn("filter", worker.action_tokens)
-        finally:
-            for name, value in original.items():
-                if value is None:
-                    delattr(worker, name)
-                else:
-                    setattr(worker, name, value)
-
-    def test_pull_request_stacks_are_collapsible_with_ordered_independent_cards(self):
-        items = [
-            {"_plugin": "github", "title": "Grandchild", "identity_key": "pr:3",
-             "parent_identity_key": "pr:2", "url": "https://example.com/3"},
-            {"_plugin": "github", "title": "Child", "identity_key": "pr:2",
-             "parent_identity_key": "pr:1", "url": "https://example.com/2",
-             "repo_path": "/repo", "head_branch": "feature",
-             "actions": [{"label": "Run child", "payload": {"command": ["echo", "child"]}}]},
-            {"_plugin": "github", "title": "Base", "identity_key": "pr:1",
-             "url": "https://example.com/1"},
-            {"_plugin": "github", "title": "Unrelated", "identity_key": "pr:4",
-             "url": "https://example.com/4"},
-        ]
-        token_number = iter(range(9))
-        payload, actions = worker.build_pane(
-            items, token_factory=lambda: f"token-{next(token_number)}",
-        )
-        top_level = [
-            block for block in payload["blocks"]
-            if block.get("kind") == "section" and block.get("title") != "Filters"
-        ]
-        self.assertEqual(len(top_level), 3)
-        base, stack, unrelated = top_level
-        self.assertEqual(base["children"][0]["label"], "Base")
-        self.assertEqual(stack["title"], "Stacked pull requests")
-        self.assertEqual(stack["value"], "2 PRs")
-        self.assertTrue(stack["collapsible"])
-        self.assertTrue(stack["collapsed"])
-        cards = stack["children"]
-        self.assertEqual(
-            [card["children"][0]["label"] for card in cards],
-            ["└─ Child", "   └─ Grandchild"],
-        )
-        self.assertEqual(unrelated["children"][0]["label"], "Unrelated")
-        child_buttons = cards[0]["children"][1]["children"]
-        self.assertEqual([button["label"] for button in child_buttons], ["Run child", "New session"])
-        linked = worker.payload_with_sessions(payload, items, [{
-            "id": "stack-child", "title": "Work", "status": "Running",
-            "workspace_repos": [{"source_path": "/repo", "branch": "feature"}],
-        }])
-        linked_stack = next(
-            block for block in linked["blocks"]
-            if block.get("kind") == "section" and block.get("title") == "Stacked pull requests"
-        )
-        self.assertEqual(linked_stack["children"][0]["children"][1]["href"], "/session/stack-child")
-        self.assertEqual(set(actions), worker._payload_action_tokens(payload))
-        self.assertEqual(len(cards), 2)
-        self.assertEqual(items[0]["title"], "Grandchild")
-        orphan_payload = worker.pane_payload([{
-            "_plugin": "github", "title": "Orphan", "identity_key": "pr:5",
-            "parent_identity_key": "pr:missing",
-        }])
-        orphan = next(block for block in worker._walk_blocks(orphan_payload["blocks"])
-                      if block.get("kind") == "row")
-        self.assertEqual(orphan["label"], "Orphan")
-
-
-
-    def test_known_source_icons_are_rendered_on_rows(self):
-        expected_icons = {
-            "github": "git-branch",
-            "linear": "circle-dot",
-            "calendar": "calendar-days",
-            "reminders": "list-todo",
-            "generic": "inbox",
+    def test_action_failure_and_terminal_diagnostic_are_published_to_dashboard(self):
+        previous = {
+            name: getattr(worker, name)
+            for name in ("dashboard_active", "snapshot_fetched_at",
+                         "active_action", "active_prompt")
         }
-        for source, icon in expected_icons.items():
-            with self.subTest(source=source):
-                payload = worker.pane_payload([{
-                    "_plugin": source, "title": "Readable title",
-                    "url": "https://example.com/item",
-                }])
-                row = _first_item_card(payload)["children"][0]
-                self.assertEqual(row["icon"], icon)
-                self.assertEqual(row["label"], "Readable title")
-                self.assertEqual(row["href"], "https://example.com/item")
+        had_action_tokens = hasattr(worker, "action_tokens")
+        previous_action_tokens = getattr(worker, "action_tokens", None)
+        try:
+            worker.dashboard_active = True
+            worker.snapshot_fetched_at = "2026-10-19 12:00:00 UTC"
+            worker.action_tokens = {}
+            worker.active_action = None
+            worker.active_prompt = None
+            with patch.object(worker, "rpc") as send:
+                worker.publish_payload(
+                    [], worker.status_payload("Failed: Lumen: Action did not complete."),
+                    items=[{"title": "Review PR", "actions": []}],
+                    action_output="Could not open Terminal: permission denied.",
+                )
+            page = send.call_args.args[1]["payload"]
+            self.assertEqual(page["status"], "Failed: Lumen: Action did not complete.")
+            self.assertEqual(page["action_output"],
+                             "Could not open Terminal: permission denied.")
+            self.assertEqual(page["error"], page["status"])
+        finally:
+            for name, value in previous.items():
+                setattr(worker, name, value)
+            if had_action_tokens:
+                worker.action_tokens = previous_action_tokens
+            else:
+                del worker.action_tokens
 
-
-    def test_source_icon_uses_item_collector_not_cross_linked_actions(self):
-        payload = worker.pane_payload([{
-            "_plugin": "linear", "title": "Linked issue",
-            "actions": [{"_plugin": "github", "label": "Open",
-                         "payload": {"kind": "open", "url": "https://github.com/example/repo/pull/1"}}],
-        }])
-        row = _first_item_card(payload)["children"][0]
-        self.assertEqual(row["icon"], "circle-dot")
-        self.assertEqual(row["href"], "https://github.com/example/repo/pull/1")
-
-    def test_pull_request_rows_render_state_iconography(self):
-        cases = [
-            ("CI failing", "circle-x", "danger", "ci failing"),
-            ("Changes requested", "circle-x", "danger", "changes requested"),
-            ("Approved", "badge-check", "success", "approved"),
-        ]
-        for state, icon, tone, tooltip in cases:
-            with self.subTest(state=state):
-                payload = worker.pane_payload([{
-                    "_plugin": "github", "kind": "pull_request",
-                    "title": "Review PR", "indicators": {"state": state},
-                }])
-                row = _first_item_card(payload)["children"][0]
-                self.assertEqual(row["badges"], [{"icon": icon, "tone": tone, "tooltip": tooltip}])
-
-    def test_active_matching_session_gets_an_encoded_in_app_link(self):
-        item = {"title": "Review PR", "repo_path": "/repo", "head_branch": "feature"}
-        payload = worker.pane_payload([item])
-        linked = worker.payload_with_sessions(payload, [item], [{
+    def test_dashboard_page_preserves_live_session_matches(self):
+        item = {
+            "title": "Review PR", "repo_path": "/repo", "head_branch": "feature",
+        }
+        sessions = [{
             "id": "session/id", "title": "Work", "status": "Running",
             "workspace_repos": [{"source_path": "/repo", "branch": "feature"}],
-        }])
-        card = _first_item_card(linked)
-        self.assertEqual(card["children"][1]["href"], "/session/session%2Fid")
-        self.assertEqual(card["children"][1]["sublabel"], "Running")
-        self.assertNotIn("href", _first_item_card(payload)["children"][0])
-
-    def test_missing_or_inactive_session_does_not_add_session_link(self):
-        item = {"title": "Review PR", "repo_path": "/repo", "head_branch": "feature"}
-        payload = worker.pane_payload([item])
-        for sessions in (
-            [],
-            [{"id": "idle", "status": "Idle", "workspace_repos": [
-                {"source_path": "/repo", "branch": "feature"},
-            ]}],
-            [{"id": "archived", "status": "Running", "archived": True, "workspace_repos": [
-                {"source_path": "/repo", "branch": "feature"},
-            ]}],
-        ):
-            with self.subTest(sessions=sessions):
-                linked = worker.payload_with_sessions(payload, [item], sessions)
-                self.assertEqual(len(_first_item_card(linked)["children"]), 2)
-
-    def test_attention_created_session_title_links_only_when_unique(self):
-        item = {"title": "Fix build"}
-        session = {"id": "session-1", "title": "Attention: Fix build", "status": "Waiting"}
-        payload = worker.pane_payload([item])
-        linked = worker.payload_with_sessions(payload, [item], [session])
-        self.assertEqual(_first_item_card(linked)["children"][1]["href"], "/session/session-1")
-        duplicate = worker.pane_payload([item, item])
-        linked = worker.payload_with_sessions(duplicate, [item, item], [session])
-        self.assertFalse(any(
-            child.get("icon") == "square-terminal"
-            for block in linked["blocks"] if block["kind"] == "section"
-            for child in block["children"]
-        ))
-
-    def test_unknown_or_missing_collectors_use_fallback_not_url_or_context(self):
-        for collector in ("custom", None):
-            with self.subTest(collector=collector):
-                item = {
-                    "title": "Custom item", "context": "github",
-                    "url": "https://github.com/example/repo/issues/1",
-                }
-                if collector is not None:
-                    item["_plugin"] = collector
-                row = _first_item_card(worker.pane_payload([item]))["children"][0]
-                self.assertEqual(row["icon"], "inbox")
-                self.assertEqual(row["href"], item["url"])
-
-    def test_own_pull_request_hides_approve_and_keeps_another_supported_action(self):
-        item = {
-            "_plugin": "github", "title": "Fix release",
-            "actions": [
-                {"_plugin": "github", "label": "approve", "_is_own_pr": True, "payload": {"kind": "approve"}},
-                {"_plugin": "generic", "label": "Run check", "payload": {"command": ["echo", "check"]}},
-            ],
-        }
-        tokens = iter(["run-token", "session-token", "filter-token"])
-        payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
-        card = _first_item_card(payload)
-        buttons = card["children"][1]["children"]
-        self.assertEqual([button["label"] for button in buttons], ["Run check", "New session"])
-        self.assertNotIn("approve", json.dumps(payload).casefold())
-        self.assertEqual(set(actions), {"run-token", "session-token", "filter-token"})
-
-    def test_each_item_shows_all_configured_actions_plus_new_session(self):
-        item = {
-            "title": "Build",
-            "actions": [
-                {"label": label, "payload": {"command": ["echo", label]}}
-                for label in ("First", "Second", "Third")
-            ],
-        }
-        tokens = iter(["first-token", "second-token", "third-token", "session-token"])
-        payload, actions = worker.build_pane([item], token_factory=lambda: next(tokens))
-        card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        buttons = _item_action_blocks(card)
-        self.assertEqual([button["label"] for button in buttons],
-                         ["First", "Second", "Third", "New session"])
-        self.assertEqual([actions[button["params"]["token"]]
-                          for button in buttons[:3]], item["actions"])
-        self.assertEqual([button["method"] for button in buttons],
-                         ["attention.action"] * 3 + ["attention.new_session"])
-        self.assertEqual(set(actions), {
-            "first-token", "second-token", "third-token", "session-token",
-        })
-
-
-    def test_command_based_open_uses_the_linked_row_without_an_open_button(self):
-        open_action = {
-            "_plugin": "generic", "key": "open", "label": "Open",
-            "payload": {"command": ["open", "https://example.com/build"]},
-        }
-        tokens = iter(["open-token", "session-token"])
-        payload, actions = worker.build_pane(
-            [{"title": "Build failed", "actions": [open_action]}],
-            token_factory=lambda: next(tokens),
+        }]
+        page = worker.dashboard_payload(
+            [item], "2026-10-19 12:00:00 UTC", sessions,
         )
-        card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        row = card["children"][0]
-        self.assertEqual(row["method"], "attention.action")
-        self.assertEqual(row["params"], {"token": "open-token"})
-        buttons = card["children"][1]["children"]
-        self.assertEqual([button["label"] for button in buttons], ["New session"])
-        self.assertEqual(actions["open-token"], open_action)
+        self.assertEqual(page["items"][0]["session"], {"id": "session/id", "title": "Work"})
 
-    def test_secondary_open_action_remains_available_as_a_button(self):
-        first_open = {
-            "label": "Open", "payload": {"kind": "open", "url": "https://example.com/build"}
+    def test_generated_session_action_preserves_registered_repo_and_pr_branches(self):
+        item = {
+            "_plugin": "github", "kind": "pull_request", "title": "PR",
+            "repo_path": "/worktrees/repo", "repo_project_path": "/registered/repo",
+            "head_branch": "feature/pr-42", "base_branch": "main",
         }
-        secondary_open = {
-            "label": "Open docs", "payload": {"kind": "open", "url": "https://example.com/docs"}
-        }
-        tokens = iter(["docs-token", "session-token"])
-        payload, actions = worker.build_pane(
-            [{"title": "Build", "url": "https://example.com/build",
-              "actions": [first_open, secondary_open]}],
-            token_factory=lambda: next(tokens),
+        token_actions = {}
+        page = worker.dashboard_payload(
+            [item], "2026-10-19 12:00:00 UTC", [], token_actions,
         )
-        card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        row = card["children"][0]
-        self.assertEqual(row["href"], "https://example.com/build")
-        buttons = _item_action_blocks(card)
-        self.assertEqual([button["label"] for button in buttons],
-                         ["Open docs", "New session"])
-        self.assertIs(actions[buttons[0]["params"]["token"]], secondary_open)
+        new_session = page["items"][0]["actions"][-1]
+        self.assertEqual(new_session["label"], "New session")
+        action = token_actions[new_session["token"]]
+        self.assertEqual(action["params"]["path"], "/registered/repo")
+        self.assertTrue(action["params"]["is_pull_request"])
+        self.assertEqual(action["params"]["worktree_branch"], "feature/pr-42")
+        self.assertEqual(action["params"]["base_branch"], "main")
 
-
-    def test_unsafe_source_urls_are_not_rendered_as_links(self):
-        payload = worker.pane_payload([{"title": "Unsafe", "url": "javascript:alert(1)"}])
-        row = next(block for block in payload["blocks"] if block["kind"] == "section")["children"][0]
-        self.assertNotIn("href", row)
-
-    def test_summary_deduplicates_status_context_and_reason(self):
-        payload = worker.pane_payload([{
-            "status": "OVERDUE", "context": "Accounting", "title": "Pay invoice",
-            "attention_reason": " overdue ", "details": "OVERDUE",
-        }])
-        card = next(block for block in payload["blocks"] if block["kind"] == "section")
-        self.assertEqual(card["children"][0]["sublabel"], "OVERDUE · Accounting")
-        self.assertNotIn("Details", json.dumps(card))
-
-    def test_trimming_keeps_priority_prefix_prunes_tokens_and_obeys_host_limit(self):
-        items = [{
-            "_plugin": "generic", "status": "NOW", "context": "repo",
-            "title": f"Item {index}", "details": "x" * 500, "weight": 100 - index,
-            "actions": [{"_plugin": "generic", "key": "o", "label": "Open",
-                         "payload": {"url": f"https://example.com/{index}"}}],
-        } for index in range(12)]
-        token_number = iter(range(40))
-        token_factory = lambda: f"token-{next(token_number)}"
-        with patch.object(worker, "MAX_PANE_BYTES", 2400):
-            payload, actions = worker.build_pane(items, token_factory=token_factory)
-        cards = [
-            block for block in payload["blocks"]
-            if block.get("kind") == "section" and block.get("title") != "Filters"
-        ]
-        titles = [card["children"][0]["label"] for card in cards]
-        self.assertLess(len(titles), len(items))
-        self.assertEqual(titles, [f"Item {index}" for index in range(len(titles))])
-        self.assertIn("Additional items omitted", json.dumps(payload))
-        visible_tokens = worker._payload_action_tokens(payload)
-        self.assertEqual(set(actions), visible_tokens)
-        self.assertLess(len(actions), 2 * len(items))
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.assertLessEqual(len(encoded), 2400)
-        huge = [{"status": "NOW", "context": "repo", "title": str(i), "details": "界" * 600}
-                for i in range(500)]
-        with patch.object(worker, "MAX_PANE_BYTES", 64 * 1024):
-            encoded = json.dumps(worker.pane_payload(huge), separators=(",", ":")).encode("utf-8")
-        self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
+    def test_configured_session_action_replaces_generated_session_action(self):
+        session_action = {
+            "_plugin": "generic", "key": "s", "label": "session",
+            "payload": {"command": ["aoe", "add"]},
+        }
+        item = {
+            "_plugin": "generic", "title": "Existing session flow",
+            "repo_path": "/repo", "actions": [session_action],
+        }
+        token_actions = {}
+        page = worker.dashboard_payload(
+            [item], "2026-10-19 12:00:00 UTC", [], token_actions,
+        )
+        actions = page["items"][0]["actions"]
+        self.assertEqual([action["label"] for action in actions], ["session"])
+        self.assertEqual(actions[0]["method"], "attention.action")
+        self.assertIs(token_actions[actions[0]["token"]], session_action)
 
 
 
@@ -746,7 +505,7 @@ class AttentionSourceTests(unittest.TestCase):
                 with patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
                     self.assertEqual(worker.attention_items(), [])
 
-    def test_cli_and_pane_show_sanitized_partial_and_total_collector_failures(self):
+    def test_cli_and_dashboard_show_sanitized_partial_and_total_collector_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_dir = root / "config" / "attention"
@@ -785,27 +544,29 @@ class AttentionSourceTests(unittest.TestCase):
             self.assertIn("RuntimeError", output)
             self.assertNotIn("collector-secret", output)
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
-            self.assertIn("Healthy item", pane_text)
-            self.assertIn("failing collector failed: RuntimeError", pane_text)
-            self.assertNotIn("collector-secret", pane_text)
+                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
+            dashboard_text = json.dumps(dashboard)
+            self.assertEqual([item["title"] for item in dashboard["items"]], ["Healthy item"])
+            self.assertEqual(len(dashboard["failures"]), 1)
+            self.assertIn("failing", dashboard_text.casefold())
+            self.assertNotIn("collector-secret", dashboard_text)
 
             set_plugins([failing])
             output = run_cli()
             self.assertIn("failing collector failed", output)
             self.assertNotIn("Nothing needs attention", output)
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
-            self.assertIn("failing collector failed: RuntimeError", pane_text)
-            self.assertNotIn("No attention items.", pane_text)
+                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
+            self.assertEqual(dashboard["items"], [])
+            self.assertEqual(len(dashboard["failures"]), 1)
 
             healthy.write_text("def fetch(config):\n    return []\n")
             set_plugins([healthy])
             self.assertEqual(run_cli(), "")
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                pane_text = json.dumps(worker.pane_payload(worker.attention_items()))
-            self.assertIn("No attention items.", pane_text)
-            self.assertNotIn("collector failed", pane_text)
+                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
+            self.assertEqual(dashboard["items"], [])
+            self.assertEqual(dashboard["failures"], [])
 
     def test_interactive_dashboard_renders_failed_and_healthy_collectors(self):
         dashboard_spec = importlib.util.spec_from_file_location(
@@ -1277,7 +1038,10 @@ class WorkerProtocolTests(unittest.TestCase):
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
                 loading_payload = loading["params"]["payload"]
-                self.assertIn("Select Refresh", json.dumps(loading_payload))
+                self.assertEqual(loading_payload["blocks"][0], {
+                    "kind": "row", "label": "Open Attention dashboard",
+                    "icon": "inbox", "href": worker.DASHBOARD_PATH,
+                })
                 reply(loading)
                 time.sleep(0.15)
                 self.assertFalse(calls.exists(), "worker fetched during startup or elapsed timer")
@@ -1365,7 +1129,10 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(loading, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(loading["method"], "ui.state.set")
-                    self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
+                    self.assertEqual(loading["params"]["payload"]["blocks"][0], {
+                        "kind": "row", "label": "Open Attention dashboard",
+                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
+                    })
                     reply(loading, {})
                     proc.stdin.write(json.dumps({
                         "jsonrpc": "2.0", "id": "refresh",
@@ -1391,7 +1158,10 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(published, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(published["method"], "ui.state.set")
-                    self.assertEqual(next(block for block in published["params"]["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Recovered")
+                    self.assertEqual(published["params"]["payload"]["blocks"][0], {
+                        "kind": "row", "label": "Open Attention dashboard",
+                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
+                    })
                     reply(published, {})
                     break
             finally:
@@ -1438,7 +1208,10 @@ class WorkerProtocolTests(unittest.TestCase):
                 reply(listing, {"sessions": [{"id": "s1"}]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
-                self.assertIn("Select Refresh", json.dumps(loading["params"]["payload"]))
+                self.assertEqual(loading["params"]["payload"]["blocks"][0], {
+                    "kind": "row", "label": "Open Attention dashboard",
+                    "icon": "inbox", "href": worker.DASHBOARD_PATH,
+                })
                 reply(loading)
                 proc.stdin.write(json.dumps({
                     "jsonrpc": "2.0", "id": "refresh",
@@ -1455,10 +1228,10 @@ class WorkerProtocolTests(unittest.TestCase):
                     self.assertEqual(pushed["method"], "ui.state.set")
                     params = pushed["params"]
                     self.assertEqual((params["session_id"], params["slot"], params["id"]), ("s1", "pane", "attention"))
-                    self.assertEqual(next(block for block in params["payload"]["blocks"] if block["kind"] == "section")["children"][0]["label"], "Ship")
-                    toolbar = params["payload"]["blocks"][0]
-                    self.assertEqual(toolbar["kind"], "columns")
-                    self.assertEqual(toolbar["children"][-1]["method"], "attention.refresh")
+                    self.assertEqual(params["payload"]["blocks"][0], {
+                        "kind": "row", "label": "Open Attention dashboard",
+                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
+                    })
                     reply(pushed)
                     break
 

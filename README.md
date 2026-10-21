@@ -220,20 +220,23 @@ repository root with `aoe plugin install .`, then enable it with
 `aoe plugin enable athal7.attention`. The dashboard page requires AoE 1.20 or
 newer.
 
-The dashboard uses the same prioritized items, configured groups and indicator
-columns, source actions, and configured actions as the terminal dashboard. It
-displays details, filters by configured group and source/provider, and links
-matching live sessions. Both the full page and the session pane expose every
-configured action except own-PR approvals. The pane groups action buttons into
-pairs; the primary row represents the first unprompted open action, while other
-open actions remain available as buttons.
-Actions that request input publish their prompts in the full dashboard page;
-open that page from the AoE Pages menu to answer. The page and pane invoke the
-same configured CLI action implementation. `"terminal": true` actions open a
-separate terminal window. Other actions' captured stdout and stderr—including
-configured command output—appear in the full dashboard after completion.
-The page treats a resolved action-bridge reply as delivery acknowledgment;
-completion and asynchronous outcomes come from updated dashboard state.
+The Attention dashboard page is the single item view. It uses the terminal
+dashboard's prioritized items, configured groups and indicator columns, source
+actions, and configured actions. It displays details, filters by group and
+source/provider, and links matching live sessions. Item actions stay under a
+collapsed **Actions** menu; own-PR approvals remain hidden.
+
+The per-session pane is a native **Open Attention dashboard** launcher with
+short status notices, not a second item renderer. AoE exposes pages and session
+panes through separate slots, and native pane blocks cannot collect the page's
+filters, free-text/choice prompts, or **New session** form. Those workflows stay
+on the dashboard page.
+
+The page reports action completion or launch failure and displays captured
+diagnostics. `terminal: true` actions open a separate terminal window; other
+actions' captured stdout and stderr appear on the page. An action-bridge reply
+acknowledges delivery; completion and asynchronous outcomes come from updated
+dashboard state.
 
 The dashboard's **New session** form creates a normal terminal-mode AoE session
 from a project path or scratch directory, then starts it with `aoe session
