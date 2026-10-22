@@ -892,6 +892,76 @@ class WorkerProtocolTests(unittest.TestCase):
             **options, "scratch": True,
         }))
 
+    def test_configured_agent_per_directory_drives_the_new_session_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work_repo = work / "repo"
+            personal = root / "personal"
+            work_repo.mkdir(parents=True)
+            personal.mkdir()
+            config_dir = root / "config" / "attention"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.json").write_text(json.dumps({
+                "plugins": [],
+                "session": {"agents": [
+                    {"path": str(work), "tool": "omp"},
+                    {"path": str(work_repo), "tool": "pi"},
+                    {"path": str(personal), "tool": "freebuf"},
+                ]},
+            }))
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(root / "state"),
+            }
+            with patch.dict(os.environ, env), \
+                 patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                worker.attention_items()
+                self.assertEqual(worker._session_tool_for_path(str(work)), "omp")
+                self.assertEqual(worker._session_tool_for_path(str(work_repo)), "pi")
+                self.assertEqual(worker._session_tool_for_path(str(work_repo / "app")), "pi")
+                self.assertEqual(
+                    worker._session_tool_for_path(str(personal / "notes")), "freebuf",
+                )
+                self.assertEqual(worker._session_tool_for_path(str(root / "elsewhere")), "")
+                self.assertEqual(worker._session_tool_for_path(""), "")
+
+                action = worker._new_session_action({
+                    "title": "Fix regression", "repo_path": str(work_repo / "app"),
+                })
+                self.assertEqual(action["params"]["tool"], "pi")
+                self.assertIsNone(worker._session_options_error(action["params"]))
+
+                github_action = worker._new_session_action({
+                    "_plugin": "github", "kind": "issue", "title": "Issue",
+                    "repo_path": str(personal / "clone"),
+                    "repo_project_path": str(work_repo),
+                })
+                self.assertEqual(github_action["params"]["tool"], "pi")
+
+                unconfigured = worker._new_session_action({
+                    "title": "Scratch follow-up", "repo_path": str(root / "elsewhere"),
+                })
+                self.assertNotIn("tool", unconfigured["params"])
+
+    def test_invalid_session_agent_configuration_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "attention"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.json").write_text(json.dumps({
+                "plugins": [],
+                "session": {"agents": [{"path": "/repos", "tool": "--title"}]},
+            }))
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(root / "state"),
+            }
+            with patch.dict(os.environ, env), \
+                 patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                with self.assertRaises(RuntimeError):
+                    worker.attention_items()
+
     def test_new_session_passes_cli_profile_tool_group_and_branch_options(self):
         commands = []
         outputs = iter([

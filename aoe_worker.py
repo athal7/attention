@@ -29,6 +29,7 @@ live_sessions_by_id = {}
 consumed_action_ids = set()
 consumed_session_item_ids = set()
 selected_item_keys = {}
+session_agents = []
 action_token_sessions = {}
 pane_refresh_requested = False
 
@@ -82,6 +83,10 @@ def attention_items():
         loader.exec_module(module)
         config = module.load_config()
         items = module.build_prioritized_items(config)
+        resolve_agents = getattr(module, "session_agents", None)
+        agents, agents_error = resolve_agents(config) if resolve_agents else ([], None)
+        if agents_error:
+            raise RuntimeError(agents_error)
         dashboard_groups = getattr(module, "dashboard_groups", None)
         if dashboard_groups:
             groups, group_error = dashboard_groups(config)
@@ -94,6 +99,8 @@ def attention_items():
                                   and module._group_matches(item, group["match"])), fallback)
                     item["_attention_group"] = group["name"]
                     item["_attention_group_order"] = groups.index(group)
+        global session_agents
+        session_agents = agents
         return items
     finally:
         sys.modules.pop(name, None)
@@ -152,6 +159,20 @@ def _is_approve_action(action):
 
 
 
+def _session_tool_for_path(path):
+    """The agent configured for the directory containing path, longest match first."""
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    resolved = os.path.realpath(os.path.expanduser(path.strip()))
+    matches = [
+        agent for agent in session_agents
+        if resolved == agent["path"] or resolved.startswith(agent["path"] + os.sep)
+    ]
+    if not matches:
+        return ""
+    return max(matches, key=lambda agent: len(agent["path"]))["tool"]
+
+
 def _new_session_action(item):
     title = _display_text(item.get("title"), 120) or "Follow-up"
     is_github_item = item.get("_plugin") == "github"
@@ -167,6 +188,9 @@ def _new_session_action(item):
         "scratch": not path and not is_github_item,
         "is_pull_request": is_pull_request,
     }
+    tool = _session_tool_for_path(path)
+    if tool:
+        options["tool"] = tool
     if is_github_item:
         resolution_error = item.get("repo_resolution_error")
         if not path and not resolution_error:

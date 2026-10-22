@@ -860,6 +860,54 @@ def _group_matches(item, match):
     )
 
 
+def _session_tool_name(tool):
+    """An AoE agent name: no whitespace, control characters, or flag confusion."""
+    return (
+        isinstance(tool, str)
+        and bool(tool.strip())
+        and tool == tool.strip()
+        and not tool.startswith("-")
+        and not any(ord(char) < 32 or ord(char) == 127 for char in tool)
+    )
+
+
+def session_agents(config):
+    """Resolve which agent an AoE session should start per directory.
+
+    Returns (agents, error), where each agent is {"path": <absolute
+    directory>, "tool": <AoE agent name>}. Items outside every configured
+    directory keep AoE's default agent.
+    """
+    session_config = config.get("session") if isinstance(config, dict) else None
+    if session_config is None:
+        return [], None
+    if not isinstance(session_config, dict):
+        return None, "session configuration must be an object"
+    if set(session_config) - {"agents"}:
+        return None, "session has an unsupported field"
+    raw_agents = session_config.get("agents")
+    if raw_agents is None:
+        return [], None
+    if not isinstance(raw_agents, list):
+        return None, "session.agents must be a list"
+
+    agents = []
+    for index, raw_agent in enumerate(raw_agents, 1):
+        if not isinstance(raw_agent, dict) or set(raw_agent) != {"path", "tool"}:
+            return None, f"session.agents[{index}] must declare exactly path and tool"
+        path = raw_agent.get("path")
+        tool = raw_agent.get("tool")
+        if not isinstance(path, str) or not path.strip():
+            return None, f"session.agents[{index}].path must be a non-empty string"
+        if not _session_tool_name(tool):
+            return None, f"session.agents[{index}].tool must be an agent name"
+        agents.append({
+            "path": os.path.realpath(os.path.expanduser(path.strip())),
+            "tool": tool,
+        })
+    return agents, None
+
+
 def _tree_order(items):
     by_identity = {
         item["identity_key"]: item
