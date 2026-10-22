@@ -3,19 +3,13 @@ name = "Attention"
 version = "1.2.0"
 api_version = 16
 aoe_version = ">=1.20.0, <2.0.0"
-description = "Attention sidebar and dashboard page using the terminal's configured actions."
+description = "Attention triage in session sidebars."
 capabilities = ["runtime.worker", "session.read", "process.spawn", "fs.read", "fs.write", "clipboard.write", "browser_open", "net"]
 
 [[ui]]
 slot = "pane"
 id = "attention"
 
-[[ui]]
-slot = "page"
-id = "dashboard"
-title = "Attention"
-icon = "inbox"
-entry = "attention.html"
 
 [runtime]
 kind = "command"

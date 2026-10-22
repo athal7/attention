@@ -42,207 +42,8 @@ def _receive_json_line(stream, buffer, timeout, timeout_message):
         buffer.extend(chunk)
 
 
-@unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard page tests")
-class DashboardPageTests(unittest.TestCase):
-    def test_page_accepts_delivery_ack_and_shows_worker_or_bridge_errors(self):
-        harness = r"""
-const fs = require("node:fs");
-const vm = require("node:vm");
-const html = fs.readFileSync(process.argv[1], "utf8");
-const source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-async function run(actionReply) {
-  const elements = new Map();
-  const makeElement = tag => ({
-    tagName: String(tag).toUpperCase(),
-    children: [],
-    style: { setProperty() {} },
-    append(...children) { this.children.push(...children); },
-    replaceChildren(...children) { this.children = children; },
-    prepend(child) { this.children.unshift(child); },
-    setAttribute() {},
-    focus() {},
-    querySelectorAll() { return []; },
-    hidden: false,
-    disabled: false,
-    value: "",
-  });
-  const document = {
-    getElementById(id) {
-      if (!elements.has(id)) elements.set(id, makeElement("div"));
-      return elements.get(id);
-    },
-    createElement: makeElement,
-    documentElement: makeElement("html"),
-  };
-  document.getElementById("items");
-  const timers = [];
-  const port1 = {
-    onmessage: null,
-    postMessage(message) {
-      const reply = message.method === "action" ? actionReply : { result: [] };
-      queueMicrotask(() => this.onmessage({ data: { id: message.id, ...reply } }));
-    },
-  };
-  vm.runInNewContext(source, {
-    document,
-    MessageChannel: function MessageChannel() { return { port1, port2: {} }; },
-    parent: { postMessage() {} },
-    location: { hash: "#nonce" },
-    setTimeout(callback) { timers.push(callback); },
-    setInterval() {},
-  });
-  await timers[0]();
-  return elements.get("items").children
-    .filter(child => child.className === "notice error")
-    .map(child => child.textContent);
-}
-
-(async () => {
-  const errors = await run({ result: { accepted: true } });
-  if (errors.length) throw new Error(`delivery acknowledgement rejected: ${errors}`);
-  const workerRejected = await run({ result: { ok: false, error: "busy" } });
-  if (workerRejected[0] !== "busy") {
-    throw new Error(`worker rejection was not shown: ${workerRejected}`);
-  }
-  const rejected = await run({ error: { message: "bridge unavailable" } });
-  if (rejected[0] !== "bridge unavailable") {
-    throw new Error(`bridge rejection was not shown: ${rejected}`);
-  }
-})().catch(error => {
-  console.error(error);
-  process.exitCode = 1;
-});
-"""
-        result = subprocess.run(
-            [shutil.which("node"), "-e", harness, str(ROOT / "attention.html")],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-
-    def test_lumen_page_action_dispatches_its_configured_token(self):
-        harness = r"""
-const fs = require("node:fs");
-const vm = require("node:vm");
-const html = fs.readFileSync(process.argv[1], "utf8");
-const source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
-const sent = [];
-const timers = [];
-const payload = {
-  items: [{
-    title: "Review pull request",
-    source: "github",
-    provider: "github",
-    group: "Pull requests",
-    actions: [{ label: "Lumen", token: "lumen-action-token", method: "attention.action" }],
-  }],
-  failures: [],
-  fetched_at: "2026-10-21 12:00 UTC",
-  busy: false,
-  status: "",
-  error: "",
-  prompt: null,
-};
-const elements = new Map();
-function descendants(node) {
-  return [node, ...node.children.flatMap(descendants)];
-}
-function makeElement(tag) {
-  const node = {
-    tagName: String(tag).toUpperCase(),
-    children: [],
-    dataset: {},
-    style: { setProperty() {} },
-    append(...children) { this.children.push(...children); },
-    replaceChildren(...children) { this.children = children; },
-    prepend(child) { this.children.unshift(child); },
-    setAttribute() {},
-    focus() {},
-    querySelectorAll(selector) {
-      return selector === "button"
-        ? descendants(this).filter(child => child.tagName === "BUTTON")
-        : [];
-    },
-    hidden: false,
-    disabled: false,
-    value: "",
-  };
-  Object.defineProperty(node, "childNodes", { get() { return this.children; } });
-  return node;
-}
-const document = {
-  getElementById(id) {
-    if (!elements.has(id)) elements.set(id, makeElement("div"));
-    return elements.get(id);
-  },
-  createElement: makeElement,
-  documentElement: makeElement("html"),
-};
-document.getElementById("new-session").hidden = true;
-const port1 = {
-  onmessage: null,
-  postMessage(message) {
-    sent.push(message);
-    const result = message.method === "plugins.uiState"
-      ? [{ plugin_id: "athal7.attention", slot: "page", id: "dashboard", payload }]
-      : { accepted: true };
-    queueMicrotask(() => this.onmessage({ data: { id: message.id, result } }));
-  },
-};
-vm.runInNewContext(source, {
-  document,
-  MessageChannel: function MessageChannel() { return { port1, port2: {} }; },
-  parent: { postMessage() {} },
-  location: { hash: "#nonce" },
-  setTimeout(callback) { timers.push(callback); },
-  setInterval() {},
-});
-function find(node, predicate) {
-  return descendants(node).find(predicate);
-}
-(async () => {
-  await timers[0]();
-  const action = find(document.getElementById("items"),
-    node => node.tagName === "BUTTON" && node.textContent === "Lumen");
-  if (!action) throw new Error("Lumen action was not rendered");
-  const actionMenu = find(document.getElementById("items"),
-    node => node.tagName === "DETAILS");
-  if (!actionMenu || actionMenu.open !== false) {
-    throw new Error("Configured actions should stay inside a collapsed menu");
-  }
-  action.onclick();
-  const dispatch = sent.find(message => message.method === "action"
-    && message.params.method === "attention.action");
-  if (!dispatch || dispatch.params.params.token !== "lumen-action-token") {
-    throw new Error(`Lumen action did not reach the configured worker route: ${JSON.stringify(sent)}`);
-  }
-  document.getElementById("show-new-session").onclick();
-  if (document.getElementById("new-session").hidden) {
-    throw new Error("New session form is not accessible from the unified page");
-  }
-  const filter = find(document.getElementById("filters"),
-    node => node.tagName === "BUTTON" && node.textContent === "source: github");
-  if (!filter) throw new Error("Source filter was not rendered");
-  filter.onclick();
-  const remainingAction = find(document.getElementById("items"),
-    node => node.tagName === "BUTTON" && node.textContent === "Lumen");
-  if (remainingAction) throw new Error("Source filter did not hide the item's actions");
-  const empty = find(document.getElementById("items"),
-    node => node.textContent === "No attention items match the current filters.");
-  if (!empty) throw new Error("Filtered empty state was not shown");
-})().catch(error => {
-  console.error(error);
-  process.exitCode = 1;
-});
-"""
-        result = subprocess.run(
-            [shutil.which("node"), "-e", harness, str(ROOT / "attention.html")],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-class DashboardPayloadTests(unittest.TestCase):
+class SidebarPayloadTests(unittest.TestCase):
     def test_session_ui_state_parses_primary_cli_url_without_starting_daemon(self):
         output = SimpleNamespace(
             returncode=0,
@@ -261,37 +62,46 @@ class DashboardPayloadTests(unittest.TestCase):
             "http://127.0.0.1:4097/api/plugins/ui-state?token=secret", timeout=5,
         )
 
-    def test_prompt_publishes_dashboard_even_when_not_already_open(self):
-        prompt = {"id": "prompt-1", "token": "token-1"}
-        with patch.object(worker, "rpc") as rpc, \
-                patch.object(worker, "dashboard_active", False), \
-                patch.object(worker, "active_prompt", prompt), \
-                patch.object(worker, "snapshot_fetched_at", None), \
-                patch.object(worker, "action_tokens", {}, create=True):
-            worker.publish_payload([], worker.status_payload("Input required."), items=[])
-        page = next(
-            call.args[1]["payload"] for call in rpc.call_args_list
-            if call.args[1].get("slot") == "page"
-        )
-        self.assertEqual(page["prompt"], prompt)
-
-    def test_native_sidebar_lists_items_and_places_item_actions_under_folded_rows(self):
+    def test_native_sidebar_uses_a_work_queue_and_one_selected_detail(self):
         action = {"key": "o", "label": "Open", "payload": {"kind": "open"}}
         token_actions = {}
-        page = worker.dashboard_payload([{
-            "title": "Review PR", "status": "Review needed", "url": "https://github.com/acme/repo/pull/42",
+        snapshot = worker.attention_payload([{
+            "title": "Review PR", "status": "Review needed",
+            "attention_reason": "Requested changes", "context": "acme/repo",
+            "details": "Inspect the failing test.",
+            "url": "https://github.com/acme/repo/pull/42",
             "actions": [action],
-        }], "now", [], token_actions)
-        pane = worker._sidebar_payload(page)
+        }, {
+            "title": "Linear issue", "status": "Assigned",
+            "url": "https://linear.app/acme/issue/ENG-4",
+        }], [], token_actions)
+        pane = worker._pane_payload(snapshot)
         self.assertEqual(pane["default_location"], "right")
         self.assertEqual(pane["blocks"][0]["method"], "attention.refresh")
-        card = pane["blocks"][2]["children"][0]
-        self.assertTrue(card["collapsed"])
-        self.assertEqual(card["children"][0]["href"], "https://github.com/acme/repo/pull/42")
-        self.assertEqual(card["children"][1]["method"], "attention.action")
-        self.assertIs(token_actions[card["children"][1]["params"]["token"]], action)
+        queue = pane["blocks"][1]
+        self.assertEqual(queue["title"], "Work queue")
+        self.assertTrue(queue["scroll"])
+        self.assertEqual(queue["badges"][0]["text"], "2")
+        first, second = queue["children"]
+        self.assertEqual(first["label"], "Review PR")
+        self.assertTrue(first["selected"])
+        self.assertEqual(first["sublabel"], "acme/repo")
+        self.assertEqual(first["value_tone"], "warn")
+        self.assertEqual(first["href"], "https://github.com/acme/repo/pull/42")
+        self.assertFalse(second["selected"])
+        callout = pane["blocks"][2]
+        self.assertEqual(callout["kind"], "callout")
+        self.assertEqual(callout["title"], "Requested changes")
+        self.assertEqual(callout["detail"], "Inspect the failing test.")
+        self.assertEqual(callout["actions"][0]["href"],
+                         "https://github.com/acme/repo/pull/42")
+        actions = pane["blocks"][3]
+        self.assertTrue(actions["collapsed"])
+        self.assertEqual(actions["children"][0]["method"], "attention.action")
+        token = actions["children"][0]["params"]["token"]
+        self.assertIs(token_actions[token], action)
 
-    def test_open_session_item_identity_suppresses_only_matching_github_and_linear_work(self):
+    def test_open_session_identity_suppresses_only_matching_github_and_linear_work(self):
         items = [
             {"kind": "pull_request", "title": "Shared branch without identity facet",
              "url": "https://github.com/acme/repo/pull/99", "repo_path": "/repo",
@@ -312,11 +122,12 @@ class DashboardPayloadTests(unittest.TestCase):
                 ("github", "acme", "repo", "pull", 43),
             ]},
         ]
-        page = worker.dashboard_payload(items, "now", sessions)
+        snapshot = worker.attention_payload(items, sessions)
         self.assertEqual(
-            {card["title"] for card in page["items"]},
+            {card["title"] for card in snapshot["items"]},
             {"Unrelated", "Stopped", "Shared branch without identity facet"},
         )
+
     def test_absorbed_linear_issue_identity_suppresses_its_github_host(self):
         loader = importlib.machinery.SourceFileLoader(
             "attention_linked_identity_test", str(ROOT / "attention"),
@@ -333,11 +144,12 @@ class DashboardPayloadTests(unittest.TestCase):
             "url": "https://linear.app/acme/issue/ENG-4",
         }
         attention._absorb(host, guest)
-        page = worker.dashboard_payload([host], "now", [{
+        snapshot = worker.attention_payload([host], [{
             "id": "linear-session", "status": "Idle",
             "_attention_items": [("linear", "acme", "ENG-4")],
         }])
-        self.assertEqual(page["items"], [])
+        self.assertEqual(snapshot["items"], [])
+
     def test_session_facets_use_only_canonical_plugin_item_links(self):
         entries = [{
             "plugin_id": "agent-of-empires.github",
@@ -371,8 +183,7 @@ class DashboardPayloadTests(unittest.TestCase):
             "plugin_id": "other.plugin", "slot": "row-badge",
             "id": "github_pr_badge", "session_id": "s1",
             "payload": {"href": "https://github.com/acme/repo/pull/99"},
-        }])
-        entries.extend([{
+        }, {
             "plugin_id": "athal7.attention", "slot": "pane",
             "id": "attention", "session_id": "s2", "payload": {},
         }, {
@@ -386,25 +197,73 @@ class DashboardPayloadTests(unittest.TestCase):
             ],
         })
 
-
-    def test_dashboard_page_trims_low_priority_entries_to_payload_limit(self):
+    def test_native_sidebar_keeps_selection_per_session(self):
         items = [
-            {"title": "Highest priority", "details": "h" * 4000, "weight": 100},
-            {"title": "Middle priority", "details": "m" * 4000, "weight": 50},
-            {"title": "Lowest priority", "details": "l" * 4000, "weight": 1},
+            {"title": "First", "status": "Review needed", "actions": []},
+            {"title": "Second", "status": "Assigned", "actions": []},
         ]
-        page = worker.dashboard_payload(items, "2026-10-19 12:00:00 UTC", [])
-        with patch.object(worker, "MAX_DASHBOARD_BYTES", 6000):
-            fitted = worker._fit_dashboard(page)
+        keys = [worker._item_key(item) for item in items]
+        calls = []
+        with patch.object(worker, "selected_item_keys", {"s1": keys[0], "s2": keys[1]}), \
+                patch.object(worker, "published_ids", set(), create=True), \
+                patch.object(worker, "action_tokens", {}, create=True), \
+                patch.object(worker, "rpc", side_effect=lambda method, params: calls.append(params)):
+            worker.publish_payload(
+                [{"id": "s1"}, {"id": "s2"}], worker.status_payload(), items=items,
+            )
+        selected = [
+            next(row["label"] for row in call["payload"]["blocks"][1]["children"]
+                 if row["selected"])
+            for call in calls
+        ]
+        self.assertEqual(selected, ["First", "Second"])
+        self.assertEqual(
+            [call["payload"]["blocks"][2]["title"] for call in calls],
+            ["Review needed", "Assigned"],
+        )
+
+    def test_sidebar_item_selection_dispatch_requests_a_pane_update(self):
+        with patch.object(worker, "live_session_ids", {"s1", "s2"}, create=True), \
+                patch.object(worker, "pane_refresh_requested", False), \
+                patch.object(worker, "send") as send:
+            worker.dispatch({
+                "jsonrpc": "2.0", "id": "select",
+                "method": "attention.select_item",
+                "params": {"session_id": "s1", "item_key": "item-b"},
+            })
+            self.assertEqual(worker.selected_item_keys, {"s1": "item-b"})
+            self.assertTrue(worker.pane_refresh_requested)
+            self.assertTrue(send.call_args.args[0]["result"]["ok"])
+            worker.dispatch({
+                "jsonrpc": "2.0", "id": "unknown-session",
+                "method": "attention.select_item",
+                "params": {"session_id": "s3", "item_key": "item-c"},
+            })
+            self.assertEqual(worker.selected_item_keys, {"s1": "item-b"})
+            self.assertFalse(send.call_args.args[0]["result"]["ok"])
+
+    def test_native_pane_trims_lower_priority_queue_rows_to_payload_limit(self):
+        items = [
+            {"title": "Highest priority", "details": "h" * 1800, "weight": 100},
+            {"title": "Middle priority", "details": "m" * 1800, "weight": 50},
+            {"title": "Lowest priority", "details": "l" * 1800, "weight": 1},
+        ]
+        snapshot = worker.attention_payload(items, [])
+        pane = worker._pane_payload(snapshot)
+        with patch.object(worker, "MAX_PANE_BYTES", 2000):
+            fitted = worker._fit_pane(pane)
         self.assertLessEqual(
             len(json.dumps(fitted, separators=(",", ":")).encode("utf-8")),
-            worker.MAX_DASHBOARD_BYTES,
+            worker.MAX_PANE_BYTES,
         )
-        self.assertEqual([item["title"] for item in fitted["items"]],
-                         ["Highest priority"])
-        self.assertEqual(fitted["omitted_items"], 2)
+        queue = next(block for block in fitted["blocks"]
+                     if block.get("title") == "Work queue")
+        self.assertEqual(
+            [row["label"] for row in queue["children"]],
+            ["Highest priority"],
+        )
 
-    def test_dashboard_page_omits_a_single_card_that_exceeds_the_payload_limit(self):
+    def test_native_pane_trims_actions_without_dropping_selected_item(self):
         item = {
             "title": "Too many actions",
             "actions": [
@@ -413,93 +272,125 @@ class DashboardPayloadTests(unittest.TestCase):
                 for index in range(100)
             ],
         }
-        page = worker.dashboard_payload([item], "2026-10-19 12:00:00 UTC", [])
-        with patch.object(worker, "MAX_DASHBOARD_BYTES", 6000):
-            fitted = worker._fit_dashboard(page)
+        snapshot = worker.attention_payload([item], [])
+        pane = worker._pane_payload(snapshot)
+        with patch.object(worker, "MAX_PANE_BYTES", 6000):
+            fitted = worker._fit_pane(pane)
         encoded = json.dumps(fitted, separators=(",", ":")).encode("utf-8")
-        self.assertLessEqual(len(encoded), worker.MAX_DASHBOARD_BYTES)
-        self.assertEqual(fitted["items"], [])
-        self.assertEqual(fitted["omitted_items"], 1)
+        self.assertLessEqual(len(encoded), worker.MAX_PANE_BYTES)
+        self.assertIn("Too many actions", json.dumps(fitted))
+        actions = next(block for block in fitted["blocks"]
+                       if block.get("title") == "Actions")
+        self.assertLess(len(actions["children"]), 100)
+        self.assertIn("omitted", json.dumps(fitted))
 
-    def test_dashboard_page_exposes_lumen_and_prompt_actions_as_opaque_tokens(self):
+
+    def test_sidebar_actions_are_opaque_tokens(self):
         lumen_action = {
             "_plugin": "github", "label": "Lumen",
-            "payload": {
-                "command": [
-                    "/opt/homebrew/bin/lumen", "diff",
-                    "https://github.com/example/repo/pull/42",
-                ],
-                "terminal": True,
-            },
+            "payload": {"command": [
+                "/opt/homebrew/bin/lumen", "diff",
+                "https://github.com/example/repo/pull/42",
+            ], "terminal": True},
         }
         prompt_action = {
             "label": "Comment",
             "payload": {"command": ["echo"], "inputs": [{"prompt": "Review note"}]},
         }
         token_actions = {}
-        page = worker.dashboard_payload([{
+        snapshot = worker.attention_payload([{
             "_plugin": "github", "kind": "pull_request", "title": "Review PR",
             "actions": [lumen_action, prompt_action],
-        }], "2026-10-19 12:00:00 UTC", [], token_actions)
-
-        actions = page["items"][0]["actions"]
+        }], [], token_actions)
+        actions = snapshot["items"][0]["actions"]
         self.assertEqual([action["label"] for action in actions],
                          ["Lumen", "Comment", "New session"])
-        lumen_button = actions[0]
-        self.assertEqual(lumen_button["method"], "attention.action")
-        dispatched_action = token_actions[lumen_button["token"]]
-        self.assertIs(dispatched_action, lumen_action)
-        self.assertEqual(dispatched_action["payload"]["command"], [
-            "/opt/homebrew/bin/lumen", "diff",
-            "https://github.com/example/repo/pull/42",
-        ])
-        self.assertNotIn("/opt/homebrew/bin/lumen", json.dumps(page))
+        pane = worker._pane_payload(snapshot)
+        encoded = json.dumps(pane)
+        self.assertNotIn("/opt/homebrew/bin/lumen", encoded)
+        action_tokens = worker._pane_action_tokens(pane)
+        self.assertEqual(action_tokens, {action["token"] for action in actions})
+        self.assertIs(token_actions[actions[0]["token"]], lumen_action)
 
-    def test_action_failure_and_terminal_diagnostic_are_published_to_dashboard(self):
-        previous = {
-            name: getattr(worker, name)
-            for name in ("dashboard_active", "snapshot_fetched_at",
-                         "active_action", "active_prompt")
-        }
-        had_action_tokens = hasattr(worker, "action_tokens")
-        previous_action_tokens = getattr(worker, "action_tokens", None)
+    def test_action_feedback_is_published_only_in_session_pane(self):
+        names = ("published_ids", "action_tokens", "selected_item_keys")
+        previous = {name: getattr(worker, name) for name in names if hasattr(worker, name)}
+        worker.published_ids = set()
+        worker.action_tokens = {}
+        worker.selected_item_keys = {}
         try:
-            worker.dashboard_active = True
-            worker.snapshot_fetched_at = "2026-10-19 12:00:00 UTC"
-            worker.action_tokens = {}
-            worker.active_action = None
-            worker.active_prompt = None
             with patch.object(worker, "rpc") as send:
                 worker.publish_payload(
-                    [], worker.status_payload("Failed: Lumen: Action did not complete."),
+                    [{"id": "s1"}],
+                    worker.status_payload("Failed: Lumen: Action did not complete."),
                     items=[{"title": "Review PR", "actions": []}],
-                    action_output="Could not open Terminal: permission denied.",
                 )
-            page = send.call_args.args[1]["payload"]
-            self.assertEqual(page["status"], "Failed: Lumen: Action did not complete.")
-            self.assertEqual(page["action_output"],
-                             "Could not open Terminal: permission denied.")
-            self.assertEqual(page["error"], page["status"])
+            params = send.call_args.args[1]
+            self.assertEqual(params["slot"], "pane")
+            self.assertEqual(params["session_id"], "s1")
+            self.assertEqual(params["payload"]["blocks"][1]["text"],
+                             "Failed: Lumen: Action did not complete.")
+            self.assertNotIn("page", json.dumps(params))
         finally:
-            for name, value in previous.items():
-                setattr(worker, name, value)
-            if had_action_tokens:
-                worker.action_tokens = previous_action_tokens
-            else:
-                del worker.action_tokens
+            for name in names:
+                if name in previous:
+                    setattr(worker, name, previous[name])
+                elif hasattr(worker, name):
+                    delattr(worker, name)
+    def test_republished_pane_rejects_old_action_tokens_immediately(self):
+        names = (
+            "published_ids", "action_tokens", "action_token_sessions",
+            "selected_item_keys", "live_session_ids", "active_action",
+            "action_requests", "consumed_action_ids",
+        )
+        previous = {name: getattr(worker, name) for name in names if hasattr(worker, name)}
+        action = {"label": "Run", "payload": {"command": ["echo"]}}
+        worker.published_ids = set()
+        worker.action_tokens = {"old-token": action}
+        worker.action_token_sessions = {"old-token": "s1"}
+        worker.selected_item_keys = {}
+        worker.live_session_ids = {"s1", "s2"}
+        worker.active_action = None
+        worker.action_requests = queue.Queue()
+        worker.consumed_action_ids = set()
+        responses = []
 
-    def test_dashboard_page_preserves_live_session_matches(self):
-        item = {
-            "title": "Review PR", "repo_path": "/repo", "head_branch": "feature",
-        }
+        def publish(method, params):
+            if params["session_id"] == "s1":
+                with patch.object(worker, "send", side_effect=responses.append):
+                    worker.dispatch({
+                        "jsonrpc": "2.0", "id": "stale",
+                        "method": "attention.action",
+                        "params": {"token": "old-token", "session_id": "s1"},
+                    })
+
+        try:
+            with patch.object(worker, "rpc", side_effect=publish):
+                worker.publish_payload(
+                    [{"id": "s1"}, {"id": "s2"}], {},
+                    items=[{"title": "Review PR", "actions": [action]}],
+                )
+            self.assertEqual(responses[0]["result"]["ok"], False)
+            self.assertIn("expired", responses[0]["result"]["error"])
+            with self.assertRaises(queue.Empty):
+                worker.action_requests.get_nowait()
+        finally:
+            for name in names:
+                if name in previous:
+                    setattr(worker, name, previous[name])
+                elif hasattr(worker, name):
+                    delattr(worker, name)
+
+    def test_sidebar_preserves_live_session_matches(self):
+        item = {"title": "Review PR", "repo_path": "/repo", "head_branch": "feature"}
         sessions = [{
             "id": "session/id", "title": "Work", "status": "Running",
             "workspace_repos": [{"source_path": "/repo", "branch": "feature"}],
         }]
-        page = worker.dashboard_payload(
-            [item], "2026-10-19 12:00:00 UTC", sessions,
+        snapshot = worker.attention_payload([item], sessions)
+        self.assertEqual(
+            snapshot["items"][0]["session"], {"id": "session/id", "title": "Work"},
         )
-        self.assertEqual(page["items"][0]["session"], {"id": "session/id", "title": "Work"})
 
     def test_generated_session_action_preserves_registered_repo_and_pr_branches(self):
         item = {
@@ -508,10 +399,8 @@ class DashboardPayloadTests(unittest.TestCase):
             "head_branch": "feature/pr-42", "base_branch": "main",
         }
         token_actions = {}
-        page = worker.dashboard_payload(
-            [item], "2026-10-19 12:00:00 UTC", [], token_actions,
-        )
-        new_session = page["items"][0]["actions"][-1]
+        snapshot = worker.attention_payload([item], [], token_actions)
+        new_session = snapshot["items"][0]["actions"][-1]
         self.assertEqual(new_session["label"], "New session")
         action = token_actions[new_session["token"]]
         self.assertEqual(action["params"]["path"], "/registered/repo")
@@ -529,14 +418,11 @@ class DashboardPayloadTests(unittest.TestCase):
             "repo_path": "/repo", "actions": [session_action],
         }
         token_actions = {}
-        page = worker.dashboard_payload(
-            [item], "2026-10-19 12:00:00 UTC", [], token_actions,
-        )
-        actions = page["items"][0]["actions"]
+        snapshot = worker.attention_payload([item], [], token_actions)
+        actions = snapshot["items"][0]["actions"]
         self.assertEqual([action["label"] for action in actions], ["session"])
         self.assertEqual(actions[0]["method"], "attention.action")
         self.assertIs(token_actions[actions[0]["token"]], session_action)
-
 
 
 class GitHubRepositoryResolutionTests(unittest.TestCase):
@@ -633,7 +519,7 @@ class AttentionSourceTests(unittest.TestCase):
                 with patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
                     self.assertEqual(worker.attention_items(), [])
 
-    def test_cli_and_dashboard_show_sanitized_partial_and_total_collector_failures(self):
+    def test_cli_and_sidebar_show_sanitized_partial_and_total_collector_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_dir = root / "config" / "attention"
@@ -672,29 +558,29 @@ class AttentionSourceTests(unittest.TestCase):
             self.assertIn("RuntimeError", output)
             self.assertNotIn("collector-secret", output)
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
-            dashboard_text = json.dumps(dashboard)
-            self.assertEqual([item["title"] for item in dashboard["items"]], ["Healthy item"])
-            self.assertEqual(len(dashboard["failures"]), 1)
-            self.assertIn("failing", dashboard_text.casefold())
-            self.assertNotIn("collector-secret", dashboard_text)
+                snapshot = worker.attention_payload(worker.attention_items(), [])
+            snapshot_text = json.dumps(snapshot)
+            self.assertEqual([item["title"] for item in snapshot["items"]], ["Healthy item"])
+            self.assertEqual(len(snapshot["failures"]), 1)
+            self.assertIn("failing", snapshot_text.casefold())
+            self.assertNotIn("collector-secret", snapshot_text)
 
             set_plugins([failing])
             output = run_cli()
             self.assertIn("failing collector failed", output)
             self.assertNotIn("Nothing needs attention", output)
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
-            self.assertEqual(dashboard["items"], [])
-            self.assertEqual(len(dashboard["failures"]), 1)
+                snapshot = worker.attention_payload(worker.attention_items(), [])
+            self.assertEqual(snapshot["items"], [])
+            self.assertEqual(len(snapshot["failures"]), 1)
 
             healthy.write_text("def fetch(config):\n    return []\n")
             set_plugins([healthy])
             self.assertEqual(run_cli(), "")
             with patch.dict(os.environ, env), patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
-                dashboard = worker.dashboard_payload(worker.attention_items(), None, [])
-            self.assertEqual(dashboard["items"], [])
-            self.assertEqual(dashboard["failures"], [])
+                snapshot = worker.attention_payload(worker.attention_items(), [])
+            self.assertEqual(snapshot["items"], [])
+            self.assertEqual(snapshot["failures"], [])
 
     def test_interactive_dashboard_renders_failed_and_healthy_collectors(self):
         dashboard_spec = importlib.util.spec_from_file_location(
@@ -944,18 +830,29 @@ class WorkerProtocolTests(unittest.TestCase):
         action_tokens = {token: action}
         consumed = set()
         requests = queue.Queue()
-        with patch.object(worker, "live_session_ids", {"s1"}, create=True), \
+        with patch.object(worker, "live_session_ids", {"s1", "s2"}, create=True), \
              patch.object(worker, "action_tokens", action_tokens, create=True), \
+             patch.object(worker, "action_token_sessions", {token: "s1"}, create=True), \
              patch.object(worker, "consumed_session_item_ids", consumed, create=True), \
              patch.object(worker, "action_requests", requests, create=True), \
              patch.object(worker, "active_action", None, create=True), \
-             patch.object(worker, "dashboard_active", False, create=True), \
              patch.object(worker, "send") as send:
             request = {
                 "jsonrpc": "2.0", "id": "create-session",
                 "method": "attention.new_session",
                 "params": {"token": token, "session_id": "s1"},
             }
+            foreign_request = {
+                **request, "id": "foreign-session",
+                "params": {"token": token, "session_id": "s2"},
+            }
+            worker.dispatch(foreign_request)
+            foreign = send.call_args.args[0]["result"]
+            self.assertFalse(foreign["ok"])
+            self.assertIn("expired", foreign["error"])
+            with self.assertRaises(queue.Empty):
+                requests.get_nowait()
+            send.reset_mock()
             worker.dispatch(request)
             send.assert_called_once_with({
                 "jsonrpc": "2.0", "id": "create-session", "result": {"ok": True},
@@ -970,28 +867,22 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertFalse(send.call_args.args[0]["result"]["ok"])
             self.assertIn("expired", send.call_args.args[0]["result"]["error"])
 
-    def test_new_session_form_routes_cli_options_to_the_worker(self):
-        options = {
-            "title": "Worktree session", "path": "/repo", "profile": "qa", "tool": "omp",
-            "group": "reviews", "worktree_branch": "feature/task",
-            "new_branch": True, "base_branch": "main", "scratch": False,
-        }
+    def test_new_session_without_sidebar_action_token_is_rejected(self):
         requests = queue.Queue()
         with patch.object(worker, "action_tokens", {}, create=True), \
              patch.object(worker, "action_requests", requests, create=True), \
              patch.object(worker, "active_action", None, create=True), \
-             patch.object(worker, "dashboard_active", False, create=True), \
              patch.object(worker, "send") as send:
             worker.dispatch({
                 "jsonrpc": "2.0", "id": "form",
-                "method": "attention.new_session", "params": options,
+                "method": "attention.new_session",
+                "params": {"title": "Worktree session", "path": "/repo"},
             })
-            send.assert_called_once_with({
-                "jsonrpc": "2.0", "id": "form", "result": {"ok": True},
-            })
-        queued = requests.get_nowait()
-        self.assertEqual(queued["action"]["params"], options)
-
+            response = send.call_args.args[0]
+            self.assertFalse(response["result"]["ok"])
+            self.assertIn("expired", response["result"]["error"])
+        with self.assertRaises(queue.Empty):
+            requests.get_nowait()
     def test_pr_worktree_reuses_an_existing_local_head_branch(self):
         commands = []
         outputs = iter([
@@ -1445,8 +1336,10 @@ class AttentionActionDispatchTests(unittest.TestCase):
 
 
 
+
+
 class WorkerActionProtocolTests(unittest.TestCase):
-    def test_action_is_session_scoped_single_use_without_implicit_refresh(self):
+    def test_actions_are_session_scoped_and_prompt_actions_fail_in_sidebar(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             attention = root / "attention"
@@ -1463,26 +1356,19 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 "'weight':10,'_plugin':'github','kind':'issue',"
                 "'repo_resolution_error':'Attention item has no AoE project path.','actions':["
                 "{'key':'o','label':'Run QA','primary':True,'_plugin':'generic',"
-                "'_original_key':'o','payload':{'command':['echo','run'] }},"
+                "'_original_key':'o','payload':{'command':['echo','run']}},"
                 "{'key':'p','label':'Prompt QA','_plugin':'generic',"
-                "'_original_key':'p','payload':{'command':['echo','prompt']}},"
-                "{'key':'x','label':'Oversized QA','_plugin':'generic',"
-                "'_original_key':'x','payload':{'command':['echo','oversized']}}]}]\n"
-                "if len(sys.argv) > 1 and sys.argv[1] in ('__worker_action__', '__worker_action_interactive__'):\n"
+                "'_original_key':'p','payload':{'command':['echo','prompt']}}]},"
+                "{'status':'WAITING','context':'QA','title':'Second item',"
+                "'details':'selected detail','attention_reason':'Second item selected',"
+                "'weight':5,'_plugin':'generic','kind':'task','id':'second','actions':[]}]\n"
+                "if len(sys.argv) > 1 and sys.argv[1] == '__worker_action_interactive__':\n"
                 "    action = json.loads(sys.stdin.readline())\n"
                 "    DISPATCHED.write_text(json.dumps(action))\n"
                 "    command = action['payload']['command'][-1]\n"
                 "    if command == 'prompt':\n"
-                "        print(json.dumps({'prompt': {'text':'Confirm action?', 'choices':['yes','no'], 'default':'yes'}}), flush=True)\n"
-                "        answer = json.loads(sys.stdin.readline())\n"
-                "        if answer.get('value') is None:\n"
-                "            print(json.dumps({'ok':False,'error':'Action canceled.'}))\n"
-                "        else:\n"
-                "            print(json.dumps({'ok':True}))\n"
-                "    elif command == 'oversized':\n"
-                "        choices = ['choice-' + str(i) + '-' + ('界' * 200) for i in range(100)]\n"
-                "        print(json.dumps({'prompt': {'text':'Large choices', 'choices':choices}}), flush=True)\n"
-                "        print(json.dumps({'ok':True}))\n"
+                "        print(json.dumps({'prompt': {'text':'Confirm action?'}}), flush=True)\n"
+                "        sys.stdin.readline()\n"
                 "    else:\n"
                 "        sys.stderr.write('source action output\\n')\n"
                 "        print(json.dumps({'ok': True}))\n"
@@ -1493,202 +1379,207 @@ class WorkerActionProtocolTests(unittest.TestCase):
             )
             worker_path = root / "aoe_worker.py"
             worker_path.write_text(source)
-            proc = subprocess.Popen([sys.executable, str(worker_path)], stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+            proc = subprocess.Popen(
+                [sys.executable, str(worker_path)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
             stdout_buffer = bytearray()
-            published_pages = []
 
             def receive(timeout=3):
-                return _receive_json_line(proc.stdout, stdout_buffer, timeout, "worker did not send a protocol message")
+                return _receive_json_line(
+                    proc.stdout, stdout_buffer, timeout, "worker did not send a protocol message",
+                )
 
             def reply(request, result=None):
-                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request["id"],
-                                             "result": result or {}}) + "\n")
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result or {},
+                }) + "\n")
                 proc.stdin.flush()
 
             def send_action(request_id, token, session_id, method="attention.action"):
-                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id,
-                    "method": method, "params": {"token": token, "session_id": session_id}}) + "\n")
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": request_id, "method": method,
+                    "params": {"token": token, "session_id": session_id},
+                }) + "\n")
                 proc.stdin.flush()
+
+            def find_action(pane, label):
+                pending = list(pane["blocks"])
+                while pending:
+                    block = pending.pop()
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("label") == label and block.get("method"):
+                        return block
+                    children = block.get("children")
+                    if isinstance(children, list):
+                        pending.extend(children)
+                raise AssertionError(f"no sidebar action named {label!r}")
+
+            def service(message):
+                if message.get("method") == "sessions.list":
+                    reply(message, {"sessions": [
+                        {"id": "s1", "project_path": "/repo"},
+                        {"id": "s2", "project_path": "/other"},
+                    ]})
+                    return None
+                if message.get("method") == "ui.state.set":
+                    params = message["params"]
+                    self.assertEqual(params["slot"], "pane")
+                    self.assertIn(params["session_id"], {"s1", "s2"})
+                    reply(message)
+                    return params["session_id"], params["payload"]
+                return None
 
             def wait_response(request_id, timeout=4):
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     message = receive(max(0.01, deadline - time.monotonic()))
-                    if message.get("method") == "ui.state.set":
-                        params = message["params"]
-                        if params.get("slot") == "page":
-                            published_pages.append(params["payload"])
-                        reply(message)
-                    elif message.get("method") == "sessions.list":
-                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
+                    if message.get("method") in {"sessions.list", "ui.state.set"}:
+                        service(message)
                     elif message.get("id") == request_id:
                         return message
                 self.fail(f"worker did not reply to {request_id}")
 
-            def wait_page(predicate, timeout=5):
+            def wait_pane(predicate, session_id="s1", timeout=5):
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
-                    for index, page in enumerate(published_pages):
-                        if predicate(page):
-                            del published_pages[index]
-                            return page
                     message = receive(max(0.01, deadline - time.monotonic()))
-                    if message.get("method") == "sessions.list":
-                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
-                    elif message.get("method") == "ui.state.set":
-                        params = message["params"]
-                        page = params["payload"]
-                        reply(message)
-                        if params.get("slot") == "page":
-                            if predicate(page):
-                                return page
-                            published_pages.append(page)
-                self.fail("worker did not publish the expected dashboard state")
+                    pane = service(message)
+                    if (pane is not None and pane[0] == session_id
+                            and predicate(pane[1])):
+                        return pane[1]
+                self.fail(f"worker did not publish the expected sidebar state for {session_id}")
 
             try:
                 listing = receive()
                 self.assertEqual(listing["method"], "sessions.list")
-                reply(listing, {"sessions": [{"id": "s1", "project_path": "/repositories/attention-open"}]})
+                reply(listing, {"sessions": [
+                    {"id": "s1", "project_path": "/repo"},
+                    {"id": "s2", "project_path": "/other"},
+                ]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
+                self.assertEqual(loading["params"]["slot"], "pane")
                 reply(loading)
+
                 proc.stdin.write(json.dumps({
-                    "jsonrpc": "2.0", "id": "initial-refresh",
-                    "method": "attention.refresh", "params": {},
+                    "jsonrpc": "2.0", "id": "refresh", "method": "attention.refresh",
+                    "params": {"session_id": "s1"},
                 }) + "\n")
                 proc.stdin.flush()
-                self.assertEqual(receive()["id"], "initial-refresh")
-                page_payload = None
-                while page_payload is None:
-                    first = receive()
-                    if first.get("method") == "sessions.list":
-                        reply(first, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
-                        continue
-                    self.assertEqual(first.get("method"), "ui.state.set")
-                    params = first["params"]
-                    if params.get("slot") == "page":
-                        page_payload = params["payload"]
-                    reply(first)
-                item = page_payload["items"][0]
-                button = next(action for action in item["actions"]
-                              if action["label"] == "Run QA")
-                token = button["token"]
-                self.assertNotIn("private-command", json.dumps(page_payload))
+                self.assertTrue(wait_response("refresh")["result"]["ok"])
+                pane = wait_pane(lambda value: find_action(value, "Run QA") is not None)
+                run_action = find_action(pane, "Run QA")
+                token = run_action["params"]["token"]
+                self.assertNotIn('"echo", "run"', json.dumps(pane))
+                other_pane = wait_pane(
+                    lambda value: find_action(value, "Run QA") is not None,
+                    session_id="s2",
+                )
+                other_token = find_action(other_pane, "Run QA")["params"]["token"]
+                self.assertNotEqual(token, other_token)
 
                 send_action("wrong-session", token, "other")
                 wrong = wait_response("wrong-session")
                 self.assertFalse(wrong["result"]["ok"])
                 self.assertIn("Unknown session", wrong["result"]["error"])
+                send_action("foreign-live-session", token, "s2")
+                foreign = wait_response("foreign-live-session")
+                self.assertFalse(foreign["result"]["ok"])
+                self.assertIn("expired", foreign["result"]["error"])
 
-                send_action("run", token, None)
-                accepted = wait_response("run")
-                self.assertTrue(accepted["result"]["ok"])
+                send_action("run", token, "s1")
+                self.assertTrue(wait_response("run")["result"]["ok"])
                 send_action("duplicate", token, "s1")
                 duplicate = wait_response("duplicate")
                 self.assertFalse(duplicate["result"]["ok"])
+                self.assertIn("already running", duplicate["result"]["error"])
 
-                deadline = time.monotonic() + 5
-                completed_seen = False
-                completed_page = None
-                action_output = None
-                while time.monotonic() < deadline and not completed_seen:
-                    message = receive(max(0.01, deadline - time.monotonic()))
-                    if message.get("method") == "sessions.list":
-                        reply(message, {"sessions": [{"id": "s1", "project_path": "/repo"}]})
-                        continue
-                    self.assertEqual(message.get("method"), "ui.state.set")
-                    params = message["params"]
-                    page = params["payload"]
-                    if params.get("slot") == "page":
-                        completed_seen = "Completed: Run QA" in json.dumps(page)
-                        if completed_seen:
-                            completed_page = page
-                            action_output = page.get("action_output")
-                    reply(message)
+                completed = wait_pane(
+                    lambda value: any(
+                        block.get("text", "").startswith("Completed: Run QA")
+                        for block in value["blocks"] if isinstance(block, dict)
+                    )
+                )
+                send_action("stale-after-completion", token, "s1")
+                stale = wait_response("stale-after-completion")
+                self.assertFalse(stale["result"]["ok"])
+                self.assertIn("expired", stale["result"]["error"])
                 self.assertTrue(dispatched.exists(), "source action child was not invoked")
                 self.assertEqual(json.loads(dispatched.read_text())["payload"]["command"],
                                  ["echo", "run"])
-                self.assertTrue(completed_seen, "page omitted action completion feedback")
-                self.assertEqual(action_output, "source action output")
+                self.assertIn("source action output", json.dumps(completed))
                 self.assertEqual(fetches.read_text(), "1", "action completion fetched implicitly")
-                session_button = next(
-                    action for action in completed_page["items"][0]["actions"]
-                    if action["label"] == "New session"
-                )
-                new_session_token = session_button["token"]
 
-                send_action("stale", token, "s1")
-                stale = wait_response("stale")
-                self.assertFalse(stale["result"]["ok"])
-                self.assertIn("expired", stale["result"]["error"])
-                self.assertIsNotNone(new_session_token)
-                send_action("create-session", new_session_token, "s1", method="attention.new_session")
+                new_session = find_action(completed, "New session")
+                send_action(
+                    "create-session", new_session["params"]["token"], "s1",
+                    method="attention.new_session",
+                )
                 rejected = wait_response("create-session")
                 self.assertFalse(rejected["result"]["ok"])
-                self.assertIn("Attention item has no AoE project path.",
-                              rejected["result"]["error"])
-                self.assertEqual(fetches.read_text(), "1", "session creation fetched implicitly")
-                send_action("duplicate-session", new_session_token, "s1", method="attention.new_session")
-                duplicate_session = wait_response("duplicate-session")
-                self.assertFalse(duplicate_session["result"]["ok"])
-                self.assertIn("Attention item has no AoE project path.",
-                              duplicate_session["result"]["error"])
-
-                prompt_button = next(
-                    action for action in completed_page["items"][0]["actions"]
-                    if action["label"] == "Prompt QA"
+                self.assertIn(
+                    "Attention item has no AoE project path.", rejected["result"]["error"],
                 )
-                send_action("prompt", prompt_button["token"], "s1")
-                prompt_response = wait_response("prompt")
-                self.assertTrue(prompt_response["result"]["ok"])
-                prompt_page = wait_page(lambda value: value.get("prompt") is not None)
-                prompt = prompt_page["prompt"]
-                self.assertEqual(prompt["text"], "Confirm action?")
-                self.assertEqual(prompt["choices"], ["yes", "no"])
+                self.assertEqual(fetches.read_text(), "1", "session creation fetched implicitly")
 
+                prompt = find_action(completed, "Prompt QA")
+                send_action("prompt", prompt["params"]["token"], "s1")
+                self.assertTrue(wait_response("prompt")["result"]["ok"])
+                failed = wait_pane(
+                    lambda value: any(
+                        "requires interactive input" in block.get("text", "")
+                        for block in value["blocks"] if isinstance(block, dict)
+                    )
+                )
+                self.assertNotEqual(
+                    find_action(failed, "Prompt QA")["params"]["token"],
+                    prompt["params"]["token"],
+                )
+                self.assertEqual(fetches.read_text(), "1", "actions fetched implicitly")
+                prompt_token = find_action(failed, "Prompt QA")["params"]["token"]
+                queue = next(block for block in failed["blocks"]
+                             if block.get("title") == "Work queue")
+                second = next(row for row in queue["children"]
+                              if row["label"] == "Second item")
                 proc.stdin.write(json.dumps({
-                    "jsonrpc": "2.0", "id": "cancel-input",
-                    "method": "attention.input",
+                    "jsonrpc": "2.0", "id": "select-second",
+                    "method": "attention.select_item",
                     "params": {
-                        "token": prompt["token"], "prompt_id": prompt["id"], "value": None,
+                        "session_id": "s1",
+                        "item_key": second["params"]["item_key"],
                     },
                 }) + "\n")
                 proc.stdin.flush()
-                canceled = wait_response("cancel-input")
-                self.assertTrue(canceled["result"]["ok"])
-                canceled_page = wait_page(
-                    lambda value: "Action canceled." in (value.get("status") or ""),
-                )
-                prompt_again = next(
-                    action for action in canceled_page["items"][0]["actions"]
-                    if action["label"] == "Prompt QA"
-                )
-                self.assertNotEqual(prompt_again["token"], prompt["token"])
-
-                oversized = next(
-                    action for action in canceled_page["items"][0]["actions"]
-                    if action["label"] == "Oversized QA"
-                )
-                send_action("oversized-prompt", oversized["token"], "s1")
-                oversized_response = wait_response("oversized-prompt")
-                self.assertTrue(oversized_response["result"]["ok"])
-                oversized_page = wait_page(
-                    lambda value: "dashboard size limit" in (value.get("status") or ""),
-                )
-                self.assertTrue(any(
-                    action["label"] == "Oversized QA"
-                    for action in oversized_page["items"][0]["actions"]
+                self.assertTrue(wait_response("select-second")["result"]["ok"])
+                selected = wait_pane(lambda value: any(
+                    row.get("selected") and row.get("label") == "Second item"
+                    for block in value["blocks"] if block.get("title") == "Work queue"
+                    for row in block.get("children", [])
                 ))
-                self.assertEqual(fetches.read_text(), "1", "actions fetched implicitly")
+                queue = next(block for block in selected["blocks"]
+                             if block.get("title") == "Work queue")
+                self.assertEqual(
+                    [row["label"] for row in queue["children"] if row.get("selected")],
+                    ["Second item"],
+                )
+                detail = next(
+                    block for block in selected["blocks"]
+                    if block.get("kind") == "callout"
+                    and block.get("title") == "Second item selected"
+                )
+                self.assertEqual(detail["detail"], "selected detail")
+                send_action("expired-hidden-action", prompt_token, "s1")
+                expired = wait_response("expired-hidden-action")
+                self.assertFalse(expired["result"]["ok"])
+                self.assertIn("expired", expired["result"]["error"])
+                self.assertEqual(fetches.read_text(), "1", "selection fetched implicitly")
             finally:
                 proc.kill()
                 proc.wait(timeout=5)
                 proc.stdin.close()
                 proc.stdout.close()
                 proc.stderr.close()
-
-
 if __name__ == "__main__":
     unittest.main()

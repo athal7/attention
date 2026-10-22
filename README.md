@@ -211,41 +211,35 @@ just point `config["plugins"]` at it.
 - [`ical`](https://github.com/BRO3886/ical) -- `calendar` plugin
 - [`remindctl`](https://github.com/steipete/remindctl) -- `reminders` plugin
 
+## Agent of Empires session sidebar
 
-## Agent of Empires web dashboard
+This repository provides an Agent of Empires community plugin with a native
+Attention pane in each session. Install from the repository root with
+`aoe plugin install .`, then enable it with `aoe plugin enable
+athal7.attention`. The sidebar requires AoE 1.20 or newer.
 
-This repository provides an Agent of Empires community plugin with an
-Attention sidebar in each session and a full dashboard page. Install from the
-repository root with `aoe plugin install .`, then enable it with
-`aoe plugin enable athal7.attention`. The dashboard page requires AoE 1.20 or
-newer.
+The pane shows terminal-prioritized items in a compact work-queue selector.
+Selecting a row updates that session's pane with one status callout, source link,
+optional matching session, and collapsed action list. Selection is per session;
+if its item disappears, the highest-priority remaining item becomes selected.
+Items with canonical GitHub PR/issue or Linear issue links already attached to
+an open AoE session are omitted; idle sessions count as open.
+Archived, snoozed, trashed, and stopped sessions do not suppress items. If
+plugin UI-state links are unavailable, items remain visible; Attention does
+not infer identity from titles or branch names.
 
-The per-session sidebar is the primary item view. It uses the terminal
-dashboard's prioritized items and configured groups, links source records, and
-provides item actions. Items with canonical GitHub PR/issue or Linear issue
-links already attached to an open AoE session are omitted; idle sessions count
-as open. The dashboard page remains available for detailed filters, prompts,
-diagnostics, and the **New session** form.
+The **Refresh Attention** control stays at the top of the pane. Collector
+failures appear as named, sanitized notes alongside healthy items; exception
+messages are never shown. Own-PR approvals remain hidden. Actions requiring
+interactive input report that they must be run from the CLI; the pane has no
+text-entry or choice-prompt surface.
 
-Item actions stay under collapsible sections; own-PR approvals remain hidden.
-The sidebar's refresh control fetches current items. AoE exposes pages and
-session panes through separate slots, and native pane blocks cannot collect the
-page's free-text/choice prompts or **New session** form. Those workflows stay
-on the dashboard page.
-
-The page reports action completion or launch failure and displays captured
-diagnostics. `terminal: true` actions open a separate terminal window; other
-actions' captured stdout and stderr appear on the page. An action-bridge reply
-acknowledges delivery; completion and asynchronous outcomes come from updated
-dashboard state.
-
-The dashboard's **New session** form creates a normal terminal-mode AoE session
-from a project path or scratch directory, then starts it with `aoe session
-start`. It supports the CLI's profile, tool, group, title, and worktree
-branch/base options. It does not use ACP or require structured-session settings.
-Configured per-item actions labeled `session` or `New session` replace the
-generated session action and run through the source's configured CLI action,
-preserving its command, prompts, resume behavior, and worktree handling.
+The generated **New session** action starts a normal terminal-mode AoE session
+from an item's project path, or a scratch session for non-GitHub items without
+a project path. Pull requests reuse an existing local head branch, or create
+the worktree branch from the pull request's target with `--new-branch
+--base-branch`. Configured per-item actions labeled `session` or `New session`
+replace the generated action and use the source's configured CLI action.
 
 GitHub session actions resolve the repository by owner/name from verified
 GitHub remotes, including upstream remotes. A unique registered project in the
@@ -254,23 +248,13 @@ candidates, `origin` takes precedence over other remotes. For a registered bare
 repository, the resolver verifies identity through its default-branch worktree
 but passes the registered project path to AoE. Missing or ambiguous matches
 fail closed; Attention does not guess from a same-named folder or create a
-scratch session. Pull requests reuse an existing local head branch, or create
-the worktree branch from the pull request's target with `--new-branch
---base-branch`. The source's initial review message is sent with `aoe send
+scratch session. The source's initial review message is sent with `aoe send
 --no-revive` after the session starts.
 
 The worker uses `process.spawn` for configured CLI actions and `aoe url
 --no-autostart` to read the daemon's UI-state snapshot. Its `net` capability is
 used for that local API request and by configured actions and sources. Session
-suppression depends on available GitHub and Linear plugin UI-state links; when
-those links are unavailable, items remain visible.
-
-The sidebar groups items and shows their status, source link, and actions.
-Actions stay under collapsible sections; own-PR approvals remain hidden.
-Collector failures appear as named, sanitized notes alongside healthy items;
-exception messages are never shown. The **Refresh** button stays at the top of
-the pane. The dashboard page refreshes automatically when opened and retains
-its configured-group, source, and provider filters and indicator columns.
+suppression depends on available GitHub and Linear plugin UI-state links.
 
 The `attention` GitHub source does not persist a snapshot locally. It uses
 `gh search`; `gh api --cache` covers GET requests and does not cache those

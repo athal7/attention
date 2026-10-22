@@ -12,7 +12,6 @@ import hashlib
 import secrets
 import select
 import subprocess
-import re
 import sys
 import tempfile
 import threading
@@ -21,22 +20,17 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 SESSION_POLL_SECONDS = 60
-MAX_DASHBOARD_BYTES = 64 * 1024
-MAX_ACTION_PROMPT_BYTES = 32 * 1024
+MAX_PANE_BYTES = 64 * 1024
 ACTION_TIMEOUT_SECONDS = 120
 INITIAL_MESSAGE_DELAY_SECONDS = 5
-DASHBOARD_PATH = "/plugins/athal7.attention/dashboard"
 _input_buffer = bytearray()
 _source_lock = threading.Lock()
 live_sessions_by_id = {}
-dashboard_active = False
-prompt_refresh_requested = False
-snapshot_fetched_at = None
-active_action = None
-active_prompt = None
-action_answers = queue.Queue()
 consumed_action_ids = set()
 consumed_session_item_ids = set()
+selected_item_keys = {}
+action_token_sessions = {}
+pane_refresh_requested = False
 
 
 def send(message):
@@ -95,18 +89,11 @@ def attention_items():
                 raise RuntimeError(group_error)
             if groups:
                 fallback = next(group for group in groups if group.get("fallback"))
-                indicator_labels = getattr(module, "_INDICATOR_LABELS", {})
                 for item in items:
                     group = next((group for group in groups if "match" in group
                                   and module._group_matches(item, group["match"])), fallback)
-                    columns = group.get("columns") or ["state"]
-                    item["_dashboard_group"] = group["name"]
-                    item["_dashboard_columns"] = columns
-                    item["_dashboard_column_labels"] = {
-                        column: indicator_labels.get(column, column.replace("_", " ").title())
-                        for column in columns
-                    }
-                    item["_dashboard_order"] = groups.index(group)
+                    item["_attention_group"] = group["name"]
+                    item["_attention_group_order"] = groups.index(group)
         return items
     finally:
         sys.modules.pop(name, None)
@@ -434,30 +421,37 @@ def live_sessions():
 
 def status_payload(text=""):
     blocks = [{
-        "kind": "row",
-        "label": "Open Attention dashboard",
-        "icon": "inbox",
-        "href": DASHBOARD_PATH,
+        "kind": "row", "label": "Refresh Attention", "icon": "refresh",
+        "method": "attention.refresh",
     }]
     if text:
         blocks.append({"kind": "note", "text": _display_text(text, 200)})
-    return {"title": "Attention", "default_location": "right", "blocks": blocks}
+    return {"title": "Attention", "icon": "inbox", "default_location": "right",
+            "blocks": blocks}
 
 
+def _item_key(item):
+    identity = item.get("identity_key")
+    if not identity:
+        identity = (
+            item.get("_plugin"), item.get("kind"), item.get("id"),
+            item.get("url"), item.get("title"), item.get("context"),
+            item.get("repo_path"), item.get("head_branch"),
+        )
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:20]
 
 
-
-
-
-
-
-def dashboard_payload(items, fetched_at, sessions, token_actions=None):
+def attention_payload(items, sessions, token_actions=None):
     token_actions = {} if token_actions is None else token_actions
     items = _unowned_items(items, sessions)
     cards = []
     titles = [_display_text(item.get("title"), 120) or "Follow-up"
               for item in items if not item.get("_collector_failure")]
     for item in _tree_order([item for item in items if not item.get("_collector_failure")]):
+        item_key = _item_key(item)
         actions = []
         for action in item.get("actions", []):
             if not isinstance(action, dict) or id(action) in consumed_action_ids:
@@ -493,125 +487,248 @@ def dashboard_payload(items, fetched_at, sessions, token_actions=None):
         title = _display_text(item.get("title"), 120) or "Follow-up"
         matches = _matching_sessions(item, sessions, allow_title=titles.count(title) == 1)
         cards.append({
+            "key": item_key,
+            "prefix": _display_text(item.get("_tree_prefix") or item.get("id"), 48),
             "title": title, "url": _safe_source_url(item.get("url")),
             "status": _display_text(item.get("status"), 100),
             "context": _display_text(item.get("context"), 160),
             "reason": _display_text(item.get("attention_reason"), 160),
-            "details": _display_text(item.get("details"), 4000),
-            "indicators": {str(k): _display_text(v, 120)
-                           for k, v in (item.get("indicators") or {}).items()},
-            "columns": [
-                _display_text(column, 120)
-                for column in item.get("_dashboard_columns", ["state"])
-                if isinstance(column, str)
-            ],
-            "column_labels": {
-                _display_text(key, 120): _display_text(value, 120)
-                for key, value in item.get("_dashboard_column_labels", {}).items()
-                if isinstance(key, str)
-            } if isinstance(item.get("_dashboard_column_labels", {}), dict) else {},
+            "details": _display_text(item.get("details"), 1000),
             "source": _display_text(item.get("_plugin"), 100),
-            "provider": _display_text(item.get("_provider"), 100),
-            "group": _display_text(item.get("_dashboard_group", "Attention"), 120),
-            "group_order": item.get("_dashboard_order", 0), "actions": actions,
+            "group": _display_text(item.get("_attention_group", "Attention"), 120),
+            "group_order": item.get("_attention_group_order", 0),
+            "actions": actions,
             "session": ({"id": matches[0]["id"], "title": _display_text(
                 matches[0].get("title"), 120) or matches[0]["id"]} if matches else None),
         })
     failures = [{"source": _display_text(item.get("context"), 100),
                  "error": _display_text(item.get("details"), 200)}
                 for item in items if item.get("_collector_failure")]
-    return {"items": cards, "failures": failures, "fetched_at": fetched_at,
-            "busy": active_action is not None, "prompt": active_prompt,
-            "omitted_items": 0, "omitted_failures": 0}
+    return {"items": cards, "failures": failures}
 
 
-def _fit_dashboard(payload):
-    encoded = lambda: len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    while payload["failures"] and encoded() > MAX_DASHBOARD_BYTES:
-        payload["failures"].pop()
-        payload["omitted_failures"] += 1
-    while payload["items"] and encoded() > MAX_DASHBOARD_BYTES:
-        payload["items"].pop()
-        payload["omitted_items"] += 1
-    return payload
+def _source_icon(source):
+    return {
+        "github": "git-branch", "linear": "circle", "calendar": "calendar",
+        "reminders": "check-square", "generic": "inbox",
+    }.get((source or "").casefold(), "inbox")
 
 
-def _notice_text(payload):
-    return next((block.get("text", "") for block in payload.get("blocks", [])
-                 if block.get("kind") == "note" and block.get("text")), "")
+def _status_tone(status):
+    status = (status or "").casefold()
+    if any(word in status for word in ("fail", "overdue", "blocked", "error")):
+        return "danger"
+    if any(word in status for word in ("review", "assigned", "waiting", "due")):
+        return "warn"
+    if any(word in status for word in ("approved", "complete", "success")):
+        return "success"
+    return "neutral"
 
-def _sidebar_payload(page, notice=""):
+
+def _pane_payload(snapshot, notice="", selected_key=None):
     blocks = [{
         "kind": "row", "label": "Refresh Attention", "icon": "refresh",
         "method": "attention.refresh",
-    }, {
-        "kind": "row", "label": "Open Attention dashboard", "icon": "inbox",
-        "href": DASHBOARD_PATH,
     }]
     if notice:
         blocks.append({"kind": "note", "text": _display_text(notice, 200)})
-    groups = {}
-    for card in page["items"]:
-        children = [{
-            "kind": "row", "label": card["title"], "sublabel": card["status"],
-            "href": card["url"],
-        }]
-        children.extend({
-            "kind": "row", "label": action["label"], "method": action["method"],
-            "params": {"token": action["token"]},
-        } for action in card["actions"])
-        groups.setdefault(card["group"], []).append({
-            "kind": "section", "title": card["title"],
-            "children": children, "collapsible": True, "collapsed": True,
+
+    cards = snapshot["items"]
+    if cards:
+        selected = next((card for card in cards if card["key"] == selected_key), cards[0])
+        rows = []
+        for card in cards:
+            row = {
+                "kind": "row", "label": card["title"],
+                "icon": _source_icon(card["source"]),
+                "method": "attention.select_item",
+                "params": {"item_key": card["key"]},
+                "selected": card["key"] == selected["key"],
+            }
+            if card["prefix"]:
+                row["prefix"] = card["prefix"]
+            if card["context"]:
+                row["sublabel"] = card["context"]
+            if card["status"]:
+                row["value"] = card["status"]
+                row["value_tone"] = _status_tone(card["status"])
+            if card["url"]:
+                row["href"] = card["url"]
+            rows.append(row)
+        blocks.append({
+            "kind": "section", "title": "Work queue",
+            "badges": [{"text": str(len(rows)), "tone": "neutral"}],
+            "children": rows, "scroll": True,
         })
-    blocks.extend({
-        "kind": "section", "title": group, "children": sections,
-        "collapsible": True, "collapsed": False,
-    } for group, sections in groups.items())
-    blocks.extend({"kind": "note", "text": f'{failure["source"]}: {failure["error"]}'}
-                  for failure in page["failures"])
-    if page["omitted_items"] or page["omitted_failures"]:
-        blocks.append({"kind": "note", "text": "Some lower-priority items were omitted."})
-    return {"title": "Attention", "default_location": "right", "blocks": blocks}
+
+        callout = {
+            "kind": "callout",
+            "title": selected["reason"] or selected["status"] or "Follow-up",
+            "icon": _source_icon(selected["source"]),
+            "tone": _status_tone(selected["status"]),
+        }
+        if selected["details"]:
+            callout["detail"] = selected["details"]
+        if selected["url"]:
+            callout["actions"] = [{
+                "kind": "action", "label": "Open source",
+                "href": selected["url"], "icon": "external-link",
+                "variant": "secondary",
+            }]
+        blocks.append(callout)
+        if selected["session"]:
+            blocks.append({
+                "kind": "row", "label": "Session",
+                "value": selected["session"]["title"], "icon": "bot",
+            })
+        if selected["actions"]:
+            blocks.append({
+                "kind": "section", "title": "Actions",
+                "badges": [{"text": str(len(selected["actions"])), "tone": "neutral"}],
+                "icon": "zap", "boxed": True,
+                "collapsible": True, "collapsed": True,
+                "children": [{
+                    "kind": "row", "label": action["label"],
+                    "method": action["method"], "params": {"token": action["token"]},
+                } for action in selected["actions"]],
+            })
+    else:
+        blocks.append({
+            "kind": "callout", "title": "Nothing needs attention",
+            "detail": "Refresh to check for new items.",
+            "icon": "circle-check", "tone": "success",
+        })
+
+    if snapshot["failures"]:
+        blocks.append({
+            "kind": "section", "title": "Collector failures",
+            "icon": "triangle-alert", "tone": "danger", "boxed": True,
+            "children": [{
+                "kind": "note",
+                "text": f'{failure["source"]}: {failure["error"]}',
+                "tone": "danger",
+            } for failure in snapshot["failures"]],
+        })
+    return {"title": "Attention", "icon": "inbox", "default_location": "right",
+            "blocks": blocks}
 
 
+def _fit_pane(payload):
+    def size():
+        return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
-def publish_payload(sessions, payload, only_new=False, items=(), action_output=""):
-    global action_tokens
-    page = dashboard_payload(items, snapshot_fetched_at, sessions, action_tokens)
-    if action_output:
-        page["action_output"] = action_output
-    notice = _display_text(_notice_text(payload), 400)
-    page["status"] = notice
-    page["error"] = notice if ("failed" in notice.casefold()
-                               or notice.startswith("New session:")) else ""
-    page = _fit_dashboard(page)
-    page_tokens = {
-        action["token"]
-        for card in page.get("items", [])
-        for action in card.get("actions", [])
-        if isinstance(action, dict) and isinstance(action.get("token"), str)
-    }
-    if dashboard_active or active_prompt is not None:
-        rpc("ui.state.set", {"slot": "page", "id": "dashboard", "payload": page})
-    pane = _sidebar_payload(page, notice)
-    sidebar_tokens = {
-        block.get("params", {}).get("token")
-        for block in pane["blocks"]
-        if isinstance(block, dict) and isinstance(block.get("params"), dict)
-    }
-    action_tokens = {
-        token: action for token, action in action_tokens.items()
-        if token in page_tokens | sidebar_tokens
-    }
+    omitted = 0
+    while size() > MAX_PANE_BYTES - 100:
+        queue_section = next((
+            block for block in payload["blocks"]
+            if block.get("kind") == "section" and block.get("title") == "Work queue"
+        ), None)
+        rows = queue_section.get("children", []) if queue_section else []
+        removable = next((
+            index for index in range(len(rows) - 1, -1, -1)
+            if rows[index].get("selected") is not True
+        ), None)
+        if removable is not None:
+            rows.pop(removable)
+            omitted += 1
+            continue
+
+        actions = next((
+            block for block in reversed(payload["blocks"])
+            if block.get("kind") == "section"
+            and block.get("title") == "Actions"
+            and block.get("children")
+        ), None)
+        if actions is not None:
+            actions["children"].pop()
+            omitted += 1
+            if not actions["children"]:
+                payload["blocks"].remove(actions)
+            continue
+
+        failures = next((
+            block for block in reversed(payload["blocks"])
+            if block.get("kind") == "section"
+            and block.get("title") == "Collector failures"
+            and block.get("children")
+        ), None)
+        if failures is None:
+            break
+        failures["children"].pop()
+        omitted += 1
+        if not failures["children"]:
+            payload["blocks"].remove(failures)
+    if omitted:
+        payload["blocks"].append({
+            "kind": "note", "text": f"{omitted} lower-priority rows or actions omitted."
+        })
+    return payload
+
+
+def _status_notice(payload):
+    return next((block.get("text", "") for block in payload.get("blocks", [])
+                 if block.get("kind") == "note" and block.get("text")), "")
+
+
+def _pane_action_tokens(payload):
+    tokens = set()
+    pending = list(payload.get("blocks", []))
+    while pending:
+        block = pending.pop()
+        if not isinstance(block, dict):
+            continue
+        params = block.get("params")
+        if isinstance(params, dict) and isinstance(params.get("token"), str):
+            tokens.add(params["token"])
+        children = block.get("children")
+        if isinstance(children, list):
+            pending.extend(children)
+    return tokens
+
+
+def publish_payload(sessions, payload, only_new=False, items=()):
+    global action_tokens, action_token_sessions
+    notice = _display_text(_status_notice(payload), 200)
+    next_action_tokens = {}
+    next_token_sessions = {}
+    pane_updates = []
+    live_ids = set()
     for session in sessions:
         session_id = session["id"]
+        live_ids.add(session_id)
         if only_new and session_id in published_ids:
+            for token, owner in action_token_sessions.items():
+                if owner == session_id and token in action_tokens:
+                    next_action_tokens[token] = action_tokens[token]
+                    next_token_sessions[token] = session_id
             continue
+
+        session_tokens = {}
+        snapshot = attention_payload(items, sessions, session_tokens)
+        keys = {card["key"] for card in snapshot["items"]}
+        selected_key = selected_item_keys.get(session_id)
+        if selected_key not in keys:
+            selected_key = snapshot["items"][0]["key"] if snapshot["items"] else None
+        if selected_key is None:
+            selected_item_keys.pop(session_id, None)
+        else:
+            selected_item_keys[session_id] = selected_key
+        pane = _fit_pane(_pane_payload(snapshot, notice, selected_key))
+        for token in _pane_action_tokens(pane):
+            if token in session_tokens:
+                next_action_tokens[token] = session_tokens[token]
+                next_token_sessions[token] = session_id
+        pane_updates.append((session_id, pane))
+        published_ids.add(session_id)
+    for stale_id in set(selected_item_keys) - live_ids:
+        selected_item_keys.pop(stale_id, None)
+    action_tokens = next_action_tokens
+    action_token_sessions = next_token_sessions
+    for session_id, pane in pane_updates:
         rpc("ui.state.set", {
             "slot": "pane", "id": "attention", "session_id": session_id, "payload": pane,
         })
-        published_ids.add(session_id)
+
 def fetch_snapshot(results):
     try:
         with _source_lock:
@@ -679,49 +796,14 @@ def execute_action(token, action, label, results):
                             buffer[:] = remainder
                             response = json.loads(line)
                             if "prompt" in response:
-                                prompt_data = response["prompt"]
-                                prompt_id = secrets.token_urlsafe(18)
-                                size = os.fstat(output.fileno()).st_size
-                                context = os.pread(output.fileno(), min(size - offset, 4000),
-                                                   max(offset, size - 4000)).decode("utf-8", errors="replace")
-                                offset = size
-                                prompt = {
-                                    "id": prompt_id, "token": token,
-                                    "text": _display_text(
-                                        prompt_data.get("text") if isinstance(prompt_data, dict)
-                                        else prompt_data, 1000,
-                                    ) or "Input required",
-                                    "context": context,
-                                }
-                                if isinstance(prompt_data, dict):
-                                    choices = prompt_data.get("choices")
-                                    if isinstance(choices, list):
-                                        prompt["choices"] = [
-                                            choice[:200] for choice in choices[:100]
-                                            if isinstance(choice, str)
-                                        ]
-                                    default = prompt_data.get("default")
-                                    if isinstance(default, str):
-                                        prompt["default"] = default[:1000]
-                                if (len(json.dumps(
-                                        prompt, separators=(",", ":")
-                                ).encode("utf-8")) > MAX_ACTION_PROMPT_BYTES):
-                                    error = "Action prompt exceeds the dashboard size limit."
-                                    process.kill()
-                                    process.wait()
-                                    buffer.clear()
-                                    break
-                                results.put({"token": token, "prompt": prompt})
-                                try:
-                                    answer = action_answers.get(
-                                        timeout=max(0.1, deadline - time.monotonic())
-                                    )
-                                except queue.Empty as exc:
-                                    raise TimeoutError from exc
-                                if answer is None:
-                                    error = "Action canceled."
-                                process.stdin.write((json.dumps({"value": answer}) + "\n").encode())
-                                process.stdin.flush()
+                                error = (
+                                    "This action requires interactive input; "
+                                    "run it from the CLI."
+                                )
+                                process.kill()
+                                process.wait()
+                                buffer.clear()
+                                break
                             if response.get("ok") is True:
                                 completed = True
                             else:
@@ -931,84 +1013,72 @@ def start_new_session(token, params, results):
 
 
 def dispatch(message):
-    global refresh_requested, active_action, active_prompt
-    global dashboard_active, prompt_refresh_requested
+    global refresh_requested, active_action, pane_refresh_requested
     method = message.get("method", "")
     request_id = message.get("id")
     params = message.get("params")
     if not isinstance(params, dict):
         params = {}
     session_id = params.get("session_id")
-    if (session_id is None
-            and method in {"attention.refresh", "attention.input",
-                           "attention.action", "attention.new_session"}):
-        dashboard_active = True
     result = {"ok": False, "error": "Unknown session."}
     if session_id is not None and session_id not in live_session_ids:
         pass
+    elif method == "attention.select_item":
+        item_key = params.get("item_key")
+        if (not isinstance(session_id, str) or not isinstance(item_key, str)
+                or not item_key or len(item_key) > 128):
+            result = {"ok": False, "error": "Invalid item selection."}
+        else:
+            selected_item_keys[session_id] = item_key
+            pane_refresh_requested = True
+            result = {"ok": True}
     elif method == "attention.refresh":
         refresh_requested = True
         result = {"ok": True}
-    elif method == "attention.input":
-        if (not active_prompt or params.get("token") != active_prompt["token"]
-                or params.get("prompt_id") != active_prompt["id"]
-                or not (params.get("value") is None or isinstance(params.get("value"), str))):
-            result = {"ok": False, "error": "This prompt expired."}
-        else:
-            active_prompt = None
-            action_answers.put(params.get("value"))
-            prompt_refresh_requested = True
-            result = {"ok": True}
     elif method == "attention.action":
         token = params.get("token")
-        action = action_tokens.get(token) if isinstance(token, str) else None
+        action = (
+            action_tokens.get(token)
+            if isinstance(token, str) and action_token_sessions.get(token) == session_id
+            else None
+        )
         if active_action is not None:
             result = {"ok": False, "error": "Another action is already running."}
         elif not isinstance(action, dict) or action.get("_aoe_operation"):
             result = {"ok": False, "error": "This action expired. Refresh and try again."}
         else:
             action_tokens.pop(token)
+            action_token_sessions.pop(token, None)
             consumed_action_ids.add(id(action))
             active_action = {"token": token, "action": action, "session_id": session_id}
             action_requests.put(active_action)
             result = {"ok": True}
     elif method == "attention.new_session":
         token = params.get("token")
-        session_action = action_tokens.get(token) if isinstance(token, str) else None
-        item_id = None
-        if token is not None and (
-            not isinstance(session_action, dict)
-            or session_action.get("_aoe_operation") != "new_session"
-        ):
-            result = {"ok": False, "error": "This session action expired. Refresh and try again."}
+        session_action = (
+            action_tokens.get(token)
+            if isinstance(token, str) and action_token_sessions.get(token) == session_id
+            else None
+        )
+        if (not isinstance(session_action, dict)
+                or session_action.get("_aoe_operation") != "new_session"):
+            result = {
+                "ok": False, "error": "This session action expired. Refresh and try again.",
+            }
+        elif active_action is not None:
+            result = {"ok": False, "error": "Another action is already running."}
         else:
-            if token is not None:
-                options = session_action.get("params")
-                item_id = session_action.get("_item_id")
-            else:
-                options = {
-                    "title": params.get("title", ""),
-                    "path": params.get("path", ""),
-                    "profile": params.get("profile", ""),
-                    "tool": params.get("tool", ""),
-                    "group": params.get("group", ""),
-                    "worktree_branch": params.get("worktree_branch"),
-                    "new_branch": params.get("new_branch", False),
-                    "base_branch": params.get("base_branch"),
-                    "scratch": params.get("scratch", False),
-                }
+            options = session_action.get("params")
             error = _session_options_error(options)
             if error:
                 result = {"ok": False, "error": error}
-            elif active_action is not None:
-                result = {"ok": False, "error": "Another action is already running."}
             else:
-                active_token = token or secrets.token_urlsafe(18)
-                if token is not None:
-                    action_tokens.pop(token, None)
-                    if isinstance(item_id, int):
-                        consumed_session_item_ids.add(item_id)
-                active_action = {"token": active_token, "action": {
+                item_id = session_action.get("_item_id")
+                action_tokens.pop(token, None)
+                action_token_sessions.pop(token, None)
+                if isinstance(item_id, int):
+                    consumed_session_item_ids.add(item_id)
+                active_action = {"token": token, "action": {
                     "_aoe_operation": "new_session", "_item_id": item_id,
                     "params": options, "label": "New session",
                 }, "session_id": session_id}
@@ -1019,31 +1089,25 @@ def dispatch(message):
     if request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
-
 def main():
-
-    global published_ids, refresh_requested, action_tokens, live_session_ids
-    global action_requests, action_results, active_action
-    global snapshot_fetched_at, dashboard_active
-    global action_answers, active_prompt, prompt_refresh_requested, consumed_action_ids
-    global consumed_session_item_ids
-    dashboard_active = False
-    snapshot_fetched_at = None
+    global published_ids, refresh_requested, action_tokens, action_token_sessions
+    global live_session_ids, action_requests, action_results, active_action
+    global consumed_action_ids, consumed_session_item_ids, selected_item_keys
+    global pane_refresh_requested
     published_ids = set()
     refresh_requested = False
-    prompt_refresh_requested = False
     action_tokens = {}
+    action_token_sessions = {}
     consumed_action_ids = set()
     consumed_session_item_ids = set()
     live_session_ids = set()
+    selected_item_keys = {}
+    pane_refresh_requested = False
     action_requests = queue.Queue()
     action_results = queue.Queue()
-    action_answers = queue.Queue()
     active_action = None
-    active_prompt = None
     results = queue.Queue(maxsize=1)
-    base_payload = status_payload()
-    payload = base_payload
+    payload = status_payload()
     snapshot_items = []
     sessions = []
     fetch_in_flight = False
@@ -1057,10 +1121,6 @@ def main():
             message = read_message(max(0, min(0.25, next_sessions - time.monotonic())))
             if isinstance(message, dict) and "method" in message:
                 dispatch(message)
-            if prompt_refresh_requested:
-                prompt_refresh_requested = False
-                payload = status_payload("Action running.")
-                publish_payload(sessions, payload, items=snapshot_items)
 
             now = time.monotonic()
             if now >= next_sessions:
@@ -1070,9 +1130,17 @@ def main():
                 live_session_ids = {session["id"] for session in sessions}
                 live_sessions_by_id.clear()
                 live_sessions_by_id.update({session["id"]: session for session in sessions})
-                publish_payload(sessions, payload, only_new=not (retry_publish or sessions_changed), items=snapshot_items)
+                for stale_id in set(selected_item_keys) - live_session_ids:
+                    selected_item_keys.pop(stale_id, None)
+                publish_payload(
+                    sessions, payload,
+                    only_new=not (retry_publish or sessions_changed), items=snapshot_items,
+                )
                 retry_publish = False
                 next_sessions = now + SESSION_POLL_SECONDS
+            if pane_refresh_requested:
+                pane_refresh_requested = False
+                publish_payload(sessions, payload, items=snapshot_items)
 
             try:
                 request = action_requests.get_nowait()
@@ -1081,7 +1149,6 @@ def main():
             if request is not None:
                 label = request["action"].get("label", "Action")
                 payload = status_payload(f"Running: {label}")
-                base_payload = status_payload()
                 publish_payload(sessions, payload, items=snapshot_items)
                 if request["action"].get("_aoe_operation") == "new_session":
                     start_new_session(request["token"], request["action"]["params"], action_results)
@@ -1094,36 +1161,28 @@ def main():
             except queue.Empty:
                 event = None
             if event is not None and active_action and active_action["token"] == event["token"]:
-                if "prompt" in event:
-                    active_prompt = event["prompt"]
-                    payload = status_payload("Input required. Continue in the Attention dashboard.")
-                    action_in_flight = False
-                    publish_payload(sessions, payload, items=snapshot_items)
+                completed_action = active_action["action"]
+                if completed_action.get("_aoe_operation") == "new_session":
+                    item_id = completed_action.get("_item_id")
+                    if not event["completed"] and not event.get("session_id"):
+                        if isinstance(item_id, int):
+                            consumed_session_item_ids.discard(item_id)
                 else:
-                    completed_action = active_action["action"]
-                    if completed_action.get("_aoe_operation") == "new_session":
-                        item_id = completed_action.get("_item_id")
-                        if not event["completed"] and not event.get("session_id"):
-                            if isinstance(item_id, int):
-                                consumed_session_item_ids.discard(item_id)
-                    else:
-                        consumed_action_ids.discard(id(completed_action))
-                    active_action = None
-                    active_prompt = None
-                    action_in_flight = False
-                    message_text = (
-                        f"Created session: {event['session_id']}"
-                        if event["completed"] and event.get("session_id")
-                        else f"Completed: {event['label']}" if event["completed"]
-                        else f"Failed: {event['label']}: {event['error']}"
-                    )
-                    base_payload = status_payload()
-                    payload = status_payload(message_text)
-                    next_sessions = time.monotonic()
-                    publish_payload(
-                        sessions, payload, items=snapshot_items,
-                        action_output=event.get("output", ""),
-                    )
+                    consumed_action_ids.discard(id(completed_action))
+                active_action = None
+                action_in_flight = False
+                message_text = (
+                    f"Created session: {event['session_id']}"
+                    if event["completed"] and event.get("session_id")
+                    else f"Completed: {event['label']}" if event["completed"]
+                    else f"Failed: {event['label']}: {event['error']}"
+                )
+                output = _display_text(event.get("output"), 120)
+                if output:
+                    message_text += f": {output}"
+                payload = status_payload(message_text)
+                next_sessions = time.monotonic()
+                publish_payload(sessions, payload, items=snapshot_items)
 
             if refresh_requested:
                 refresh_requested = False
@@ -1143,16 +1202,14 @@ def main():
             if updated_payload is not None or updated_actions is not None:
                 fetch_in_flight = False
                 if error is None:
-                    base_payload = updated_payload
-                    payload = base_payload
+                    payload = updated_payload
                     action_tokens = updated_actions
                     consumed_action_ids.clear()
                     consumed_session_item_ids.clear()
                     snapshot_items = updated_items
-                    snapshot_fetched_at = fetched_at
                 else:
                     payload = status_payload(
-                        f"Refresh failed: {error}. Open the dashboard to retry."
+                        f"Refresh failed: {error}. Use Refresh to retry."
                     )
                 publish_payload(sessions, payload, items=snapshot_items)
             if refresh_pending and not fetch_in_flight and not action_in_flight:
