@@ -925,6 +925,11 @@ class WorkerProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(worker._session_tool_for_path(str(root / "elsewhere")), "")
                 self.assertEqual(worker._session_tool_for_path(""), "")
+                self.assertEqual(worker._session_tool_for_path(str(work) + "-sibling"), "")
+                with patch.object(worker, "session_agents", [{"path": os.sep, "tool": "omp"}]):
+                    self.assertEqual(
+                        worker._session_tool_for_path(str(work_repo)), "omp",
+                    )
 
                 action = worker._new_session_action({
                     "title": "Fix regression", "repo_path": str(work_repo / "app"),

@@ -861,13 +861,14 @@ def _group_matches(item, match):
 
 
 def _session_tool_name(tool):
-    """An AoE agent name: no whitespace, control characters, or flag confusion."""
+    """An AoE agent name: one word, no control characters, no flag confusion."""
     return (
         isinstance(tool, str)
-        and bool(tool.strip())
-        and tool == tool.strip()
+        and bool(tool)
         and not tool.startswith("-")
-        and not any(ord(char) < 32 or ord(char) == 127 for char in tool)
+        and not any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 for char in tool
+        )
     )
 
 

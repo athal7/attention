@@ -159,6 +159,12 @@ def _is_approve_action(action):
 
 
 
+def _contains_path(root, path):
+    """Whether path is root or a descendant of it, without prefix false positives."""
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return path == root or path.startswith(prefix)
+
+
 def _session_tool_for_path(path):
     """The agent configured for the directory containing path, longest match first."""
     if not isinstance(path, str) or not path.strip():
@@ -166,7 +172,7 @@ def _session_tool_for_path(path):
     resolved = os.path.realpath(os.path.expanduser(path.strip()))
     matches = [
         agent for agent in session_agents
-        if resolved == agent["path"] or resolved.startswith(agent["path"] + os.sep)
+        if _contains_path(agent["path"], resolved)
     ]
     if not matches:
         return ""
