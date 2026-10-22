@@ -466,6 +466,7 @@ def attention_payload(items, sessions, token_actions=None):
             actions.append({
                 "label": _display_text(action.get("label"), 80) or "Action",
                 "token": token, "method": "attention.action",
+                "primary": action.get("primary") is True,
             })
         has_session_action = any(
             _is_session_action(action) for action in item.get("actions", [])
@@ -514,6 +515,14 @@ def _source_icon(source):
     }.get((source or "").casefold(), "inbox")
 
 
+def _source_label(source):
+    source = _display_text(source, 100)
+    return {
+        "github": "GitHub", "linear": "Linear", "calendar": "Calendar",
+        "reminders": "Reminders", "generic": "Other",
+    }.get(source.casefold(), source.replace("_", " ").title() if source else "Other")
+
+
 def _status_tone(status):
     status = (status or "").casefold()
     if any(word in status for word in ("fail", "overdue", "blocked", "error")):
@@ -526,10 +535,7 @@ def _status_tone(status):
 
 
 def _pane_payload(snapshot, notice="", selected_key=None):
-    blocks = [{
-        "kind": "row", "label": "Refresh Attention", "icon": "refresh",
-        "method": "attention.refresh",
-    }]
+    blocks = []
     if notice:
         blocks.append({"kind": "note", "text": _display_text(notice, 200)})
 
@@ -550,25 +556,29 @@ def _pane_payload(snapshot, notice="", selected_key=None):
             if card["context"]:
                 row["sublabel"] = card["context"]
             if card["status"]:
-                row["value"] = card["status"]
-                row["value_tone"] = _status_tone(card["status"])
+                row["badges"] = [{
+                    "text": card["status"],
+                    "tone": _status_tone(card["status"]),
+                }]
             if card["url"]:
                 row["href"] = card["url"]
             rows.append(row)
         blocks.append({
-            "kind": "section", "title": "Work queue",
+            "kind": "section", "title": "Work queue", "icon": "list",
             "badges": [{"text": str(len(rows)), "tone": "neutral"}],
-            "children": rows, "scroll": True,
+            "boxed": True, "children": rows, "scroll": True,
         })
 
         callout = {
-            "kind": "callout",
-            "title": selected["reason"] or selected["status"] or "Follow-up",
+            "kind": "callout", "title": selected["title"],
             "icon": _source_icon(selected["source"]),
             "tone": _status_tone(selected["status"]),
         }
-        if selected["details"]:
-            callout["detail"] = selected["details"]
+        detail = " · ".join(
+            text for text in (selected["reason"], selected["details"]) if text
+        )
+        if detail:
+            callout["detail"] = detail
         if selected["url"]:
             callout["actions"] = [{
                 "kind": "action", "label": "Open source",
@@ -576,11 +586,38 @@ def _pane_payload(snapshot, notice="", selected_key=None):
                 "variant": "secondary",
             }]
         blocks.append(callout)
+
+        detail_rows = []
+        if selected["status"]:
+            detail_rows.append({
+                "kind": "row", "label": "Status", "value": selected["status"],
+                "value_tone": _status_tone(selected["status"]),
+            })
+        if selected["source"]:
+            detail_rows.append({
+                "kind": "row", "label": "Source",
+                "value": _source_label(selected["source"]),
+                "icon": _source_icon(selected["source"]),
+            })
+        if selected["context"]:
+            detail_rows.append({
+                "kind": "row", "label": "Context", "value": selected["context"],
+            })
+        if selected["group"] != "Attention":
+            detail_rows.append({
+                "kind": "row", "label": "Group", "value": selected["group"],
+            })
         if selected["session"]:
-            blocks.append({
-                "kind": "row", "label": "Session",
+            detail_rows.append({
+                "kind": "row", "label": "Open session",
                 "value": selected["session"]["title"], "icon": "bot",
             })
+        if detail_rows:
+            blocks.append({
+                "kind": "section", "title": "Item details", "icon": "info",
+                "boxed": True, "children": detail_rows,
+            })
+
         if selected["actions"]:
             blocks.append({
                 "kind": "section", "title": "Actions",
@@ -588,10 +625,18 @@ def _pane_payload(snapshot, notice="", selected_key=None):
                 "icon": "zap", "boxed": True,
                 "collapsible": True, "collapsed": True,
                 "children": [{
-                    "kind": "row", "label": action["label"],
-                    "method": action["method"], "params": {"token": action["token"]},
+                    "kind": "action", "label": action["label"],
+                    "method": action["method"],
+                    "params": {"token": action["token"]},
+                    "variant": "primary" if action.get("primary") else "secondary",
                 } for action in selected["actions"]],
             })
+    elif snapshot["failures"]:
+        blocks.append({
+            "kind": "callout", "title": "Sources need attention",
+            "detail": "No work items were loaded from these sources.",
+            "icon": "triangle-alert", "tone": "warn",
+        })
     else:
         blocks.append({
             "kind": "callout", "title": "Nothing needs attention",
@@ -609,6 +654,11 @@ def _pane_payload(snapshot, notice="", selected_key=None):
                 "tone": "danger",
             } for failure in snapshot["failures"]],
         })
+    blocks.extend((
+        {"kind": "divider"},
+        {"kind": "action", "label": "Refresh", "icon": "refresh-cw",
+         "method": "attention.refresh"},
+    ))
     return {"title": "Attention", "icon": "inbox", "default_location": "right",
             "blocks": blocks}
 

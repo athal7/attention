@@ -218,21 +218,22 @@ Attention pane in each session. Install from the repository root with
 `aoe plugin install .`, then enable it with `aoe plugin enable
 athal7.attention`. The sidebar requires AoE 1.20 or newer.
 
-The pane shows terminal-prioritized items in a compact work-queue selector.
-Selecting a row updates that session's pane with one status callout, source link,
-optional matching session, and collapsed action list. Selection is per session;
-if its item disappears, the highest-priority remaining item becomes selected.
-Items with canonical GitHub PR/issue or Linear issue links already attached to
-an open AoE session are omitted; idle sessions count as open.
+The pane uses a compact selector/detail hierarchy: a scrollable work queue with
+status badges, a selected-item callout with a source link, and boxed item
+details. Selection is per session; if its item disappears, the highest-priority
+remaining item becomes selected. Item-specific actions are nested in a collapsed
+section. Items with canonical GitHub PR/issue or Linear issue links already
+attached to an open AoE session are omitted; idle sessions count as open.
 Archived, snoozed, trashed, and stopped sessions do not suppress items. If
 plugin UI-state links are unavailable, items remain visible; Attention does
 not infer identity from titles or branch names.
 
-The **Refresh Attention** control stays at the top of the pane. Collector
-failures appear as named, sanitized notes alongside healthy items; exception
-messages are never shown. Own-PR approvals remain hidden. Actions requiring
-interactive input report that they must be run from the CLI; the pane has no
-text-entry or choice-prompt surface.
+The **Refresh Attention** action sits at the bottom of the pane. Collector
+failures appear in a separate grouped section as named, sanitized notes;
+exception messages are never shown. Own-PR approvals remain hidden. Actions
+requiring interactive input report that they must be run from the CLI; the pane
+has no text-entry or choice-prompt surface. The full-pane dashboard has been
+removed; the AoE native pane is the only Attention web surface.
 
 The generated **New session** action starts a normal terminal-mode AoE session
 from an item's project path, or a scratch session for non-GitHub items without

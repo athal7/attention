@@ -62,44 +62,75 @@ class SidebarPayloadTests(unittest.TestCase):
             "http://127.0.0.1:4097/api/plugins/ui-state?token=secret", timeout=5,
         )
 
-    def test_native_sidebar_uses_a_work_queue_and_one_selected_detail(self):
-        action = {"key": "o", "label": "Open", "payload": {"kind": "open"}}
+    def test_native_sidebar_uses_github_style_selector_and_details(self):
+        action = {
+            "key": "o", "label": "Open", "primary": True,
+            "payload": {"kind": "open"},
+        }
         token_actions = {}
         snapshot = worker.attention_payload([{
-            "title": "Review PR", "status": "Review needed",
-            "attention_reason": "Requested changes", "context": "acme/repo",
-            "details": "Inspect the failing test.",
-            "url": "https://github.com/acme/repo/pull/42",
-            "actions": [action],
+            "_plugin": "github", "kind": "pull_request", "title": "Review PR",
+            "status": "Review needed", "attention_reason": "Requested changes",
+            "context": "acme/repo", "details": "Inspect the failing test.",
+            "url": "https://github.com/acme/repo/pull/42", "actions": [action],
         }, {
-            "title": "Linear issue", "status": "Assigned",
-            "url": "https://linear.app/acme/issue/ENG-4",
+            "_plugin": "linear", "kind": "issue", "title": "Linear issue",
+            "status": "Assigned", "url": "https://linear.app/acme/issue/ENG-4",
         }], [], token_actions)
         pane = worker._pane_payload(snapshot)
         self.assertEqual(pane["default_location"], "right")
-        self.assertEqual(pane["blocks"][0]["method"], "attention.refresh")
-        queue = pane["blocks"][1]
+        queue = pane["blocks"][0]
         self.assertEqual(queue["title"], "Work queue")
+        self.assertTrue(queue["boxed"])
         self.assertTrue(queue["scroll"])
         self.assertEqual(queue["badges"][0]["text"], "2")
         first, second = queue["children"]
         self.assertEqual(first["label"], "Review PR")
         self.assertTrue(first["selected"])
         self.assertEqual(first["sublabel"], "acme/repo")
-        self.assertEqual(first["value_tone"], "warn")
+        self.assertEqual(first["badges"], [{"text": "Review needed", "tone": "warn"}])
         self.assertEqual(first["href"], "https://github.com/acme/repo/pull/42")
         self.assertFalse(second["selected"])
-        callout = pane["blocks"][2]
+
+        callout = pane["blocks"][1]
         self.assertEqual(callout["kind"], "callout")
-        self.assertEqual(callout["title"], "Requested changes")
-        self.assertEqual(callout["detail"], "Inspect the failing test.")
+        self.assertEqual(callout["title"], "Review PR")
+        self.assertEqual(callout["detail"],
+                         "Requested changes · Inspect the failing test.")
+        self.assertEqual(callout["actions"][0]["label"], "Open source")
         self.assertEqual(callout["actions"][0]["href"],
                          "https://github.com/acme/repo/pull/42")
+
+        details = pane["blocks"][2]
+        self.assertEqual(details["title"], "Item details")
+        detail_rows = {row["label"]: row["value"] for row in details["children"]}
+        self.assertEqual(detail_rows["Status"], "Review needed")
+        self.assertEqual(detail_rows["Source"], "GitHub")
+        self.assertEqual(detail_rows["Context"], "acme/repo")
+
         actions = pane["blocks"][3]
+        self.assertEqual(actions["title"], "Actions")
+        self.assertTrue(actions["collapsible"])
         self.assertTrue(actions["collapsed"])
+        self.assertEqual(actions["children"][0]["variant"], "primary")
         self.assertEqual(actions["children"][0]["method"], "attention.action")
         token = actions["children"][0]["params"]["token"]
         self.assertIs(token_actions[token], action)
+        self.assertEqual(pane["blocks"][-1]["label"], "Refresh")
+        self.assertEqual(pane["blocks"][-1]["method"], "attention.refresh")
+        self.assertEqual(pane["blocks"][-2]["kind"], "divider")
+
+    def test_empty_native_sidebar_distinguishes_source_failures(self):
+        empty = worker._pane_payload({"items": [], "failures": []})
+        failure = worker._pane_payload({
+            "items": [], "failures": [{"source": "GitHub", "error": "unavailable"}],
+        })
+        self.assertEqual(empty["blocks"][0]["title"], "Nothing needs attention")
+        self.assertEqual(empty["blocks"][0]["tone"], "success")
+        self.assertEqual(failure["blocks"][0]["title"], "Sources need attention")
+        failures = next(block for block in failure["blocks"]
+                        if block.get("title") == "Collector failures")
+        self.assertIn("GitHub: unavailable", failures["children"][0]["text"])
 
     def test_open_session_identity_suppresses_only_matching_github_and_linear_work(self):
         items = [
@@ -211,14 +242,25 @@ class SidebarPayloadTests(unittest.TestCase):
             worker.publish_payload(
                 [{"id": "s1"}, {"id": "s2"}], worker.status_payload(), items=items,
             )
+        panes = [call["payload"] for call in calls]
+        queues = [next(block for block in pane["blocks"]
+                       if block.get("title") == "Work queue")
+                  for pane in panes]
         selected = [
-            next(row["label"] for row in call["payload"]["blocks"][1]["children"]
-                 if row["selected"])
-            for call in calls
+            next(row["label"] for row in queue["children"] if row.get("selected"))
+            for queue in queues
         ]
         self.assertEqual(selected, ["First", "Second"])
         self.assertEqual(
-            [call["payload"]["blocks"][2]["title"] for call in calls],
+            [next(block["title"] for block in pane["blocks"]
+                  if block.get("kind") == "callout") for pane in panes],
+            ["First", "Second"],
+        )
+        self.assertEqual(
+            [next(row["value"] for row in next(
+                block for block in pane["blocks"]
+                if block.get("title") == "Item details"
+            )["children"] if row["label"] == "Status") for pane in panes],
             ["Review needed", "Assigned"],
         )
 
@@ -328,7 +370,9 @@ class SidebarPayloadTests(unittest.TestCase):
             params = send.call_args.args[1]
             self.assertEqual(params["slot"], "pane")
             self.assertEqual(params["session_id"], "s1")
-            self.assertEqual(params["payload"]["blocks"][1]["text"],
+            notice = next(block for block in params["payload"]["blocks"]
+                          if block.get("kind") == "note")
+            self.assertEqual(notice["text"],
                              "Failed: Lumen: Action did not complete.")
             self.assertNotIn("page", json.dumps(params))
         finally:
@@ -372,6 +416,68 @@ class SidebarPayloadTests(unittest.TestCase):
                 )
             self.assertEqual(responses[0]["result"]["ok"], False)
             self.assertIn("expired", responses[0]["result"]["error"])
+            with self.assertRaises(queue.Empty):
+                worker.action_requests.get_nowait()
+        finally:
+            for name in names:
+                if name in previous:
+                    setattr(worker, name, previous[name])
+                elif hasattr(worker, name):
+                    delattr(worker, name)
+
+    def test_skipped_pane_publish_keeps_existing_session_action_token(self):
+        names = (
+            "published_ids", "action_tokens", "action_token_sessions",
+            "selected_item_keys", "live_session_ids", "active_action",
+            "action_requests", "consumed_action_ids", "consumed_session_item_ids",
+        )
+        previous = {name: getattr(worker, name) for name in names if hasattr(worker, name)}
+        action = {"label": "Run", "payload": {"command": ["echo"]}}
+        worker.published_ids = {"s1"}
+        worker.action_tokens = {"existing-token": action}
+        worker.action_token_sessions = {"existing-token": "s1"}
+        worker.selected_item_keys = {}
+        worker.live_session_ids = {"s1", "s2"}
+        worker.active_action = None
+        worker.action_requests = queue.Queue()
+        worker.consumed_action_ids = set()
+        worker.consumed_session_item_ids = set()
+        published = []
+        responses = []
+
+        try:
+            with patch.object(
+                    worker, "rpc", side_effect=lambda method, params: published.append(params)):
+                worker.publish_payload(
+                    [{"id": "s1"}, {"id": "s2"}], worker.status_payload(),
+                    only_new=True,
+                    items=[{"title": "Review PR", "actions": [action]}],
+                )
+
+            self.assertEqual([params["session_id"] for params in published], ["s2"])
+            self.assertIs(worker.action_tokens["existing-token"], action)
+            self.assertEqual(worker.action_token_sessions["existing-token"], "s1")
+
+            with patch.object(worker, "send", side_effect=responses.append):
+                worker.dispatch({
+                    "jsonrpc": "2.0", "id": "foreign",
+                    "method": "attention.action",
+                    "params": {"token": "existing-token", "session_id": "s2"},
+                })
+                self.assertFalse(responses[-1]["result"]["ok"])
+                self.assertIn("expired", responses[-1]["result"]["error"])
+
+                worker.dispatch({
+                    "jsonrpc": "2.0", "id": "existing",
+                    "method": "attention.action",
+                    "params": {"token": "existing-token", "session_id": "s1"},
+                })
+                self.assertTrue(responses[-1]["result"]["ok"])
+
+            request = worker.action_requests.get_nowait()
+            self.assertEqual(request["session_id"], "s1")
+            self.assertIs(request["action"], action)
+            self.assertEqual(request["token"], "existing-token")
             with self.assertRaises(queue.Empty):
                 worker.action_requests.get_nowait()
         finally:
@@ -1057,7 +1163,8 @@ class WorkerProtocolTests(unittest.TestCase):
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
                 loading_payload = loading["params"]["payload"]
-                self.assertEqual(loading_payload["blocks"][0]["method"], "attention.refresh")
+                self.assertEqual(loading_payload["blocks"][-1]["method"],
+                                 "attention.refresh")
                 self.assertEqual(loading_payload["default_location"], "right")
                 reply(loading)
                 time.sleep(0.15)
@@ -1146,7 +1253,7 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(loading, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(loading["method"], "ui.state.set")
-                    self.assertEqual(loading["params"]["payload"]["blocks"][0]["method"],
+                    self.assertEqual(loading["params"]["payload"]["blocks"][-1]["method"],
                                      "attention.refresh")
                     reply(loading, {})
                     proc.stdin.write(json.dumps({
@@ -1173,7 +1280,7 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(published, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(published["method"], "ui.state.set")
-                    self.assertEqual(published["params"]["payload"]["blocks"][0]["method"],
+                    self.assertEqual(published["params"]["payload"]["blocks"][-1]["method"],
                                      "attention.refresh")
                     reply(published, {})
                     break
@@ -1221,7 +1328,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 reply(listing, {"sessions": [{"id": "s1"}]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
-                self.assertEqual(loading["params"]["payload"]["blocks"][0]["method"],
+                self.assertEqual(loading["params"]["payload"]["blocks"][-1]["method"],
                                  "attention.refresh")
                 reply(loading)
                 proc.stdin.write(json.dumps({
@@ -1239,7 +1346,7 @@ class WorkerProtocolTests(unittest.TestCase):
                     self.assertEqual(pushed["method"], "ui.state.set")
                     params = pushed["params"]
                     self.assertEqual((params["session_id"], params["slot"], params["id"]), ("s1", "pane", "attention"))
-                    self.assertEqual(params["payload"]["blocks"][0]["method"],
+                    self.assertEqual(params["payload"]["blocks"][-1]["method"],
                                      "attention.refresh")
                     reply(pushed)
                     break
@@ -1567,9 +1674,10 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 detail = next(
                     block for block in selected["blocks"]
                     if block.get("kind") == "callout"
-                    and block.get("title") == "Second item selected"
                 )
-                self.assertEqual(detail["detail"], "selected detail")
+                self.assertEqual(detail["title"], "Second item")
+                self.assertEqual(detail["detail"],
+                                 "Second item selected · selected detail")
                 send_action("expired-hidden-action", prompt_token, "s1")
                 expired = wait_response("expired-hidden-action")
                 self.assertFalse(expired["result"]["ok"])
