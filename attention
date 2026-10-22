@@ -444,6 +444,10 @@ def _absorb(host, guest):
         note = guest.get("absorb_note") or f"{guest.get('status', '')}: {guest.get('title', '')}"
         host["details"] = f"{host['details']} | {note}" if host.get("details") else note
     host["weight"] = max(host.get("weight", 0), guest.get("weight", 0)) + 5
+    host["_linked_item_urls"] = list(dict.fromkeys(
+        [*host.get("_linked_item_urls", []), guest.get("url"),
+         *guest.get("_linked_item_urls", [])]
+    ))
 
     host_actions = host.setdefault("actions", [])
     host_keys = {a["key"] for a in host_actions}

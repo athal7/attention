@@ -243,21 +243,149 @@ function find(node, predicate) {
         self.assertEqual(result.returncode, 0, result.stderr)
 
 class DashboardPayloadTests(unittest.TestCase):
-    def test_native_pane_opens_dashboard_and_renders_status(self):
-        payload = worker.status_payload()
-        self.assertEqual(payload["default_location"], "right")
-        self.assertEqual(payload["blocks"], [{
-            "kind": "row",
-            "label": "Open Attention dashboard",
-            "icon": "inbox",
-            "href": worker.DASHBOARD_PATH,
-        }])
+    def test_session_ui_state_parses_primary_cli_url_without_starting_daemon(self):
+        output = SimpleNamespace(
+            returncode=0,
+            stdout="primary\thttp://127.0.0.1:4097/?token=secret\n"
+                   "lan\thttp://192.0.2.1:4097/?token=secret\n",
+        )
+        with patch.object(worker.subprocess, "run", return_value=output) as run, \
+                patch.object(worker, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"entries":[]}'
+            self.assertEqual(worker.session_ui_state(), [])
+        run.assert_called_once_with(
+            ["aoe", "url", "--no-autostart"],
+            capture_output=True, text=True, timeout=5,
+        )
+        urlopen.assert_called_once_with(
+            "http://127.0.0.1:4097/api/plugins/ui-state?token=secret", timeout=5,
+        )
 
-        notice = worker.status_payload("Lumen: Could not open Terminal.")
-        self.assertEqual(notice["blocks"][0], payload["blocks"][0])
-        self.assertEqual(notice["blocks"][1], {
-            "kind": "note", "text": "Lumen: Could not open Terminal.",
+    def test_prompt_publishes_dashboard_even_when_not_already_open(self):
+        prompt = {"id": "prompt-1", "token": "token-1"}
+        with patch.object(worker, "rpc") as rpc, \
+                patch.object(worker, "dashboard_active", False), \
+                patch.object(worker, "active_prompt", prompt), \
+                patch.object(worker, "snapshot_fetched_at", None), \
+                patch.object(worker, "action_tokens", {}, create=True):
+            worker.publish_payload([], worker.status_payload("Input required."), items=[])
+        page = next(
+            call.args[1]["payload"] for call in rpc.call_args_list
+            if call.args[1].get("slot") == "page"
+        )
+        self.assertEqual(page["prompt"], prompt)
+
+    def test_native_sidebar_lists_items_and_places_item_actions_under_folded_rows(self):
+        action = {"key": "o", "label": "Open", "payload": {"kind": "open"}}
+        token_actions = {}
+        page = worker.dashboard_payload([{
+            "title": "Review PR", "status": "Review needed", "url": "https://github.com/acme/repo/pull/42",
+            "actions": [action],
+        }], "now", [], token_actions)
+        pane = worker._sidebar_payload(page)
+        self.assertEqual(pane["default_location"], "right")
+        self.assertEqual(pane["blocks"][0]["method"], "attention.refresh")
+        card = pane["blocks"][2]["children"][0]
+        self.assertTrue(card["collapsed"])
+        self.assertEqual(card["children"][0]["href"], "https://github.com/acme/repo/pull/42")
+        self.assertEqual(card["children"][1]["method"], "attention.action")
+        self.assertIs(token_actions[card["children"][1]["params"]["token"]], action)
+
+    def test_open_session_item_identity_suppresses_only_matching_github_and_linear_work(self):
+        items = [
+            {"kind": "pull_request", "title": "Shared branch without identity facet",
+             "url": "https://github.com/acme/repo/pull/99", "repo_path": "/repo",
+             "head_branch": "shared"},
+            {"kind": "pull_request", "title": "Owned", "url": "https://github.com/Acme/Repo/pull/42"},
+            {"kind": "issue", "title": "Linked", "url": "https://linear.app/acme/issue/ENG-4/slug"},
+            {"kind": "issue", "title": "Unrelated", "url": "https://linear.app/acme/issue/ENG-5"},
+            {"kind": "pull_request", "title": "Stopped", "url": "https://github.com/acme/repo/pull/43"},
+        ]
+        sessions = [
+            {"id": "idle", "status": "Idle",
+             "workspace_repos": [{"source_path": "/repo", "branch": "shared"}],
+             "_attention_items": [
+                 ("github", "acme", "repo", "pull", 42),
+                 ("linear", "acme", "ENG-4"),
+             ]},
+            {"id": "stopped", "status": "Stopped", "_attention_items": [
+                ("github", "acme", "repo", "pull", 43),
+            ]},
+        ]
+        page = worker.dashboard_payload(items, "now", sessions)
+        self.assertEqual(
+            {card["title"] for card in page["items"]},
+            {"Unrelated", "Stopped", "Shared branch without identity facet"},
+        )
+    def test_absorbed_linear_issue_identity_suppresses_its_github_host(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "attention_linked_identity_test", str(ROOT / "attention"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        attention = importlib.util.module_from_spec(spec)
+        loader.exec_module(attention)
+        host = {
+            "kind": "pull_request", "title": "PR", "details": "review",
+            "url": "https://github.com/acme/repo/pull/42",
+        }
+        guest = {
+            "kind": "issue", "title": "Issue", "details": "assigned",
+            "url": "https://linear.app/acme/issue/ENG-4",
+        }
+        attention._absorb(host, guest)
+        page = worker.dashboard_payload([host], "now", [{
+            "id": "linear-session", "status": "Idle",
+            "_attention_items": [("linear", "acme", "ENG-4")],
+        }])
+        self.assertEqual(page["items"], [])
+    def test_session_facets_use_only_canonical_plugin_item_links(self):
+        entries = [{
+            "plugin_id": "agent-of-empires.github",
+            "slot": "row-badge",
+            "id": "github_pr_badge",
+            "session_id": "s1",
+            "payload": {"items": [
+                {"href": "https://github.com/acme/repo/pull/42"},
+                {"href": "https://github.com/acme/repo/pull/42#issuecomment-123"},
+                {"href": "https://example.com/acme/repo/pull/42"},
+            ]},
+        }, {
+            "plugin_id": "community.linear",
+            "slot": "pane",
+            "id": "linear_issue_pane",
+            "session_id": "s1",
+            "payload": {"blocks": [{"children": [
+                {"method": "linear.select_issue", "href": "https://linear.app/acme/issue/ENG-4"},
+                {"href": "https://linear.app/acme/issue/ENG-9"},
+            ]}]},
+        }]
+        entries.extend([{
+            "plugin_id": "agent-of-empires.github", "slot": "row-badge",
+            "id": "github_pr_badge", "session_id": "s1",
+            "payload": {"items": 42},
+        }, {
+            "plugin_id": "community.linear", "slot": "pane",
+            "id": "linear_issue_pane", "session_id": "s1",
+            "payload": {"blocks": {"method": "linear.select_issue"}},
+        }, {
+            "plugin_id": "other.plugin", "slot": "row-badge",
+            "id": "github_pr_badge", "session_id": "s1",
+            "payload": {"href": "https://github.com/acme/repo/pull/99"},
+        }])
+        entries.extend([{
+            "plugin_id": "athal7.attention", "slot": "pane",
+            "id": "attention", "session_id": "s2", "payload": {},
+        }, {
+            "plugin_id": "unknown.plugin", "slot": "row-badge",
+            "id": "unknown", "session_id": "s3", "payload": {},
+        }])
+        self.assertEqual(worker._session_item_identities(entries), {
+            "s1": [
+                ("github", "acme", "repo", "pull", 42),
+                ("linear", "acme", "ENG-4"),
+            ],
         })
+
 
     def test_dashboard_page_trims_low_priority_entries_to_payload_limit(self):
         items = [
@@ -1038,10 +1166,8 @@ class WorkerProtocolTests(unittest.TestCase):
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
                 loading_payload = loading["params"]["payload"]
-                self.assertEqual(loading_payload["blocks"][0], {
-                    "kind": "row", "label": "Open Attention dashboard",
-                    "icon": "inbox", "href": worker.DASHBOARD_PATH,
-                })
+                self.assertEqual(loading_payload["blocks"][0]["method"], "attention.refresh")
+                self.assertEqual(loading_payload["default_location"], "right")
                 reply(loading)
                 time.sleep(0.15)
                 self.assertFalse(calls.exists(), "worker fetched during startup or elapsed timer")
@@ -1129,10 +1255,8 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(loading, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(loading["method"], "ui.state.set")
-                    self.assertEqual(loading["params"]["payload"]["blocks"][0], {
-                        "kind": "row", "label": "Open Attention dashboard",
-                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
-                    })
+                    self.assertEqual(loading["params"]["payload"]["blocks"][0]["method"],
+                                     "attention.refresh")
                     reply(loading, {})
                     proc.stdin.write(json.dumps({
                         "jsonrpc": "2.0", "id": "refresh",
@@ -1158,10 +1282,8 @@ class WorkerProtocolTests(unittest.TestCase):
                         reply(published, {"sessions": [{"id": "s1"}]})
                         continue
                     self.assertEqual(published["method"], "ui.state.set")
-                    self.assertEqual(published["params"]["payload"]["blocks"][0], {
-                        "kind": "row", "label": "Open Attention dashboard",
-                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
-                    })
+                    self.assertEqual(published["params"]["payload"]["blocks"][0]["method"],
+                                     "attention.refresh")
                     reply(published, {})
                     break
             finally:
@@ -1208,10 +1330,8 @@ class WorkerProtocolTests(unittest.TestCase):
                 reply(listing, {"sessions": [{"id": "s1"}]})
                 loading = receive()
                 self.assertEqual(loading["method"], "ui.state.set")
-                self.assertEqual(loading["params"]["payload"]["blocks"][0], {
-                    "kind": "row", "label": "Open Attention dashboard",
-                    "icon": "inbox", "href": worker.DASHBOARD_PATH,
-                })
+                self.assertEqual(loading["params"]["payload"]["blocks"][0]["method"],
+                                 "attention.refresh")
                 reply(loading)
                 proc.stdin.write(json.dumps({
                     "jsonrpc": "2.0", "id": "refresh",
@@ -1228,10 +1348,8 @@ class WorkerProtocolTests(unittest.TestCase):
                     self.assertEqual(pushed["method"], "ui.state.set")
                     params = pushed["params"]
                     self.assertEqual((params["session_id"], params["slot"], params["id"]), ("s1", "pane", "attention"))
-                    self.assertEqual(params["payload"]["blocks"][0], {
-                        "kind": "row", "label": "Open Attention dashboard",
-                        "icon": "inbox", "href": worker.DASHBOARD_PATH,
-                    })
+                    self.assertEqual(params["payload"]["blocks"][0]["method"],
+                                     "attention.refresh")
                     reply(pushed)
                     break
 

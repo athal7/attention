@@ -17,7 +17,8 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 ATTENTION_PATH = Path(__file__).resolve().with_name("attention")
 SESSION_POLL_SECONDS = 60
 MAX_DASHBOARD_BYTES = 64 * 1024
@@ -276,6 +277,114 @@ def _tree_order(items):
 
 
 
+def _open_session(session):
+    return (session.get("status") in {"Running", "Idle", "Waiting", "Starting", "Creating"}
+            and not any(session.get(flag) for flag in ("archived", "snoozed", "trashed")))
+
+
+def _item_identity(url):
+    url = _safe_source_url(url)
+    if not url:
+        return None
+    parsed = urlsplit(url)
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.hostname.lower() == "github.com" and len(parts) == 4
+            and parts[2] in {"pull", "issues"} and parts[3].isdigit()):
+        return ("github", parts[0].casefold(), parts[1].casefold(), parts[2], int(parts[3]))
+    if (parsed.hostname.lower() == "linear.app" and len(parts) in {3, 4}
+            and parts[1] == "issue" and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*-\d+", parts[2])):
+        return ("linear", parts[0].casefold(), parts[2].upper())
+    return None
+
+
+def session_ui_state():
+    """Read the daemon's shared plugin snapshot once, never once per item."""
+    try:
+        result = subprocess.run(
+            ["aoe", "url", "--no-autostart"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode:
+            return []
+        lines = result.stdout.strip().splitlines()
+        if not lines:
+            return []
+        address = lines[0]
+        if "\t" in address:
+            label, address = address.split("\t", 1)
+            if label != "primary":
+                return []
+        endpoint = urlsplit(address)
+        if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+            return []
+        url = urlunsplit((endpoint.scheme, endpoint.netloc, "/api/plugins/ui-state",
+                          endpoint.query, ""))
+        with urlopen(url, timeout=5) as response:
+            data = response.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024:
+            return []
+        snapshot = json.loads(data)
+        entries = snapshot.get("entries", []) if isinstance(snapshot, dict) else []
+        return entries if isinstance(entries, list) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def _session_item_identities(entries):
+    identities = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("session_id"), str):
+            continue
+        plugin_id = entry.get("plugin_id")
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        candidates = []
+        related = payload.get("items")
+        related = related if isinstance(related, list) else []
+        if (plugin_id == "agent-of-empires.github" and entry.get("slot") == "row-badge"
+                and entry.get("id") == "github_pr_badge"):
+            candidates = [payload, *related]
+        elif (plugin_id == "community.linear" and entry.get("slot") == "row-badge"
+              and entry.get("id") == "linear_issue_badge"):
+            candidates = [payload, *related]
+        elif (plugin_id == "community.linear" and entry.get("slot") == "pane"
+              and entry.get("id") == "linear_issue_pane"):
+            # Only issue-selector rows, not comments or linked resources.
+            blocks = payload.get("blocks")
+            pending = list(blocks) if isinstance(blocks, list) else []
+            while pending:
+                block = pending.pop()
+                if not isinstance(block, dict):
+                    continue
+                if block.get("method") == "linear.select_issue":
+                    candidates.append(block)
+                children = block.get("children")
+                if isinstance(children, list):
+                    pending.extend(children)
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                identity = _item_identity(candidate.get("href"))
+                if identity:
+                    identities.setdefault(entry["session_id"], set()).add(identity)
+    return {sid: sorted(values) for sid, values in identities.items()}
+
+
+def _unowned_items(items, sessions):
+    owned = {
+        identity for session in sessions if _open_session(session)
+        for identity in session.get("_attention_items", [])
+    }
+    visible = []
+    for item in items:
+        if item.get("kind") in {"pull_request", "issue"}:
+            urls = [item.get("url"), *item.get("_linked_item_urls", [])]
+            if any(_item_identity(url) in owned for url in urls):
+                continue
+        visible.append(item)
+    return visible
+
+
 def _matching_sessions(item, sessions, allow_title=True):
     branch = item.get("head_branch")
     repo_path = item.get("repo_path")
@@ -283,8 +392,7 @@ def _matching_sessions(item, sessions, allow_title=True):
     title = f"Attention: {_display_text(item.get('title'), 120) or 'Follow-up'}"
     matches = []
     for session in sessions:
-        if (session.get("status") not in {"Running", "Waiting", "Starting", "Creating"}
-                or any(session.get(flag) for flag in ("archived", "snoozed", "trashed"))):
+        if not _open_session(session):
             continue
         repos = list(session.get("workspace_repos") or [])
         worktree = session.get("worktree")
@@ -311,6 +419,9 @@ def live_sessions():
     result = rpc("sessions.list")
     sessions = result.get("sessions", []) if isinstance(result, dict) else []
     sessions = [session for session in sessions if isinstance(session, dict) and isinstance(session.get("id"), str)]
+    identities = _session_item_identities(session_ui_state())
+    sessions = [dict(session, _attention_items=identities.get(session["id"], []))
+                for session in sessions]
     live_ids = {session["id"] for session in sessions}
     for stale_id in published_ids - live_ids:
         rpc("ui.state.remove", {"slot": "pane", "id": "attention", "session_id": stale_id})
@@ -342,6 +453,7 @@ def status_payload(text=""):
 
 def dashboard_payload(items, fetched_at, sessions, token_actions=None):
     token_actions = {} if token_actions is None else token_actions
+    items = _unowned_items(items, sessions)
     cards = []
     titles = [_display_text(item.get("title"), 120) or "Follow-up"
               for item in items if not item.get("_collector_failure")]
@@ -428,30 +540,70 @@ def _notice_text(payload):
     return next((block.get("text", "") for block in payload.get("blocks", [])
                  if block.get("kind") == "note" and block.get("text")), "")
 
+def _sidebar_payload(page, notice=""):
+    blocks = [{
+        "kind": "row", "label": "Refresh Attention", "icon": "refresh",
+        "method": "attention.refresh",
+    }, {
+        "kind": "row", "label": "Open Attention dashboard", "icon": "inbox",
+        "href": DASHBOARD_PATH,
+    }]
+    if notice:
+        blocks.append({"kind": "note", "text": _display_text(notice, 200)})
+    groups = {}
+    for card in page["items"]:
+        children = [{
+            "kind": "row", "label": card["title"], "sublabel": card["status"],
+            "href": card["url"],
+        }]
+        children.extend({
+            "kind": "row", "label": action["label"], "method": action["method"],
+            "params": {"token": action["token"]},
+        } for action in card["actions"])
+        groups.setdefault(card["group"], []).append({
+            "kind": "section", "title": card["title"],
+            "children": children, "collapsible": True, "collapsed": True,
+        })
+    blocks.extend({
+        "kind": "section", "title": group, "children": sections,
+        "collapsible": True, "collapsed": False,
+    } for group, sections in groups.items())
+    blocks.extend({"kind": "note", "text": f'{failure["source"]}: {failure["error"]}'}
+                  for failure in page["failures"])
+    if page["omitted_items"] or page["omitted_failures"]:
+        blocks.append({"kind": "note", "text": "Some lower-priority items were omitted."})
+    return {"title": "Attention", "default_location": "right", "blocks": blocks}
+
+
+
 def publish_payload(sessions, payload, only_new=False, items=(), action_output=""):
     global action_tokens
-    dashboard_tokens = set()
-    if dashboard_active:
-        page = dashboard_payload(items, snapshot_fetched_at, sessions, action_tokens)
-        if action_output:
-            page["action_output"] = action_output
-        notice = _display_text(_notice_text(payload), 400)
-        page["status"] = notice
-        page["error"] = notice if ("failed" in notice.casefold()
-                                   or notice.startswith("New session:")) else ""
-        page = _fit_dashboard(page)
-        dashboard_tokens = {
-            action["token"]
-            for card in page.get("items", [])
-            for action in card.get("actions", [])
-            if isinstance(action, dict) and isinstance(action.get("token"), str)
-        }
+    page = dashboard_payload(items, snapshot_fetched_at, sessions, action_tokens)
+    if action_output:
+        page["action_output"] = action_output
+    notice = _display_text(_notice_text(payload), 400)
+    page["status"] = notice
+    page["error"] = notice if ("failed" in notice.casefold()
+                               or notice.startswith("New session:")) else ""
+    page = _fit_dashboard(page)
+    page_tokens = {
+        action["token"]
+        for card in page.get("items", [])
+        for action in card.get("actions", [])
+        if isinstance(action, dict) and isinstance(action.get("token"), str)
+    }
+    if dashboard_active or active_prompt is not None:
         rpc("ui.state.set", {"slot": "page", "id": "dashboard", "payload": page})
+    pane = _sidebar_payload(page, notice)
+    sidebar_tokens = {
+        block.get("params", {}).get("token")
+        for block in pane["blocks"]
+        if isinstance(block, dict) and isinstance(block.get("params"), dict)
+    }
     action_tokens = {
         token: action for token, action in action_tokens.items()
-        if token in dashboard_tokens
+        if token in page_tokens | sidebar_tokens
     }
-    pane = payload or status_payload()
     for session in sessions:
         session_id = session["id"]
         if only_new and session_id in published_ids:
@@ -460,8 +612,6 @@ def publish_payload(sessions, payload, only_new=False, items=(), action_output="
             "slot": "pane", "id": "attention", "session_id": session_id, "payload": pane,
         })
         published_ids.add(session_id)
-
-
 def fetch_snapshot(results):
     try:
         with _source_lock:

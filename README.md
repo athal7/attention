@@ -214,22 +214,23 @@ just point `config["plugins"]` at it.
 
 ## Agent of Empires web dashboard
 
-This repository provides an Agent of Empires community plugin with a full
-Attention dashboard page and an Attention pane in each session. Install from the
+This repository provides an Agent of Empires community plugin with an
+Attention sidebar in each session and a full dashboard page. Install from the
 repository root with `aoe plugin install .`, then enable it with
 `aoe plugin enable athal7.attention`. The dashboard page requires AoE 1.20 or
 newer.
 
-The Attention dashboard page is the single item view. It uses the terminal
-dashboard's prioritized items, configured groups and indicator columns, source
-actions, and configured actions. It displays details, filters by group and
-source/provider, and links matching live sessions. Item actions stay under a
-collapsed **Actions** menu; own-PR approvals remain hidden.
+The per-session sidebar is the primary item view. It uses the terminal
+dashboard's prioritized items and configured groups, links source records, and
+provides item actions. Items with canonical GitHub PR/issue or Linear issue
+links already attached to an open AoE session are omitted; idle sessions count
+as open. The dashboard page remains available for detailed filters, prompts,
+diagnostics, and the **New session** form.
 
-The per-session pane is a native **Open Attention dashboard** launcher with
-short status notices, not a second item renderer. AoE exposes pages and session
-panes through separate slots, and native pane blocks cannot collect the page's
-filters, free-text/choice prompts, or **New session** form. Those workflows stay
+Item actions stay under collapsible sections; own-PR approvals remain hidden.
+The sidebar's refresh control fetches current items. AoE exposes pages and
+session panes through separate slots, and native pane blocks cannot collect the
+page's free-text/choice prompts or **New session** form. Those workflows stay
 on the dashboard page.
 
 The page reports action completion or launch failure and displays captured
@@ -258,20 +259,18 @@ the worktree branch from the pull request's target with `--new-branch
 --base-branch`. The source's initial review message is sent with `aoe send
 --no-revive` after the session starts.
 
-The plugin needs `process.spawn` to run the same local CLI actions as the
-terminal dashboard, including `aoe add`, `aoe session start`, and `aoe send`. Its
-requested filesystem, clipboard, browser, and network capabilities are used by
-configured actions and sources; grant only capabilities whose behavior is
-acceptable for the actions configured on this machine.
+The worker uses `process.spawn` for configured CLI actions and `aoe url
+--no-autostart` to read the daemon's UI-state snapshot. Its `net` capability is
+used for that local API request and by configured actions and sources. Session
+suppression depends on available GitHub and Linear plugin UI-state links; when
+those links are unavailable, items remain visible.
 
-Each card title includes a source icon: a branch for GitHub, a circle for
-Linear, a calendar for calendar events, a checklist for reminders, and an
-inbox for generic or unrecognized sources. A stack's base PR stays visible;
-dependent PRs start folded in the pane. State indicators include PR review and
-CI state. Collector failures appear as named, sanitized notes alongside healthy
-items; exception messages are never shown. The **Refresh** button stays at the top
-of the pane. The dashboard page refreshes automatically when opened, and its
-configured-group, source, and provider filters remain active while it is open.
+The sidebar groups items and shows their status, source link, and actions.
+Actions stay under collapsible sections; own-PR approvals remain hidden.
+Collector failures appear as named, sanitized notes alongside healthy items;
+exception messages are never shown. The **Refresh** button stays at the top of
+the pane. The dashboard page refreshes automatically when opened and retains
+its configured-group, source, and provider filters and indicator columns.
 
 The `attention` GitHub source does not persist a snapshot locally. It uses
 `gh search`; `gh api --cache` covers GET requests and does not cache those
