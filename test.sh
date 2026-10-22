@@ -4720,6 +4720,55 @@ test_dashboard_startup_handles_curses_error
 
 # ---------------------------------------------------------------------------
 echo
+echo "== session agents per directory =="
+
+test_session_agents_configuration() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+agents, error = m.session_agents({'session': {'agents': [
+    {'path': '~/work', 'tool': 'omp'},
+    {'path': '$XDG_CONFIG', 'tool': 'freebuf'},
+]}})
+print(error)
+print(','.join(agent['tool'] for agent in agents))
+print(all(agent['path'].startswith('/') for agent in agents))
+print(m.session_agents({}))
+print(m.session_agents({'session': {'agents': None}})[0])
+print(m.session_agents({'session': {'agents': 'omp'}})[1])
+print(m.session_agents({'session': {'agents': [{'path': '/repo', 'tool': '--title'}]}})[1])
+print(m.session_agents({'session': {'agents': [{'path': ' ', 'tool': 'omp'}]}})[1])
+print(m.session_agents({'session': {'agents': [{'path': '/repo', 'tool': 'omp pi'}]}})[1])
+print(m.session_agents({'session': {'agents': [{'path': '/repo', 'tool': 'omp', 'profile': 'qa'}]}})[1])
+print(m.session_agents({'session': {'paths': []}})[1])
+")"
+  check "session agent configuration resolves to an agent name" \
+    "$(sed -n 1p <<<"$out")" "None"
+  check "session agent configuration keeps each directory's tool" \
+    "$(sed -n 2p <<<"$out")" "omp,freebuf"
+  check "session agent directories are absolute" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "missing session configuration contributes no agents" \
+    "$(sed -n 4p <<<"$out")" "([], None)"
+  check "agentless session configuration contributes no agents" \
+    "$(sed -n 5p <<<"$out")" "[]"
+  check "a non-list agents value is rejected" \
+    "$(sed -n 6p <<<"$out")" "session.agents must be a list"
+  check "an agent name that looks like a flag is rejected" \
+    "$(sed -n 7p <<<"$out")" "session.agents[1].tool must be an agent name"
+  check "a blank agent directory is rejected" \
+    "$(sed -n 8p <<<"$out")" "session.agents[1].path must be a non-empty string"
+  check "an agent name with whitespace is rejected" \
+    "$(sed -n 9p <<<"$out")" "session.agents[1].tool must be an agent name"
+  check "unknown agent fields are rejected" \
+    "$(sed -n 10p <<<"$out")" "session.agents[1] must declare exactly path and tool"
+  check "unknown session fields are rejected" \
+    "$(sed -n 11p <<<"$out")" "session has an unsupported field"
+}
+test_session_agents_configuration
+
+# ---------------------------------------------------------------------------
+echo
 echo "== --help =="
 
 check "attention --help mentions Usage" \

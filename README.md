@@ -73,6 +73,12 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
     ]
   },
   "linear":    { "apiToken": "lin_api_..." },
+  "session":   {
+    "agents": [
+      { "path": "~/code/work", "tool": "omp" },
+      { "path": "~/code/personal", "tool": "freebuf" }
+    ]
+  },
   "dashboard": {
     "groups": [
       { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["state"] },
@@ -93,6 +99,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}`), optional `"terminal": true` to run in a separate terminal window, optional `"background": true` for fire-and-forget commands, optional `"wip"` to update work-in-progress state, and optional `"input"`/`"inputs"` prompts (see [PLUGINS.md](PLUGINS.md)). GitHub action templates also expose `{head_branch}` and `{base_branch}` for PR worktrees (empty when unavailable). |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
+| `session.agents` | Which agent the generated `New session` action starts per directory. Each entry pairs a `path` (a directory; `~` is expanded) with an AoE `tool` (`aoe add --tool`, e.g. `omp` or `freebuf`). The longest configured directory containing the item's project directory wins, so a more specific entry can override a parent. Items outside every entry keep AoE's default agent. An invalid entry fails the refresh instead of starting the wrong agent. |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, and/or `any`) or `fallback: true`. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
 ### Dashboard groups
@@ -237,9 +244,10 @@ removed; the AoE native pane is the only Attention web surface.
 
 The generated **New session** action starts a normal terminal-mode AoE session
 from an item's project path, or a scratch session for non-GitHub items without
-a project path. Pull requests reuse an existing local head branch, or create
-the worktree branch from the pull request's target with `--new-branch
---base-branch`. Configured per-item actions labeled `session` or `New session`
+a project path. The agent it runs comes from `session.agents` for that
+directory; unconfigured directories keep AoE's default agent. Pull requests
+reuse an existing local head branch, or create the worktree branch from the
+pull request's target with `--new-branch --base-branch`. Configured per-item actions labeled `session` or `New session`
 replace the generated action and use the source's configured CLI action.
 
 GitHub session actions resolve the repository by owner/name from verified
