@@ -282,6 +282,13 @@ Provider actions support the same optional `"input"` or `"inputs"` declarations
 as bundled plugins: text or pick-one prompts fill `{input}` or
 `{input.<name>}` placeholders in the command.
 
+An action labeled `session` or `New session` runs with the agent that
+`session.agents` resolves for its item -- from the item's GitHub `repo`
+identity first, then its project directory -- exported as `AOE_TOOL` and
+available as the `{session_tool}` placeholder in its command. When no entry
+matches, `AOE_TOOL` is unset and the placeholder resolves empty, so AoE's
+default agent applies.
+
 An action may also set `"wip": true` to mark the item work in progress
 when it runs, exactly as bundled-plugin actions do.
 

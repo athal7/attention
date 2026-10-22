@@ -24,10 +24,18 @@ def slugify(text, max_len=50):
     return slug or "session"
 
 
-def run_cmd(cmd):
+def _environment(extra):
+    """Subprocess keyword arguments adding extra variables to the inherited
+    environment; nothing at all when there are none."""
+    return {"env": {**os.environ, **extra}} if extra else {}
+
+
+def run_cmd(cmd, env=None):
+    """Run cmd to completion. `env` adds variables to the inherited environment."""
     try:
         print(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                **_environment(env))
         if result.stdout:
             print(result.stdout, end="")
         if result.stderr:
@@ -40,7 +48,7 @@ def run_cmd(cmd):
         return False
 
 
-def dispatch_background(cmd):
+def dispatch_background(cmd, env=None):
     """Launch a fire-and-forget subprocess without blocking the caller --
     e.g. a work-session dispatch can take up to ~30s (worktree creation
     plus a readiness poll) before it even sends anything, and the
@@ -48,6 +56,8 @@ def dispatch_background(cmd):
     process's stdio/session so it survives past this call returning;
     output goes to a per-dispatch log file since the terminal may already
     be showing the next dashboard render by the time it produces any.
+
+    `env` adds variables to the inherited environment.
     """
     log_fd, log_path = tempfile.mkstemp(prefix="attention-dispatch-", suffix=".log")
     with os.fdopen(log_fd, "w") as log_file:
@@ -55,6 +65,7 @@ def dispatch_background(cmd):
             subprocess.Popen(
                 cmd, stdout=log_file, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, start_new_session=True,
+                **_environment(env),
             )
             print(f"Dispatched in background (log: {log_path}): {' '.join(cmd)}")
             return True
@@ -63,10 +74,20 @@ def dispatch_background(cmd):
             return False
 
 
-def run_terminal(cmd):
-    """Run an interactive configured action in a separate terminal window."""
+def run_terminal(cmd, env=None):
+    """Run an interactive configured action in a separate terminal window.
+
+    `env` adds variables to the inherited environment. Terminal.app starts a
+    new shell that does not inherit this process's environment, so on macOS
+    the variables are prefixed to the command instead.
+    """
     if sys.platform == "darwin":
-        command = shlex.join(cmd).replace("\\", "\\\\").replace("\"", "\\\"")
+        command = shlex.join(cmd)
+        if env:
+            command = " ".join(
+                shlex.quote(f"{key}={value}") for key, value in env.items()
+            ) + " " + command
+        command = command.replace("\\", "\\\\").replace("\"", "\\\"")
         script = f'tell application "Terminal" to do script "{command}"'
         try:
             subprocess.run(["osascript", "-e", script], check=True,
@@ -88,7 +109,8 @@ def run_terminal(cmd):
             return False
         terminal, mode = candidates[0]
         try:
-            subprocess.Popen([*terminal, mode, *cmd], start_new_session=True)
+            subprocess.Popen([*terminal, mode, *cmd], start_new_session=True,
+                             **_environment(env))
             return True
         except Exception as exc:
             print(f"Could not open terminal: {exc}")
@@ -99,7 +121,8 @@ def run_terminal(cmd):
             print("Install Windows Terminal to run this interactive action.")
             return False
         try:
-            subprocess.Popen([terminal, "new-tab", "--", *cmd])
+            subprocess.Popen([terminal, "new-tab", "--", *cmd],
+                             **_environment(env))
             return True
         except Exception as exc:
             print(f"Could not open Windows Terminal: {exc}")
@@ -121,6 +144,11 @@ _PLACEHOLDER = re.compile(r"\{([\w.]+)\}")
 
 _INPUT_PLACEHOLDER = "input"
 
+# Filled in when the action runs: the agent resolved for the item from
+# session.agents, also exported to the action process as AOE_TOOL.
+_SESSION_TOOL_PLACEHOLDER = "session_tool"
+_SESSION_TOOL_ENV = "AOE_TOOL"
+
 
 def _lookup(record, path):
     val = record
@@ -137,7 +165,11 @@ def resolve_template(template, record):
 
     def _sub(m):
         name = m.group(1)
-        if name == _INPUT_PLACEHOLDER or name.startswith(_INPUT_PLACEHOLDER + "."):
+        if (
+            name == _INPUT_PLACEHOLDER
+            or name.startswith(_INPUT_PLACEHOLDER + ".")
+            or name == _SESSION_TOOL_PLACEHOLDER
+        ):
             return m.group(0)
         val = _lookup(record, name)
         return "" if val is None else str(val)
@@ -275,12 +307,26 @@ def prompt_for_input(spec):
     return None
 
 
+def _resolve_session_tool(command, payload):
+    """Fill {session_tool} in command tokens with the item's resolved agent."""
+    tool = payload.get("session_tool")
+    tool = tool if isinstance(tool, str) else ""
+    return [
+        token.replace("{" + _SESSION_TOOL_PLACEHOLDER + "}", tool)
+        if isinstance(token, str) else token
+        for token in command
+    ]
+
+
 def run_configured_action(payload):
     """Run a configured action and report whether it completed."""
     command = payload.get("command")
     if not command:
         print("No command configured.")
         return False
+    command = _resolve_session_tool(command, payload)
+    tool = payload.get("session_tool")
+    env = {_SESSION_TOOL_ENV: tool} if isinstance(tool, str) and tool else None
     specs = payload.get("inputs")
     if specs:
         values = {}
@@ -300,8 +346,9 @@ def run_configured_action(payload):
             return tok
 
         command = [_fill(tok) for tok in command]
+    extra = {"env": env} if env else {}
     if payload.get("terminal"):
-        return run_terminal(command)
+        return run_terminal(command, **extra)
     if payload.get("background"):
-        return dispatch_background(command)
-    return run_cmd(command)
+        return dispatch_background(command, **extra)
+    return run_cmd(command, **extra)

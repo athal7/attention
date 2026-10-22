@@ -1544,6 +1544,7 @@ def fetch(config):
             "identity_key": f"github:{repo_name.lower()}#{number}",
             "base_branch": g.get("baseRefName", ""),
             "head_branch": g.get("headRefName", ""),
+            "repo": repo_name,
             "repo_path": repo_path,
             "repo_resolution_error": repo_resolution_error,
             "repo_project_path": repo_project_path,

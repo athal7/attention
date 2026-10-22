@@ -30,6 +30,7 @@ consumed_action_ids = set()
 consumed_session_item_ids = set()
 selected_item_keys = {}
 session_agents = []
+session_tool_resolver = None
 action_token_sessions = {}
 pane_refresh_requested = False
 
@@ -99,8 +100,9 @@ def attention_items():
                                   and module._group_matches(item, group["match"])), fallback)
                     item["_attention_group"] = group["name"]
                     item["_attention_group_order"] = groups.index(group)
-        global session_agents
+        global session_agents, session_tool_resolver
         session_agents = agents
+        session_tool_resolver = getattr(module, "session_agent_for_item", None)
         return items
     finally:
         sys.modules.pop(name, None)
@@ -159,24 +161,11 @@ def _is_approve_action(action):
 
 
 
-def _contains_path(root, path):
-    """Whether path is root or a descendant of it, without prefix false positives."""
-    prefix = root if root.endswith(os.sep) else root + os.sep
-    return path == root or path.startswith(prefix)
-
-
-def _session_tool_for_path(path):
-    """The agent configured for the directory containing path, longest match first."""
-    if not isinstance(path, str) or not path.strip():
-        return ""
-    resolved = os.path.realpath(os.path.expanduser(path.strip()))
-    matches = [
-        agent for agent in session_agents
-        if _contains_path(agent["path"], resolved)
-    ]
-    if not matches:
-        return ""
-    return max(matches, key=lambda agent: len(agent["path"]))["tool"]
+def _session_tool_for_item(item):
+    """The agent resolved for an item: its repository identity first, then
+    its project directory. Empty means AoE's default agent."""
+    resolve = session_tool_resolver
+    return resolve(session_agents, item) if resolve else ""
 
 
 def _new_session_action(item):
@@ -194,7 +183,7 @@ def _new_session_action(item):
         "scratch": not path and not is_github_item,
         "is_pull_request": is_pull_request,
     }
-    tool = _session_tool_for_path(path)
+    tool = _session_tool_for_item(item)
     if tool:
         options["tool"] = tool
     if is_github_item:

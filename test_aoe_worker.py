@@ -766,6 +766,68 @@ class InteractiveActionTests(unittest.TestCase):
         run_terminal.assert_called_once_with(command)
         run_cmd.assert_not_called()
 
+    def test_session_action_exports_the_resolved_agent_as_aoe_tool(self):
+        with patch.object(self.util, "run_cmd", return_value=True) as run_cmd:
+            self.assertTrue(self.util.run_configured_action({
+                "command": ["my-session"], "session_tool": "omp",
+            }))
+        run_cmd.assert_called_once_with(["my-session"], env={"AOE_TOOL": "omp"})
+
+    def test_action_without_a_resolved_agent_leaves_aoe_tool_absent(self):
+        with patch.object(self.util, "run_cmd", return_value=True) as run_cmd:
+            self.assertTrue(self.util.run_configured_action({"command": ["my-session"]}))
+        run_cmd.assert_called_once_with(["my-session"])
+
+    def test_session_tool_placeholder_is_left_for_dispatch_time(self):
+        action = self.util.resolve_configured_actions(
+            [{"key": "s", "label": "session", "command": ["my-session", "--tool", "{session_tool}"]}],
+            {"url": "https://example.com/42"},
+        )[0]
+        self.assertEqual(action["payload"]["command"],
+                         ["my-session", "--tool", "{session_tool}"])
+        with patch.object(self.util, "run_cmd", return_value=True) as run_cmd:
+            self.util.run_configured_action(dict(action["payload"], session_tool="pi"))
+        run_cmd.assert_called_once_with(["my-session", "--tool", "pi"], env={"AOE_TOOL": "pi"})
+
+    def test_background_session_action_exports_aoe_tool(self):
+        with patch.object(self.util, "dispatch_background", return_value=True) as dispatch:
+            self.assertTrue(self.util.run_configured_action({
+                "command": ["my-session"], "background": True, "session_tool": "omp",
+            }))
+        dispatch.assert_called_once_with(["my-session"], env={"AOE_TOOL": "omp"})
+
+    def test_terminal_session_action_exports_aoe_tool(self):
+        with patch.object(self.util, "run_terminal", return_value=True) as run_terminal:
+            self.assertTrue(self.util.run_configured_action({
+                "command": ["my-session"], "terminal": True, "session_tool": "omp",
+            }))
+        run_terminal.assert_called_once_with(["my-session"], env={"AOE_TOOL": "omp"})
+
+    def test_run_cmd_adds_the_session_agent_to_the_environment(self):
+        with patch.object(self.util.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.assertTrue(self.util.run_cmd([sys.executable, "-c", ""], env={"AOE_TOOL": "pi"}))
+        self.assertEqual(run.call_args.kwargs["env"]["AOE_TOOL"], "pi")
+        self.assertIn("PATH", run.call_args.kwargs["env"])
+
+    def test_macos_terminal_prefixes_the_session_agent(self):
+        with patch.object(self.util.sys, "platform", "darwin"), \
+             patch.object(self.util.subprocess, "run") as run:
+            self.assertTrue(self.util.run_terminal(
+                ["my-session", "--tool", "omp"], env={"AOE_TOOL": "omp"},
+            ))
+        script = run.call_args.args[0][2]
+        self.assertIn("AOE_TOOL=omp my-session --tool omp", script)
+
+    def test_linux_terminal_passes_the_session_agent_environment(self):
+        with patch.object(self.util.sys, "platform", "linux"), \
+             patch.dict(os.environ, {"TERMINAL": "custom-term"}), \
+             patch.object(self.util.subprocess, "Popen") as popen:
+            self.assertTrue(self.util.run_terminal(
+                ["my-session"], env={"AOE_TOOL": "omp"},
+            ))
+        self.assertEqual(popen.call_args.kwargs["env"]["AOE_TOOL"], "omp")
+
     def test_run_cmd_handles_redirected_output_and_failures(self):
         import contextlib
         import io
@@ -917,19 +979,16 @@ class WorkerProtocolTests(unittest.TestCase):
             with patch.dict(os.environ, env), \
                  patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
                 worker.attention_items()
-                self.assertEqual(worker._session_tool_for_path(str(work)), "omp")
-                self.assertEqual(worker._session_tool_for_path(str(work_repo)), "pi")
-                self.assertEqual(worker._session_tool_for_path(str(work_repo / "app")), "pi")
-                self.assertEqual(
-                    worker._session_tool_for_path(str(personal / "notes")), "freebuf",
-                )
-                self.assertEqual(worker._session_tool_for_path(str(root / "elsewhere")), "")
-                self.assertEqual(worker._session_tool_for_path(""), "")
-                self.assertEqual(worker._session_tool_for_path(str(work) + "-sibling"), "")
+                tool = lambda path: worker._session_tool_for_item({"repo_path": path})
+                self.assertEqual(tool(str(work)), "omp")
+                self.assertEqual(tool(str(work_repo)), "pi")
+                self.assertEqual(tool(str(work_repo / "app")), "pi")
+                self.assertEqual(tool(str(personal / "notes")), "freebuf")
+                self.assertEqual(tool(str(root / "elsewhere")), "")
+                self.assertEqual(tool(""), "")
+                self.assertEqual(tool(str(work) + "-sibling"), "")
                 with patch.object(worker, "session_agents", [{"path": os.sep, "tool": "omp"}]):
-                    self.assertEqual(
-                        worker._session_tool_for_path(str(work_repo)), "omp",
-                    )
+                    self.assertEqual(tool(str(work_repo)), "omp")
 
                 action = worker._new_session_action({
                     "title": "Fix regression", "repo_path": str(work_repo / "app"),
@@ -948,6 +1007,63 @@ class WorkerProtocolTests(unittest.TestCase):
                     "title": "Scratch follow-up", "repo_path": str(root / "elsewhere"),
                 })
                 self.assertNotIn("tool", unconfigured["params"])
+
+    def test_repository_agent_patterns_drive_session_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config" / "attention"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.json").write_text(json.dumps({
+                "plugins": [],
+                "session": {"agents": [
+                    {"repo": "athal7/attention", "tool": "omp"},
+                    {"repo": "athal7/*", "tool": "opencode"},
+                    {"path": str(root / "code"), "tool": "pi"},
+                ]},
+            }))
+            env = {
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(root / "state"),
+            }
+            with patch.dict(os.environ, env), \
+                 patch.object(worker, "ATTENTION_PATH", ROOT / "attention"):
+                worker.attention_items()
+
+                matched = worker._new_session_action({
+                    "_plugin": "github", "kind": "pull_request", "title": "Fix regression",
+                    "repo": "AthaL7/Attention", "repo_path": str(root / "code" / "attention"),
+                    "head_branch": "feature/pr-42", "base_branch": "main",
+                })
+                self.assertEqual(matched["params"]["tool"], "omp")
+
+                prefix = worker._new_session_action({
+                    "_plugin": "github", "kind": "issue", "title": "Issue",
+                    "repo": "athal7/other", "repo_path": "",
+                })
+                self.assertEqual(prefix["params"]["tool"], "opencode")
+
+                path_only = worker._new_session_action({
+                    "_plugin": "github", "kind": "issue", "title": "Issue",
+                    "repo": "someone/else", "repo_path": str(root / "code" / "clone"),
+                })
+                self.assertEqual(path_only["params"]["tool"], "pi")
+
+                unmatched = worker._new_session_action({
+                    "_plugin": "github", "kind": "issue", "title": "Issue",
+                    "repo": "someone/else", "repo_path": str(root / "elsewhere"),
+                })
+                self.assertNotIn("tool", unmatched["params"])
+
+                reminder = worker._new_session_action({
+                    "_plugin": "reminders", "kind": "reminder", "title": "Buy milk",
+                    "repo_path": "",
+                })
+                self.assertNotIn("tool", reminder["params"])
+
+                linear = worker._new_session_action({
+                    "_plugin": "linear", "kind": "issue", "title": "Fix bug",
+                })
+                self.assertNotIn("tool", linear["params"])
 
     def test_invalid_session_agent_configuration_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1468,6 +1584,37 @@ class AttentionActionDispatchTests(unittest.TestCase):
             action["wip"] = "clear"
             self.assertTrue(self.core.dispatch_item_action(action))
             unmark.assert_called_once_with("generic:item")
+
+    def test_worker_action_payload_exports_the_session_agent(self):
+        import contextlib
+        import io
+
+        sys.path.insert(0, str(ROOT / "sources"))
+        try:
+            loader = importlib.machinery.SourceFileLoader(
+                "attention_generic_session_test", str(ROOT / "sources" / "generic.py"),
+            )
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            plugin = importlib.util.module_from_spec(spec)
+            loader.exec_module(plugin)
+        finally:
+            sys.path.remove(str(ROOT / "sources"))
+
+        action = {
+            "_plugin": "generic", "key": "s",
+            "payload": {
+                "command": [
+                    sys.executable, "-c",
+                    "import os; print('tool=' + os.environ.get('AOE_TOOL', '<unset>'))",
+                ],
+                "session_tool": "omp",
+            },
+        }
+        output = io.StringIO()
+        with patch.object(self.core, "load_plugin", return_value=plugin), \
+             contextlib.redirect_stdout(output):
+            self.assertTrue(self.core.dispatch_item_action(action))
+        self.assertIn("tool=omp", output.getvalue())
 
     def test_terminal_act_keeps_its_row_key_contract(self):
         import base64

@@ -381,6 +381,7 @@ def fetch_plugin_items(name, config):
         for action in item.get("actions", []):
             action["_plugin"] = name
             action["_item_id"] = item.get("id")
+    apply_session_agent(fetched, config)
     return fetched
 
 
@@ -872,12 +873,27 @@ def _session_tool_name(tool):
     )
 
 
+def _contains_path(root, path):
+    """Whether path is root or a descendant of it, without prefix false positives."""
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return path == root or path.startswith(prefix)
+
+
+def _session_repo_pattern(repo):
+    """An owner/name repository or an owner/* prefix, as configured."""
+    if not isinstance(repo, str):
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in repo):
+        return False
+    return bool(re.fullmatch(r"[^\s*/]+/(?:[^\s*/]+|\*)", repo.strip()))
+
+
 def session_agents(config):
-    """Resolve which agent an AoE session should start per directory.
+    """Resolve which agent an AoE session should start per repository or directory.
 
     Returns (agents, error), where each agent is {"path": <absolute
-    directory>, "tool": <AoE agent name>}. Items outside every configured
-    directory keep AoE's default agent.
+    directory> | "repo": <owner>/<name> or <owner>/*, "tool": <AoE agent
+    name>}. Items matching no entry keep AoE's default agent.
     """
     session_config = config.get("session") if isinstance(config, dict) else None
     if session_config is None:
@@ -894,19 +910,102 @@ def session_agents(config):
 
     agents = []
     for index, raw_agent in enumerate(raw_agents, 1):
-        if not isinstance(raw_agent, dict) or set(raw_agent) != {"path", "tool"}:
-            return None, f"session.agents[{index}] must declare exactly path and tool"
-        path = raw_agent.get("path")
+        if not isinstance(raw_agent, dict) or set(raw_agent) not in (
+            {"path", "tool"}, {"repo", "tool"},
+        ):
+            return None, (
+                f"session.agents[{index}] must declare exactly path and tool, "
+                "or exactly repo and tool"
+            )
         tool = raw_agent.get("tool")
-        if not isinstance(path, str) or not path.strip():
-            return None, f"session.agents[{index}].path must be a non-empty string"
         if not _session_tool_name(tool):
             return None, f"session.agents[{index}].tool must be an agent name"
+        if "repo" in raw_agent:
+            repo = raw_agent.get("repo")
+            if not _session_repo_pattern(repo):
+                return None, (
+                    f"session.agents[{index}].repo must be an owner/repo or owner/* pattern"
+                )
+            agents.append({"repo": repo.strip().casefold(), "tool": tool})
+            continue
+        path = raw_agent.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return None, f"session.agents[{index}].path must be a non-empty string"
         agents.append({
             "path": os.path.realpath(os.path.expanduser(path.strip())),
             "tool": tool,
         })
     return agents, None
+
+
+def _item_project_path(item):
+    """The directory an item's AoE session would start in."""
+    if item.get("_plugin") == "github":
+        path = item.get("repo_project_path") or item.get("repo_path")
+    else:
+        path = item.get("repo_path")
+    return path.strip() if isinstance(path, str) else ""
+
+
+def session_agent_for_item(agents, item):
+    """The agent configured for an item, or "" to keep AoE's default agent.
+
+    A GitHub item resolves from its `repo` identity: an exact repository
+    match beats an owner wildcard. Directory matching is the fallback, and
+    the longest configured directory containing the item's project
+    directory wins.
+    """
+    if not isinstance(item, dict):
+        return ""
+    repo = item.get("repo")
+    if isinstance(repo, str):
+        identity = repo.strip().casefold()
+        owner, separator, name = identity.partition("/")
+        if separator and owner and name:
+            for agent in agents:
+                if agent.get("repo") == identity:
+                    return agent["tool"]
+            for agent in agents:
+                if agent.get("repo") == f"{owner}/*":
+                    return agent["tool"]
+    path = _item_project_path(item)
+    if not path:
+        return ""
+    resolved = os.path.realpath(os.path.expanduser(path))
+    directories = [
+        agent for agent in agents
+        if isinstance(agent.get("path"), str)
+        and _contains_path(agent["path"], resolved)
+    ]
+    if not directories:
+        return ""
+    return max(directories, key=lambda agent: len(agent["path"]))["tool"]
+
+
+def apply_session_agent(items, config):
+    """Stamp the agent resolved for each item onto its configured session
+    actions, so dispatching one can expose it as AOE_TOOL.
+
+    An invalid session.agents configuration attaches nothing: the AoE
+    worker fails the refresh rather than starting the wrong agent.
+    """
+    agents, error = session_agents(config)
+    if error:
+        return
+    for item in items:
+        tool = session_agent_for_item(agents, item)
+        if not tool:
+            continue
+        for action in item.get("actions", []):
+            payload = action.get("payload")
+            label = action.get("label")
+            if (
+                isinstance(label, str)
+                and label.strip().casefold() in {"session", "new session"}
+                and isinstance(payload, dict)
+                and "command" in payload
+            ):
+                payload["session_tool"] = tool
 
 
 def _tree_order(items):

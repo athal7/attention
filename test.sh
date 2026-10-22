@@ -4729,10 +4729,13 @@ $LOAD_CORE
 agents, error = m.session_agents({'session': {'agents': [
     {'path': '~/work', 'tool': 'omp'},
     {'path': '$XDG_CONFIG', 'tool': 'freebuf'},
+    {'repo': 'AthaL7/Attention', 'tool': 'pi'},
+    {'repo': 'athal7/*', 'tool': 'opencode'},
 ]}})
 print(error)
 print(','.join(agent['tool'] for agent in agents))
-print(all(agent['path'].startswith('/') for agent in agents))
+print(all(agent['path'].startswith('/') for agent in agents if 'path' in agent))
+print([agent['repo'] for agent in agents if 'repo' in agent])
 print(m.session_agents({}))
 print(m.session_agents({'session': {'agents': None}})[0])
 print(m.session_agents({'session': {'agents': 'omp'}})[1])
@@ -4741,31 +4744,207 @@ print(m.session_agents({'session': {'agents': [{'path': ' ', 'tool': 'omp'}]}})[
 print(m.session_agents({'session': {'agents': [{'path': '/repo', 'tool': 'omp pi'}]}})[1])
 print(m.session_agents({'session': {'agents': [{'path': '/repo', 'tool': 'omp', 'profile': 'qa'}]}})[1])
 print(m.session_agents({'session': {'paths': []}})[1])
+print(m.session_agents({'session': {'agents': [{'repo': 'athal7', 'tool': 'omp'}]}})[1])
+print(m.session_agents({'session': {'agents': [{'repo': 'athal7/re*', 'tool': 'omp'}]}})[1])
+print(m.session_agents({'session': {'agents': [{'repo': 'athal7/attention', 'path': '/repo', 'tool': 'omp'}]}})[1])
 ")"
   check "session agent configuration resolves to an agent name" \
     "$(sed -n 1p <<<"$out")" "None"
-  check "session agent configuration keeps each directory's tool" \
-    "$(sed -n 2p <<<"$out")" "omp,freebuf"
+  check "session agent configuration keeps each entry's tool" \
+    "$(sed -n 2p <<<"$out")" "omp,freebuf,pi,opencode"
   check "session agent directories are absolute" \
     "$(sed -n 3p <<<"$out")" "True"
+  check "session agent repositories are normalized case-insensitively" \
+    "$(sed -n 4p <<<"$out")" "['athal7/attention', 'athal7/*']"
   check "missing session configuration contributes no agents" \
-    "$(sed -n 4p <<<"$out")" "([], None)"
+    "$(sed -n 5p <<<"$out")" "([], None)"
   check "agentless session configuration contributes no agents" \
-    "$(sed -n 5p <<<"$out")" "[]"
+    "$(sed -n 6p <<<"$out")" "[]"
   check "a non-list agents value is rejected" \
-    "$(sed -n 6p <<<"$out")" "session.agents must be a list"
+    "$(sed -n 7p <<<"$out")" "session.agents must be a list"
   check "an agent name that looks like a flag is rejected" \
-    "$(sed -n 7p <<<"$out")" "session.agents[1].tool must be an agent name"
+    "$(sed -n 8p <<<"$out")" "session.agents[1].tool must be an agent name"
   check "a blank agent directory is rejected" \
-    "$(sed -n 8p <<<"$out")" "session.agents[1].path must be a non-empty string"
+    "$(sed -n 9p <<<"$out")" "session.agents[1].path must be a non-empty string"
   check "an agent name with whitespace is rejected" \
-    "$(sed -n 9p <<<"$out")" "session.agents[1].tool must be an agent name"
+    "$(sed -n 10p <<<"$out")" "session.agents[1].tool must be an agent name"
   check "unknown agent fields are rejected" \
-    "$(sed -n 10p <<<"$out")" "session.agents[1] must declare exactly path and tool"
+    "$(sed -n 11p <<<"$out")" \
+    "session.agents[1] must declare exactly path and tool, or exactly repo and tool"
   check "unknown session fields are rejected" \
-    "$(sed -n 11p <<<"$out")" "session has an unsupported field"
+    "$(sed -n 12p <<<"$out")" "session has an unsupported field"
+  check "a repository without an owner is rejected" \
+    "$(sed -n 13p <<<"$out")" \
+    "session.agents[1].repo must be an owner/repo or owner/* pattern"
+  check "a partial wildcard repository is rejected" \
+    "$(sed -n 14p <<<"$out")" \
+    "session.agents[1].repo must be an owner/repo or owner/* pattern"
+  check "an entry pairing a repository with a directory is rejected" \
+    "$(sed -n 15p <<<"$out")" \
+    "session.agents[1] must declare exactly path and tool, or exactly repo and tool"
 }
 test_session_agents_configuration
+
+test_session_agent_matching() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+raw_agents = [
+    {'repo': 'athal7/attention', 'tool': 'omp'},
+    {'repo': 'athal7/*', 'tool': 'opencode'},
+    {'path': '~/work', 'tool': 'pi'},
+    {'repo': 'othercorp/*', 'tool': 'freebuf'},
+]
+agents, error = m.session_agents({'session': {'agents': raw_agents}})
+print(m.session_agent_for_item(agents, {'_plugin': 'github', 'repo': 'ATHAL7/ATTENTION'}))
+print(m.session_agent_for_item(agents, {'_plugin': 'github', 'repo': 'athal7/other'}))
+print(m.session_agent_for_item(agents, {'_plugin': 'github', 'repo': 'someone/else', 'repo_path': '~/work/repo'}))
+print(repr(m.session_agent_for_item(agents, {'_plugin': 'github', 'repo': 'someone/else', 'repo_path': '/elsewhere'})))
+print(repr(m.session_agent_for_item(agents, {'_plugin': 'reminders', 'repo_path': ''})))
+print(repr(m.session_agent_for_item(agents, {'_plugin': 'linear'})))
+items = [{
+    '_plugin': 'github', 'repo': 'athal7/attention',
+    'actions': [
+        {'key': 's', 'label': 'session', 'payload': {'command': ['run']}},
+        {'key': 'S', 'label': 'New Session', 'payload': {'command': ['run']}},
+        {'key': 'l', 'label': 'lumen', 'payload': {'command': ['run']}},
+    ],
+}]
+m.apply_session_agent(items, {'session': {'agents': raw_agents}})
+actions = items[0]['actions']
+print(actions[0]['payload'].get('session_tool'))
+print(actions[1]['payload'].get('session_tool'))
+print('session_tool' in actions[2]['payload'])
+unmatched = [{'_plugin': 'reminders', 'repo_path': '', 'actions': [
+    {'key': 's', 'label': 'session', 'payload': {'command': ['run']}},
+]}]
+m.apply_session_agent(unmatched, {'session': {'agents': raw_agents}})
+print('session_tool' in unmatched[0]['actions'][0]['payload'])
+invalid = [{'_plugin': 'github', 'repo': 'athal7/attention', 'actions': [
+    {'key': 's', 'label': 'session', 'payload': {'command': ['run']}},
+]}]
+m.apply_session_agent(invalid, {'session': {'agents': [{'repo': 'nope', 'tool': 'omp'}]}})
+print('session_tool' in invalid[0]['actions'][0]['payload'])
+")"
+  check "an exact repository match wins case-insensitively" \
+    "$(sed -n 1p <<<"$out")" "omp"
+  check "an owner prefix matches repositories in that organization" \
+    "$(sed -n 2p <<<"$out")" "opencode"
+  check "directory matching is the fallback when no repository matches" \
+    "$(sed -n 3p <<<"$out")" "pi"
+  check "an item outside every entry keeps AoE's default agent" \
+    "$(sed -n 4p <<<"$out")" "''"
+  check "an item without a repository or project path stays unresolved" \
+    "$(sed -n 5p <<<"$out")" "''"
+  check "an item with neither field stays unresolved" \
+    "$(sed -n 6p <<<"$out")" "''"
+  check "a session action carries the item's resolved agent" \
+    "$(sed -n 7p <<<"$out")" "omp"
+  check "a New session action carries the item's resolved agent" \
+    "$(sed -n 8p <<<"$out")" "omp"
+  check "a non-session action carries no resolved agent" \
+    "$(sed -n 9p <<<"$out")" "False"
+  check "an unmatched item's session action carries no agent" \
+    "$(sed -n 10p <<<"$out")" "False"
+  check "an invalid session.agents configuration stamps no agent" \
+    "$(sed -n 11p <<<"$out")" "False"
+}
+test_session_agent_matching
+
+echo
+echo "== configured session actions receive AOE_TOOL =="
+
+SESSION_BIN="$WORK/bin-session-agent"
+mkdir -p "$SESSION_BIN"
+SESSION_LOG="$WORK/session-agent.log"; : > "$SESSION_LOG"
+
+cat > "$SESSION_BIN/aoe-scheduled-session" <<STUB
+#!/bin/sh
+printf 'tool=%s\n' "\${AOE_TOOL-<unset>}" >> "$SESSION_LOG"
+for arg in "\$@"; do printf 'arg=%s\n' "\$arg" >> "$SESSION_LOG"; done
+exit 0
+STUB
+chmod +x "$SESSION_BIN/aoe-scheduled-session"
+
+cat > "$SESSION_BIN/gh" <<STUB
+#!/bin/sh
+case "\$*" in
+  "search prs --review-requested=@me"*)
+    cat <<'JSON'
+[{"number": 42, "title": "AGENTTEST-session", "repository": {"name": "attention", "nameWithOwner": "athal7/attention"}, "url": "https://github.com/athal7/attention/pull/42"}]
+JSON
+    ;;
+  "api user --jq .login")
+    echo "agenttestuser"
+    ;;
+  *)
+    echo "[]"
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$SESSION_BIN/gh"
+
+write_config <<'JSON'
+{
+  "plugins": ["github"],
+  "codeDir": "/tmp/nonexistent-session-agent-code",
+  "github": {
+    "actions": [
+      {"key": "s", "label": "session", "background": true, "command": ["aoe-scheduled-session", "--tool", "{session_tool}"]},
+      {"key": "f", "label": "New session", "command": ["aoe-scheduled-session", "--tool", "{session_tool}"]}
+    ]
+  },
+  "session": {"agents": [{"repo": "athal7/*", "tool": "omp"}]}
+}
+JSON
+
+session_row() {
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$SESSION_BIN:$PATH" \
+    python3 "$ATTENTION" list | grep 'AGENTTEST-session'
+}
+
+ROW="$(session_row)"
+check "the matching GitHub item carries a session action" "$(grep -c 'AGENTTEST-session' <<<"$ROW")" "1"
+
+: > "$SESSION_LOG"
+HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$SESSION_BIN:$PATH" \
+  python3 "$ATTENTION" act "s" "$ROW" >/dev/null 2>&1
+sleep 0.3
+check "a background session action exports AOE_TOOL" \
+  "$(grep -c '^tool=omp$' "$SESSION_LOG")" "1"
+check "a background session action resolves the {session_tool} placeholder" \
+  "$(grep -c '^arg=omp$' "$SESSION_LOG")" "1"
+
+: > "$SESSION_LOG"
+HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$SESSION_BIN:$PATH" \
+  python3 "$ATTENTION" act "f" "$ROW" >/dev/null 2>&1
+check "a foreground session action exports AOE_TOOL" \
+  "$(grep -c '^tool=omp$' "$SESSION_LOG")" "1"
+check "a foreground session action resolves the {session_tool} placeholder" \
+  "$(grep -c '^arg=omp$' "$SESSION_LOG")" "1"
+
+write_config <<'JSON'
+{
+  "plugins": ["github"],
+  "codeDir": "/tmp/nonexistent-session-agent-code",
+  "github": {
+    "actions": [
+      {"key": "f", "label": "New session", "command": ["aoe-scheduled-session", "--tool", "{session_tool}"]}
+    ]
+  },
+  "session": {"agents": [{"repo": "othercorp/*", "tool": "omp"}]}
+}
+JSON
+
+ROW="$(session_row)"
+: > "$SESSION_LOG"
+HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$SESSION_BIN:$PATH" \
+  python3 "$ATTENTION" act "f" "$ROW" >/dev/null 2>&1
+check "an unmatched item leaves AOE_TOOL unset" \
+  "$(grep -c '^tool=<unset>$' "$SESSION_LOG")" "1"
+check "an unmatched item leaves the {session_tool} placeholder empty" \
+  "$(grep -c '^arg=$' "$SESSION_LOG")" "1"
 
 # ---------------------------------------------------------------------------
 echo
