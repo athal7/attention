@@ -36,7 +36,7 @@ _PR_DETAIL_FIELDS = (
 )
 _PR_GRAPHQL_SELECTION = """
 pullRequest(number: %d) {
-  author { login }
+  author { login __typename }
   state
   headRefOid
   mergeStateStatus
@@ -435,6 +435,8 @@ def _pr_indicators(detail, is_draft):
 def _apply_pr_detail(pr, detail):
     if detail is None:
         return
+    if detail.get("author"):
+        pr["author"] = detail["author"]
     pr["reviewRequested"] = bool(detail.get("reviewRequests"))
     pr["mergeReady"] = _merge_ready(detail)
     pr["headRefOid"] = detail.get("headRefOid") or ""
@@ -591,7 +593,7 @@ def _fetch_pr_attention(
 ):
     prs = _gh_json([
         "search", "prs", f"--author={author}", "--state=open", "--archived=false", "--limit", "50",
-        "--json", "number,title,body,repository,url,isDraft,createdAt",
+        "--json", "number,title,body,repository,url,isDraft,createdAt,author",
     ])
     if not prs:
         return []
@@ -660,7 +662,7 @@ def _fetch_notification_state(notifications):
             field = "pullRequest" if subject_type == "PullRequest" else "issue"
             query.append(
                 f"{alias}: {field}(number: {number}) {{ state "
-                + ("isDraft baseRefName headRefName author { login } " if subject_type == "PullRequest" else "")
+                + ("isDraft baseRefName headRefName author { login __typename } " if subject_type == "PullRequest" else "")
                 + "}"
             )
             target_aliases[(repo, subject_type, number)] = alias
@@ -751,6 +753,7 @@ def _notification_item(notification, subject_state=None, subject_info=None, curr
         item["baseRefName"] = (subject_state.get("base") or {}).get("ref", "")
         item["headRefName"] = (subject_state.get("head") or {}).get("ref", "")
         author = subject_state.get("author") or subject_state.get("user") or {}
+        item["author"] = author
         author_login = author.get("login") if isinstance(author, dict) else None
         item["_is_own_pr"] = (
             isinstance(current_login, str)
@@ -1360,6 +1363,18 @@ def _session_prompt(gtype, reasons):
     return "Review it."
 
 
+def _author_login(author):
+    if isinstance(author, dict):
+        login = author.get("login")
+        is_bot = author.get("__typename") == "Bot" or author.get("type") == "Bot" or author.get("is_bot") is True
+        if isinstance(login, str) and login and is_bot:
+            login = login.removeprefix("app/")
+            if not login.endswith("[bot]"):
+                login += "[bot]"
+        return login if isinstance(login, str) else ""
+    return author if isinstance(author, str) else ""
+
+
 def fetch(config):
     raw = _fetch_raw(config)
     if not raw:
@@ -1538,6 +1553,7 @@ def fetch(config):
             "weight": weight,
             "id": number,
             "kind": kind,
+            "author": _author_login(g.get("author")) if is_pull_request else "",
             "_is_own_pr": g.get("_is_own_pr") is True,
             "created_at": g.get("createdAt", ""),
             "absorb_note": f"{details}: {title}" if details else f"{status}: {title}",
