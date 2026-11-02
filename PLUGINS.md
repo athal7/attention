@@ -65,6 +65,7 @@ defaults shown below if omitted.
     "status_priority": 0,            # int, optional (default 0) -- on merge, higher wins the visible status, see below
     "indicators": {"ci": "✓"},       # dict[str, str], optional (default {}) -- shared dashboard table cells
     "kind": "issue",                 # str, optional (default "") -- dashboard type-group selector
+    "author": "octocat",             # str, optional (default "") -- exact author-login group selector
     "actions": [                     # list, optional (default [])
         {
             "key": "o",              # str, required -- one ASCII letter or digit; dashboard reserves lowercase q, j, and k
@@ -122,7 +123,10 @@ explicit columns prefers the shared `state` key. Missing keys display `—`.
 Every bundled source assigns a `kind`. The default dashboard groups pull
 requests, issues, reminders, and events by this value. Custom sources should
 set a stable kind such as `incident` or `deployment`. Group rules can match
-`kinds` in addition to `plugins`, `contexts`, `contextPrefixes`, and `statuses`.
+`kinds` in addition to `plugins`, `contexts`, `contextPrefixes`, `statuses`, and
+`authors`. The `authors` selector compares exact, case-sensitive item author
+logins. Sources should omit `author` when unavailable; GitHub PRs provide the
+actual login, with bot logins normalized to their `[bot]` form.
 
 Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,

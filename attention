@@ -240,6 +240,7 @@ class Item(ItemRequired, total=False):
     status_priority: int
     indicators: dict[str, str]
     kind: str
+    author: str
 
 
 def validate_and_normalize_item(item, name):
@@ -313,6 +314,11 @@ def validate_and_normalize_item(item, name):
         item["kind"] = ""
     elif not isinstance(item["kind"], str):
         raise ValueError(f"plugin '{name}' returned a malformed item: 'kind' must be of type str, got {type(item['kind']).__name__}")
+
+    if "author" not in item:
+        item["author"] = ""
+    elif not isinstance(item["author"], str):
+        raise ValueError(f"plugin '{name}' returned a malformed item: 'author' must be of type str, got {type(item['author']).__name__}")
 
     if "actions" not in item:
         item["actions"] = []
@@ -751,7 +757,7 @@ def _default_dashboard_groups():
 
 
 def _normalize_group_match(match, path, *, allow_any=False):
-    fields = ("plugins", "kinds", "contexts", "contextPrefixes", "statuses")
+    fields = ("plugins", "kinds", "contexts", "contextPrefixes", "statuses", "authors")
     supported_fields = fields + ("any",) if allow_any else fields
     if not isinstance(match, dict) or set(match) - set(supported_fields):
         return None, f"{path} must contain only {', '.join(supported_fields[:-1])}, or {supported_fields[-1]}"
@@ -840,6 +846,8 @@ def dashboard_groups(config):
 
 def _group_matches(item, match):
     context = item.get("context", "")
+    if "authors" in match and not item.get("author"):
+        return False
     if "contextPrefixes" in match and not any(
         context.startswith(prefix) for prefix in match["contextPrefixes"]
     ):
@@ -849,6 +857,7 @@ def _group_matches(item, match):
         "kinds": item.get("kind", ""),
         "contexts": context,
         "statuses": item.get("status", ""),
+        "authors": item.get("author", ""),
     }
     if not all(
         fields[key] in values
