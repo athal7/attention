@@ -4,11 +4,15 @@ version = "1.2.0"
 api_version = 16
 aoe_version = ">=1.20.0, <2.0.0"
 description = "Attention triage in session sidebars."
-capabilities = ["runtime.worker", "session.read", "process.spawn", "fs.read", "fs.write", "clipboard.write", "browser_open", "net"]
+capabilities = ["runtime.worker", "session.read", "process.spawn", "fs.read", "fs.write", "clipboard.write", "browser_open", "net", "composer.read"]
 
 [[ui]]
 slot = "pane"
 id = "attention"
+
+[[ui]]
+slot = "composer-action"
+id = "attention_input"
 
 
 [runtime]

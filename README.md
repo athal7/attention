@@ -254,10 +254,18 @@ not infer identity from titles or branch names.
 
 The **Refresh Attention** action sits at the bottom of the pane. Collector
 failures appear in a separate grouped section as named, sanitized notes;
-exception messages are never shown. Own-PR approvals remain hidden. Actions
-requiring interactive input report that they must be run from the CLI; the pane
-has no text-entry or choice-prompt surface. The full-pane dashboard has been
-removed; the AoE native pane is the only Attention web surface.
+exception messages are never shown. Own-PR approvals remain hidden. A
+collapsible **Filters** section toggles each source and dashboard group on or
+off per session, and **Clear filters** restores the full queue.
+
+An action that prompts for input keeps running instead of failing: the pane
+shows the prompt with one button per configured choice plus **Cancel action**.
+For free text, type the answer in the session composer and use **Answer
+prompt**, a composer action published only while a prompt is waiting (structured
+sessions have a composer; terminal sessions can answer choice prompts from the
+pane). The composer action disappears once the prompt is answered. The
+full-pane dashboard has been removed; the AoE native pane is the only Attention
+web surface.
 
 The generated **New session** action starts a normal terminal-mode AoE session
 from an item's project path, or a scratch session for non-GitHub items without

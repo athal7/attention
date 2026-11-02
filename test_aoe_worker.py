@@ -79,7 +79,14 @@ class SidebarPayloadTests(unittest.TestCase):
         }], [], token_actions)
         pane = worker._pane_payload(snapshot)
         self.assertEqual(pane["default_location"], "right")
-        queue = pane["blocks"][0]
+        self.assertEqual(
+            [block.get("title") for block in pane["blocks"]
+             if block.get("kind") == "section"],
+            ["Filters", "Work queue", "Item details", "Actions"],
+        )
+        titled = {block["title"]: block for block in pane["blocks"]
+                  if block.get("kind") == "section"}
+        queue = titled["Work queue"]
         self.assertEqual(queue["title"], "Work queue")
         self.assertTrue(queue["boxed"])
         self.assertTrue(queue["scroll"])
@@ -92,7 +99,7 @@ class SidebarPayloadTests(unittest.TestCase):
         self.assertEqual(first["href"], "https://github.com/acme/repo/pull/42")
         self.assertFalse(second["selected"])
 
-        callout = pane["blocks"][1]
+        callout = next(block for block in pane["blocks"] if block.get("kind") == "callout")
         self.assertEqual(callout["kind"], "callout")
         self.assertEqual(callout["title"], "Review PR")
         self.assertEqual(callout["detail"],
@@ -101,14 +108,14 @@ class SidebarPayloadTests(unittest.TestCase):
         self.assertEqual(callout["actions"][0]["href"],
                          "https://github.com/acme/repo/pull/42")
 
-        details = pane["blocks"][2]
+        details = titled["Item details"]
         self.assertEqual(details["title"], "Item details")
         detail_rows = {row["label"]: row["value"] for row in details["children"]}
         self.assertEqual(detail_rows["Status"], "Review needed")
         self.assertEqual(detail_rows["Source"], "GitHub")
         self.assertEqual(detail_rows["Context"], "acme/repo")
 
-        actions = pane["blocks"][3]
+        actions = titled["Actions"]
         self.assertEqual(actions["title"], "Actions")
         self.assertTrue(actions["collapsible"])
         self.assertTrue(actions["collapsed"])
@@ -381,6 +388,126 @@ class SidebarPayloadTests(unittest.TestCase):
                     setattr(worker, name, previous[name])
                 elif hasattr(worker, name):
                     delattr(worker, name)
+
+    def test_native_pane_filters_sources_per_session(self):
+        items = [
+            {"_plugin": "github", "title": "PR", "status": "Review needed"},
+            {"_plugin": "linear", "title": "Issue", "status": "Assigned"},
+        ]
+        snapshot = worker.attention_payload(items, [], {}, {("source", "github")})
+        self.assertEqual([card["title"] for card in snapshot["items"]], ["Issue"])
+        filters = {entry["value"]: entry for entry in snapshot["filters"]}
+        self.assertEqual(filters["github"], {
+            "kind": "source", "value": "github", "count": 1, "selected": False,
+        })
+        self.assertTrue(filters["linear"]["selected"])
+        pane = worker._pane_payload(snapshot)
+        section = next(block for block in pane["blocks"]
+                       if block.get("title") == "Filters")
+        self.assertTrue(section["boxed"])
+        self.assertTrue(section["collapsible"])
+        self.assertFalse(section["collapsed"])
+        self.assertEqual(section["badges"], [{"text": "1 hidden", "tone": "warn"}])
+        rows = {row["label"]: row for row in section["children"]}
+        self.assertEqual(rows["GitHub"]["params"], {"kind": "source", "value": "github"})
+        self.assertFalse(rows["GitHub"]["selected"])
+        self.assertTrue(rows["Linear"]["selected"])
+        self.assertEqual(rows["Clear filters"]["params"], {"clear": True})
+        unfiltered = worker._pane_payload(worker.attention_payload(items, []))
+        unfiltered_section = next(block for block in unfiltered["blocks"]
+                                  if block.get("title") == "Filters")
+        self.assertTrue(unfiltered_section["collapsed"])
+
+    def test_native_pane_renders_prompt_entry_for_choices_and_text(self):
+        snapshot = worker.attention_payload([{"_plugin": "github", "title": "PR"}], [])
+        pane = worker._pane_payload(snapshot, prompt={
+            "text": "Confirm action?", "choices": ["yes", "no"]})
+        callout = pane["blocks"][0]
+        self.assertEqual(callout["title"], "Input required")
+        self.assertEqual(callout["detail"], "Confirm action?")
+        self.assertEqual([action["label"] for action in callout["actions"]],
+                         ["yes", "no", "Cancel action"])
+        self.assertEqual(callout["actions"][0]["params"], {"value": "yes"})
+        self.assertEqual(callout["actions"][-1]["params"], {"cancel": True})
+        free = worker._pane_payload(snapshot, prompt={"text": "Review note"})
+        self.assertIn("composer", free["blocks"][1]["text"].casefold())
+
+    def test_attention_input_accepts_one_answer_for_the_waiting_action(self):
+        names = ("pending_prompt", "active_action", "prompt_answers", "live_session_ids")
+        missing = object()
+        previous = {name: getattr(worker, name, missing) for name in names}
+        worker.pending_prompt = {
+            "session_id": "s1", "token": "t1",
+            "prompt": {"text": "Confirm?", "choices": ["yes", "no"]},
+        }
+        worker.active_action = {"token": "t1", "action": {}, "session_id": "s1"}
+        worker.prompt_answers = queue.Queue()
+        worker.live_session_ids = {"s1"}
+        responses = []
+        try:
+            with patch.object(worker, "send", side_effect=responses.append):
+                worker.dispatch({
+                    "jsonrpc": "2.0", "id": 1, "method": "attention.input",
+                    "params": {"session_id": "s1", "value": "maybe"},
+                })
+                self.assertFalse(responses[-1]["result"]["ok"])
+                self.assertIsNotNone(worker.pending_prompt)
+                self.assertTrue(worker.prompt_answers.empty())
+                worker.dispatch({
+                    "jsonrpc": "2.0", "id": 2, "method": "attention.input",
+                    "params": {"session_id": "s1", "value": " yes "},
+                })
+                self.assertTrue(responses[-1]["result"]["ok"])
+                self.assertIsNone(worker.pending_prompt)
+                self.assertEqual(worker.prompt_answers.get_nowait(), "yes")
+                with self.assertRaises(queue.Empty):
+                    worker.prompt_answers.get_nowait()
+                worker.dispatch({
+                    "jsonrpc": "2.0", "id": 3, "method": "attention.input",
+                    "params": {"session_id": "s1", "value": "yes"},
+                })
+                self.assertFalse(responses[-1]["result"]["ok"])
+        finally:
+            for name, value in previous.items():
+                if value is missing:
+                    if hasattr(worker, name):
+                        delattr(worker, name)
+                else:
+                    setattr(worker, name, value)
+
+    def test_composer_action_tracks_the_pending_prompt(self):
+        names = ("pending_prompt", "composer_action_sessions")
+        missing = object()
+        previous = {name: getattr(worker, name, missing) for name in names}
+        worker.pending_prompt = {
+            "session_id": "s1", "token": "t1", "prompt": {"text": "Review note"},
+        }
+        worker.composer_action_sessions = {}
+        calls = []
+        try:
+            with patch.object(
+                    worker, "rpc",
+                    side_effect=lambda method, params: calls.append((method, params))):
+                worker._publish_composer_action({"s1"})
+                self.assertEqual(calls[0][0], "ui.state.set")
+                self.assertEqual(calls[0][1]["slot"], "composer-action")
+                self.assertEqual(calls[0][1]["payload"]["method"], "attention.input")
+                self.assertIn("Review note", calls[0][1]["payload"]["tooltip"])
+                calls.clear()
+                worker._publish_composer_action({"s1"})
+                self.assertEqual(calls, [])
+                worker.pending_prompt = None
+                worker._publish_composer_action({"s1"})
+                self.assertEqual(calls[0][0], "ui.state.remove")
+                self.assertEqual(calls[0][1]["slot"], "composer-action")
+        finally:
+            for name, value in previous.items():
+                if value is missing:
+                    if hasattr(worker, name):
+                        delattr(worker, name)
+                else:
+                    setattr(worker, name, value)
+
     def test_republished_pane_rejects_old_action_tokens_immediately(self):
         names = (
             "published_ids", "action_tokens", "action_token_sessions",
@@ -1668,15 +1795,17 @@ class AttentionActionDispatchTests(unittest.TestCase):
 
 
 class WorkerActionProtocolTests(unittest.TestCase):
-    def test_actions_are_session_scoped_and_prompt_actions_fail_in_sidebar(self):
+    def test_actions_are_session_scoped_and_prompt_actions_wait_for_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             attention = root / "attention"
             fetches = root / "fetches"
             dispatched = root / "dispatched.json"
+            answers = root / "answers.txt"
             attention.write_text(
                 "import json, sys\nfrom pathlib import Path\n"
                 f"FETCHES = Path({str(fetches)!r})\nDISPATCHED = Path({str(dispatched)!r})\n"
+                f"ANSWERS = Path({str(answers)!r})\n"
                 "def load_config(): return {}\n"
                 "def build_prioritized_items(config):\n"
                 "    count = int(FETCHES.read_text()) + 1 if FETCHES.exists() else 1\n"
@@ -1696,11 +1825,12 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 "    DISPATCHED.write_text(json.dumps(action))\n"
                 "    command = action['payload']['command'][-1]\n"
                 "    if command == 'prompt':\n"
-                "        print(json.dumps({'prompt': {'text':'Confirm action?'}}), flush=True)\n"
-                "        sys.stdin.readline()\n"
+                "        print(json.dumps({'prompt': {'text':'Confirm action?',"
+                " 'choices':['yes','no']}}), flush=True)\n"
+                "        ANSWERS.write_text(sys.stdin.readline())\n"
                 "    else:\n"
                 "        sys.stderr.write('source action output\\n')\n"
-                "        print(json.dumps({'ok': True}))\n"
+                "    print(json.dumps({'ok': True}))\n"
             )
             source = (ROOT / "aoe_worker.py").read_text().replace(
                 'ATTENTION_PATH = Path(__file__).resolve().with_name("attention")',
@@ -1745,18 +1875,31 @@ class WorkerActionProtocolTests(unittest.TestCase):
                         pending.extend(children)
                 raise AssertionError(f"no sidebar action named {label!r}")
 
+            composer_updates = []
+            composer_removals = set()
+
             def service(message):
-                if message.get("method") == "sessions.list":
+                method = message.get("method")
+                if method == "sessions.list":
                     reply(message, {"sessions": [
                         {"id": "s1", "project_path": "/repo"},
                         {"id": "s2", "project_path": "/other"},
                     ]})
                     return None
-                if message.get("method") == "ui.state.set":
+                if method == "ui.state.remove":
                     params = message["params"]
+                    if params.get("slot") == "composer-action":
+                        composer_removals.add(params.get("id"))
+                    reply(message)
+                    return None
+                if method == "ui.state.set":
+                    params = message["params"]
+                    reply(message)
+                    if params["slot"] == "composer-action":
+                        composer_updates.append(params)
+                        return None
                     self.assertEqual(params["slot"], "pane")
                     self.assertIn(params["session_id"], {"s1", "s2"})
-                    reply(message)
                     return params["session_id"], params["payload"]
                 return None
 
@@ -1856,12 +1999,48 @@ class WorkerActionProtocolTests(unittest.TestCase):
                 prompt = find_action(completed, "Prompt QA")
                 send_action("prompt", prompt["params"]["token"], "s1")
                 self.assertTrue(wait_response("prompt")["result"]["ok"])
-                failed = wait_pane(
+                pending = wait_pane(
                     lambda value: any(
-                        "requires interactive input" in block.get("text", "")
+                        block.get("title") == "Input required"
                         for block in value["blocks"] if isinstance(block, dict)
                     )
                 )
+                input_callout = next(
+                    block for block in pending["blocks"]
+                    if block.get("title") == "Input required"
+                )
+                self.assertEqual(
+                    [action["label"] for action in input_callout["actions"]],
+                    ["yes", "no", "Cancel action"],
+                )
+                self.assertEqual(input_callout["actions"][0]["params"], {"value": "yes"})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not composer_updates:
+                    service(receive(max(0.01, deadline - time.monotonic())))
+                self.assertTrue(composer_updates, "no composer action was published")
+                self.assertEqual(
+                    composer_updates[-1]["payload"]["method"],
+                    "attention.input",
+                )
+                proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": "answer-prompt",
+                    "method": "attention.input",
+                    "params": {"session_id": "s1", "value": "yes"},
+                }) + "\n")
+                proc.stdin.flush()
+                self.assertTrue(wait_response("answer-prompt")["result"]["ok"])
+                failed = wait_pane(
+                    lambda value: any(
+                        block.get("text", "").startswith("Completed: Prompt QA")
+                        for block in value["blocks"] if isinstance(block, dict)
+                    )
+                )
+                self.assertEqual(json.loads(answers.read_text()), {"value": "yes"})
+                deadline = time.monotonic() + 5
+                while (time.monotonic() < deadline
+                       and "attention_input" not in composer_removals):
+                    service(receive(max(0.01, deadline - time.monotonic())))
+                self.assertIn("attention_input", composer_removals)
                 self.assertNotEqual(
                     find_action(failed, "Prompt QA")["params"]["token"],
                     prompt["params"]["token"],

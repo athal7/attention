@@ -33,6 +33,10 @@ session_agents = []
 session_tool_resolver = None
 action_token_sessions = {}
 pane_refresh_requested = False
+hidden_item_filters = {}
+pending_prompt = None
+prompt_answers = queue.Queue()
+composer_action_sessions = {}
 
 
 def send(message):
@@ -463,13 +467,35 @@ def _item_key(item):
     return hashlib.sha256(encoded).hexdigest()[:20]
 
 
-def attention_payload(items, sessions, token_actions=None):
+def _item_filter_keys(item):
+    return (
+        ("source", _display_text(item.get("_plugin"), 100)),
+        ("group", _display_text(item.get("_attention_group", "Attention"), 120)),
+    )
+
+
+def attention_payload(items, sessions, token_actions=None, hidden_filters=()):
     token_actions = {} if token_actions is None else token_actions
+    hidden_filters = set(hidden_filters)
     items = _unowned_items(items, sessions)
+    counts = {}
+    for item in items:
+        if item.get("_collector_failure"):
+            continue
+        for key in _item_filter_keys(item):
+            if key[1]:
+                counts[key] = counts.get(key, 0) + 1
+    filters = [
+        {"kind": kind, "value": value, "count": count,
+         "selected": (kind, value) not in hidden_filters}
+        for (kind, value), count in sorted(counts.items())
+    ]
+    visible = [item for item in items
+               if not any(key in hidden_filters for key in _item_filter_keys(item))]
     cards = []
     titles = [_display_text(item.get("title"), 120) or "Follow-up"
-              for item in items if not item.get("_collector_failure")]
-    for item in _tree_order([item for item in items if not item.get("_collector_failure")]):
+              for item in visible if not item.get("_collector_failure")]
+    for item in _tree_order([item for item in visible if not item.get("_collector_failure")]):
         item_key = _item_key(item)
         actions = []
         for action in item.get("actions", []):
@@ -524,7 +550,7 @@ def attention_payload(items, sessions, token_actions=None):
     failures = [{"source": _display_text(item.get("context"), 100),
                  "error": _display_text(item.get("details"), 200)}
                 for item in items if item.get("_collector_failure")]
-    return {"items": cards, "failures": failures}
+    return {"items": cards, "failures": failures, "filters": filters}
 
 
 def _source_icon(source):
@@ -553,10 +579,77 @@ def _status_tone(status):
     return "neutral"
 
 
-def _pane_payload(snapshot, notice="", selected_key=None):
+def _prompt_blocks(prompt):
+    text = _display_text(prompt.get("text"), 200) or "Input required"
+    choices = [choice for choice in prompt.get("choices", []) if isinstance(choice, str)]
+    blocks = [{
+        "kind": "callout", "title": "Input required", "detail": text,
+        "icon": "message-square-quote", "tone": "warn",
+        "actions": [
+            {"kind": "action", "label": _display_text(choice, 80),
+             "method": "attention.input", "params": {"value": choice}}
+            for choice in choices
+        ] + [{
+            "kind": "action", "label": "Cancel action", "icon": "x",
+            "method": "attention.input", "params": {"cancel": True},
+            "variant": "secondary",
+        }],
+    }]
+    if not choices:
+        note = "Type the answer in the composer, then use Answer prompt."
+        default = _display_text(prompt.get("default"), 120)
+        if default:
+            note += f" Default: {default}"
+        blocks.append({"kind": "note", "text": note})
+    return blocks
+
+
+def _filter_section(filters):
+    rows = []
+    hidden_count = sum(1 for entry in filters if not entry["selected"])
+    for kind, prefix in (("source", "Source"), ("group", "Group")):
+        entries = sorted(
+            (entry for entry in filters if entry["kind"] == kind),
+            key=lambda entry: entry["value"].casefold(),
+        )
+        if len(entries) < 2:
+            continue
+        for entry in entries:
+            row = {
+                "kind": "row", "prefix": prefix,
+                "label": _source_label(entry["value"]) if kind == "source" else entry["value"],
+                "value": str(entry["count"]), "selected": entry["selected"],
+                "method": "attention.filter",
+                "params": {"kind": kind, "value": entry["value"]},
+            }
+            if kind == "source":
+                row["icon"] = _source_icon(entry["value"])
+            rows.append(row)
+    if not rows:
+        return None
+    section = {
+        "kind": "section", "title": "Filters", "icon": "filter",
+        "boxed": True, "collapsible": True, "collapsed": hidden_count == 0,
+        "children": rows,
+    }
+    if hidden_count:
+        section["badges"] = [{"text": f"{hidden_count} hidden", "tone": "warn"}]
+        section["children"] = rows + [{
+            "kind": "row", "label": "Clear filters", "icon": "x",
+            "method": "attention.filter", "params": {"clear": True},
+        }]
+    return section
+
+
+def _pane_payload(snapshot, notice="", selected_key=None, prompt=None):
     blocks = []
     if notice:
         blocks.append({"kind": "note", "text": _display_text(notice, 200)})
+    if prompt:
+        blocks.extend(_prompt_blocks(prompt))
+    filter_section = _filter_section(snapshot.get("filters", []))
+    if filter_section:
+        blocks.append(filter_section)
 
     cards = snapshot["items"]
     if cards:
@@ -655,6 +748,17 @@ def _pane_payload(snapshot, notice="", selected_key=None):
             "kind": "callout", "title": "Sources need attention",
             "detail": "No work items were loaded from these sources.",
             "icon": "triangle-alert", "tone": "warn",
+        })
+    elif any(not entry["selected"] for entry in snapshot.get("filters", [])):
+        blocks.append({
+            "kind": "callout", "title": "No items match the filters",
+            "detail": "Clear filters to see the work queue again.",
+            "icon": "filter-x", "tone": "warn",
+            "actions": [{
+                "kind": "action", "label": "Clear filters",
+                "method": "attention.filter", "params": {"clear": True},
+                "variant": "secondary",
+            }],
         })
     else:
         blocks.append({
@@ -773,7 +877,16 @@ def publish_payload(sessions, payload, only_new=False, items=()):
             continue
 
         session_tokens = {}
-        snapshot = attention_payload(items, sessions, session_tokens)
+        snapshot = attention_payload(
+            items, sessions, session_tokens, hidden_item_filters.get(session_id, ()))
+        available = {(entry["kind"], entry["value"]) for entry in snapshot["filters"]}
+        hidden = hidden_item_filters.get(session_id)
+        if hidden is not None:
+            remaining = hidden & available
+            if remaining:
+                hidden_item_filters[session_id] = remaining
+            else:
+                hidden_item_filters.pop(session_id, None)
         keys = {card["key"] for card in snapshot["items"]}
         selected_key = selected_item_keys.get(session_id)
         if selected_key not in keys:
@@ -782,7 +895,12 @@ def publish_payload(sessions, payload, only_new=False, items=()):
             selected_item_keys.pop(session_id, None)
         else:
             selected_item_keys[session_id] = selected_key
-        pane = _fit_pane(_pane_payload(snapshot, notice, selected_key))
+        prompt = (
+            pending_prompt.get("prompt")
+            if isinstance(pending_prompt, dict)
+            and pending_prompt.get("session_id") == session_id else None
+        )
+        pane = _fit_pane(_pane_payload(snapshot, notice, selected_key, prompt))
         for token in _pane_action_tokens(pane):
             if token in session_tokens:
                 next_action_tokens[token] = session_tokens[token]
@@ -797,6 +915,37 @@ def publish_payload(sessions, payload, only_new=False, items=()):
         rpc("ui.state.set", {
             "slot": "pane", "id": "attention", "session_id": session_id, "payload": pane,
         })
+    _publish_composer_action(live_ids)
+
+
+def _publish_composer_action(live_ids):
+    """Offer a composer button only while this session's action waits for input."""
+    global composer_action_sessions
+    wanted = {}
+    if isinstance(pending_prompt, dict) and pending_prompt.get("session_id") in live_ids:
+        wanted[pending_prompt["session_id"]] = pending_prompt
+    for session_id, pending in wanted.items():
+        marker = (pending["token"], pending["prompt"].get("text"))
+        if composer_action_sessions.get(session_id) == marker:
+            continue
+        text = _display_text(pending["prompt"].get("text"), 120)
+        rpc("ui.state.set", {
+            "slot": "composer-action", "id": "attention_input", "session_id": session_id,
+            "payload": {
+                "label": "Answer prompt", "method": "attention.input",
+                "icon": "message-square", "tone": "warn",
+                "tooltip": text or "Answer the waiting Attention action.",
+            },
+        })
+        composer_action_sessions[session_id] = marker
+    for session_id in list(composer_action_sessions):
+        if session_id not in wanted:
+            rpc("ui.state.remove", {
+                "slot": "composer-action", "id": "attention_input",
+                "session_id": session_id,
+            })
+            composer_action_sessions.pop(session_id, None)
+
 
 def fetch_snapshot(results):
     try:
@@ -834,8 +983,22 @@ def _read_action_output(output):
     ).strip()
 
 
-def execute_action(token, action, label, results):
+def _sanitize_prompt(prompt):
+    result = {"text": _display_text(prompt.get("text"), 200) or "Input required"}
+    choices = prompt.get("choices")
+    if isinstance(choices, list):
+        bounded = [str(choice)[:200] for choice in choices if isinstance(choice, str)][:20]
+        if bounded:
+            result["choices"] = bounded
+    default = prompt.get("default")
+    if isinstance(default, str):
+        result["default"] = default[:200]
+    return result
+
+
+def execute_action(token, action, label, results, session_id=None):
     """Run the CLI dispatcher, forwarding prompts without a second action implementation."""
+    global pending_prompt, pane_refresh_requested
     completed = False
     error = "Action failed."
     action_output = ""
@@ -849,7 +1012,6 @@ def execute_action(token, action, label, results):
                     process.stdin.write((json.dumps(action) + "\n").encode())
                     process.stdin.flush()
                     deadline = time.monotonic() + ACTION_TIMEOUT_SECONDS
-                    offset = 0
                     buffer = bytearray()
                     while True:
                         ready, _, _ = select.select([process.stdout.fileno()], [], [],
@@ -865,14 +1027,27 @@ def execute_action(token, action, label, results):
                             buffer[:] = remainder
                             response = json.loads(line)
                             if "prompt" in response:
-                                error = (
-                                    "This action requires interactive input; "
-                                    "run it from the CLI."
-                                )
-                                process.kill()
-                                process.wait()
-                                buffer.clear()
-                                break
+                                raw = response.get("prompt")
+                                pending_prompt = {
+                                    "session_id": session_id, "token": token,
+                                    "prompt": _sanitize_prompt(
+                                        raw if isinstance(raw, dict) else {}),
+                                }
+                                pane_refresh_requested = True
+                                deadline = max(
+                                    deadline, time.monotonic() + ACTION_TIMEOUT_SECONDS)
+                                try:
+                                    answer = prompt_answers.get(
+                                        timeout=max(0.0, deadline - time.monotonic()))
+                                except queue.Empty:
+                                    raise TimeoutError
+                                finally:
+                                    pending_prompt = None
+                                    pane_refresh_requested = True
+                                process.stdin.write(
+                                    (json.dumps({"value": answer}) + "\n").encode())
+                                process.stdin.flush()
+                                continue
                             if response.get("ok") is True:
                                 completed = True
                             else:
@@ -890,14 +1065,21 @@ def execute_action(token, action, label, results):
         error = "Action timed out waiting for input or completion."
     except Exception as exc:
         error = f"Action failed ({type(exc).__name__})."
+    finally:
+        if isinstance(pending_prompt, dict) and pending_prompt.get("token") == token:
+            pending_prompt = None
+            pane_refresh_requested = True
     results.put({
         "token": token, "label": label, "completed": completed,
         "error": error, "output": action_output,
     })
 
 
-def start_action(token, action, label, results):
-    threading.Thread(target=execute_action, args=(token, action, label, results), daemon=True).start()
+def start_action(token, action, label, results, session_id=None):
+    threading.Thread(
+        target=execute_action, args=(token, action, label, results, session_id),
+        daemon=True,
+    ).start()
 
 
 def _session_options_error(options):
@@ -1082,7 +1264,7 @@ def start_new_session(token, params, results):
 
 
 def dispatch(message):
-    global refresh_requested, active_action, pane_refresh_requested
+    global refresh_requested, active_action, pane_refresh_requested, pending_prompt
     method = message.get("method", "")
     request_id = message.get("id")
     params = message.get("params")
@@ -1104,6 +1286,26 @@ def dispatch(message):
     elif method == "attention.refresh":
         refresh_requested = True
         result = {"ok": True}
+    elif method == "attention.filter":
+        if not isinstance(session_id, str):
+            result = {"ok": False, "error": "Unknown session."}
+        elif params.get("clear") is True:
+            hidden_item_filters.pop(session_id, None)
+            pane_refresh_requested = True
+            result = {"ok": True}
+        else:
+            kind = params.get("kind")
+            value = params.get("value")
+            if (kind not in {"source", "group"} or not isinstance(value, str)
+                    or not value or len(value) > 120):
+                result = {"ok": False, "error": "Invalid filter."}
+            else:
+                hidden = hidden_item_filters.setdefault(session_id, set())
+                hidden.symmetric_difference_update({(kind, value)})
+                if not hidden:
+                    hidden_item_filters.pop(session_id, None)
+                pane_refresh_requested = True
+                result = {"ok": True}
     elif method == "attention.action":
         token = params.get("token")
         action = (
@@ -1153,6 +1355,28 @@ def dispatch(message):
                 }, "session_id": session_id}
                 action_requests.put(active_action)
                 result = {"ok": True}
+    elif method == "attention.input":
+        prompt = pending_prompt
+        if (not isinstance(prompt, dict) or prompt.get("session_id") != session_id
+                or not isinstance(active_action, dict)
+                or active_action.get("token") != prompt.get("token")):
+            result = {"ok": False, "error": "No action is waiting for input."}
+        elif params.get("cancel") is True:
+            pending_prompt = None
+            prompt_answers.put(None)
+            result = {"ok": True}
+        else:
+            composer = params.get("composer")
+            value = composer.get("text") if isinstance(composer, dict) else params.get("value")
+            choices = (prompt.get("prompt") or {}).get("choices")
+            if not isinstance(value, str) or len(value) > 2000:
+                result = {"ok": False, "error": "Invalid input."}
+            elif choices and value.strip() not in choices:
+                result = {"ok": False, "error": "Choose one of the listed options."}
+            else:
+                pending_prompt = None
+                prompt_answers.put(value.strip() if choices else value)
+                result = {"ok": True}
     else:
         result = {"ok": False, "error": f"Unsupported method: {method}"}
     if request_id is not None:
@@ -1162,7 +1386,8 @@ def main():
     global published_ids, refresh_requested, action_tokens, action_token_sessions
     global live_session_ids, action_requests, action_results, active_action
     global consumed_action_ids, consumed_session_item_ids, selected_item_keys
-    global pane_refresh_requested
+    global pane_refresh_requested, pending_prompt, hidden_item_filters
+    global composer_action_sessions
     published_ids = set()
     refresh_requested = False
     action_tokens = {}
@@ -1172,6 +1397,9 @@ def main():
     live_session_ids = set()
     selected_item_keys = {}
     pane_refresh_requested = False
+    pending_prompt = None
+    hidden_item_filters = {}
+    composer_action_sessions = {}
     action_requests = queue.Queue()
     action_results = queue.Queue()
     active_action = None
@@ -1222,7 +1450,10 @@ def main():
                 if request["action"].get("_aoe_operation") == "new_session":
                     start_new_session(request["token"], request["action"]["params"], action_results)
                 else:
-                    start_action(request["token"], request["action"], label, action_results)
+                    start_action(
+                        request["token"], request["action"], label, action_results,
+                        request["session_id"],
+                    )
                 action_in_flight = True
 
             try:
