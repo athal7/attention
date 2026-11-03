@@ -25,6 +25,7 @@ from _util import resolve_configured_actions, run_cmd, run_configured_action, sl
 
 _MAX_WORKERS = 8
 _MAX_PR_DETAIL_WORKERS = 32
+_PR_DETAIL_BATCH_SIZE = 10
 _NOTIFICATION_REASONS = {
     "mention", "team_mention", "author", "comment", "manual", "subscribed",
 }
@@ -214,13 +215,8 @@ def _normalize_pr_detail(detail):
 
 
 def _fetch_pr_details(prs):
-    """Fetch all candidate PR details in one GraphQL request.
-
-    GitHub CLI starts a new process for every `gh pr view` invocation. A
-    single aliased GraphQL query keeps the same detail fields while avoiding
-    that per-PR process and network overhead.
-    """
-    grouped = {}
+    """Fetch candidate details in bounded aliased GraphQL requests."""
+    entries = []
     for pr in prs:
         key = _pr_key(pr)
         if key is None:
@@ -229,40 +225,45 @@ def _fetch_pr_details(prs):
             number = int(pr["number"])
         except (TypeError, ValueError):
             continue
-        grouped.setdefault(pr["repository"]["nameWithOwner"], []).append((key, number))
-    if not grouped:
-        return {}
-
-    query = ["query {"]
-    for repo_index, (repo, entries) in enumerate(grouped.items()):
+        repo = pr["repository"]["nameWithOwner"]
         owner, _, name = repo.partition("/")
-        if not owner or not name:
-            continue
-        query.append(
-            f"r{repo_index}: repository(owner: {json.dumps(owner)}, "
-            f"name: {json.dumps(name)}) {{"
-        )
-        for entry_index, (key, number) in enumerate(entries):
-            alias = f"p{repo_index}_{entry_index}"
-            query.append(f"{alias}: {_PR_GRAPHQL_SELECTION % number}")
-        query.append("}")
-    query.append("}")
-    try:
-        result = _gh_json(["api", "graphql", "-f", "query=" + "".join(query)])
-    except Exception:
-        return {}
-    data = (result or {}).get("data") if isinstance(result, dict) else None
-    if not isinstance(data, dict):
-        return {}
+        if owner and name:
+            entries.append((repo, key, number))
 
     details = {}
-    for repo_index, (repo, entries) in enumerate(grouped.items()):
-        repository = data.get(f"r{repo_index}") or {}
-        for entry_index, (key, _number) in enumerate(entries):
-            raw = repository.get(f"p{repo_index}_{entry_index}")
-            detail = _normalize_pr_detail(raw)
-            if detail is not None:
-                details[key] = detail
+    for start in range(0, len(entries), _PR_DETAIL_BATCH_SIZE):
+        grouped = {}
+        for repo, key, number in entries[start:start + _PR_DETAIL_BATCH_SIZE]:
+            grouped.setdefault(repo, []).append((key, number))
+
+        query = ["query {"]
+        for repo_index, (repo, repo_entries) in enumerate(grouped.items()):
+            owner, _, name = repo.partition("/")
+            query.append(
+                f"r{repo_index}: repository(owner: {json.dumps(owner)}, "
+                f"name: {json.dumps(name)}) {{"
+            )
+            for entry_index, (_key, number) in enumerate(repo_entries):
+                query.append(f"p{repo_index}_{entry_index}: {_PR_GRAPHQL_SELECTION % number}")
+            query.append("}")
+        query.append("}")
+        try:
+            result = _gh_json(["api", "graphql", "-f", "query=" + "".join(query)])
+        except Exception:
+            continue
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            continue
+
+        for repo_index, (_repo, repo_entries) in enumerate(grouped.items()):
+            repository = data.get(f"r{repo_index}")
+            if not isinstance(repository, dict):
+                continue
+            for entry_index, (key, _number) in enumerate(repo_entries):
+                raw = repository.get(f"p{repo_index}_{entry_index}")
+                detail = _normalize_pr_detail(raw)
+                if detail is not None:
+                    details[key] = detail
     return details
 
 
@@ -1130,8 +1131,12 @@ def _review_handled_by_other(detail, current_login):
             isinstance(login, str)
             and login
             and login.casefold() != excluded
+            and (author.get("__typename") == "User"
+                 or author.get("type") == "User"
+                 or author.get("is_bot") is False)
             and author.get("__typename") != "Bot"
-            and not author.get("is_bot")
+            and author.get("type") != "Bot"
+            and author.get("is_bot") is not True
             and not login.casefold().endswith("[bot]")
         ):
             return True

@@ -167,9 +167,11 @@ icons. GitHub pull requests also provide optional `ci`, `draft`,
   mentions and comments on your work are included. Passive subscription state
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
-  Review requests are omitted when another person has submitted a review or
-  is assigned to the PR; bots, pending and dismissed reviews, and your own
-  assignment do not count.
+  Review requests are omitted when another confirmed person has submitted a
+  review or another user is assigned to the PR; bots, pending and dismissed
+  reviews, and your own assignment do not count. A review whose author type is
+  unknown does not hide a request, including when the detail fallback lacks
+  bot metadata. PR details are fetched in bounded batches with per-PR fallback.
   Merge ready requires an open, non-draft PR with approved review, a clean
   merge state, a known mergeable result, and complete successful CI checks.
   It ranks above NOTIFIED. Unknown, incomplete, pending, or failing state is

@@ -4957,6 +4957,7 @@ echo "== Agent of Empires pane worker =="
 python3 -m unittest -v "$REPO_ROOT/test_aoe_worker.py"
 python3 -m unittest -v "$REPO_ROOT/test_source_fetch_timeouts.py"
 python3 -m unittest -v "$REPO_ROOT/test_author_grouping.py"
+python3 -m unittest -v "$REPO_ROOT/test_github_reviews.py"
 
 echo "== summary: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]
