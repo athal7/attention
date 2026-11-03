@@ -257,6 +257,7 @@ def resolve_configured_actions(configured_actions, record):
             "label": a.get("label", ""),
             "primary": a.get("primary", False),
             "wip": a.get("wip", False),
+            "read": a.get("read", False),
             "payload": payload,
         })
     return actions

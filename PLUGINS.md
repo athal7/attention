@@ -72,6 +72,7 @@ defaults shown below if omitted.
             "label": "open",         # str, required -- short verb, shown in the footer hint
             "primary": True,         # bool, optional (default False) -- at most one per item, what plain Enter runs
             "wip": True,             # true marks, "clear" unmarks after completion; optional (default False)
+            "read": True,            # bool, optional (default False) -- read-only action: running it leaves the item in place instead of deprioritizing it
             "payload": {...},        # dict, optional (default {}) -- anything JSON-serializable; yours, passed back to act()
         },
         ...
@@ -130,7 +131,9 @@ actual login, with bot logins normalized to their `[bot]` form.
 
 Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
-and any other printable character is added to the filter query.
+and any other printable character is added to the filter query. After a
+write action the acted-on item drops down the list; after a `"read": true`
+action it stays put, so it can be acted on again immediately.
 
 ### Cross-link merging
 

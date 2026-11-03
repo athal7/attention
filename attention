@@ -352,6 +352,11 @@ def validate_and_normalize_item(item, name):
         elif action["wip"] is not True and action["wip"] is not False and action["wip"] != "clear":
             raise ValueError(f"plugin '{name}' returned a malformed item: action 'wip' must be true, false, or \"clear\", got {action['wip']!r}")
 
+        if "read" not in action:
+            action["read"] = False
+        elif not isinstance(action["read"], bool):
+            raise ValueError(f"plugin '{name}' returned a malformed item: action 'read' must be of type bool, got {type(action['read']).__name__}")
+
         if "payload" not in action:
             action["payload"] = {}
         elif not isinstance(action["payload"], dict):

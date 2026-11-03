@@ -1505,7 +1505,7 @@ def fetch(config):
          }
 
         actions = [
-            {"key": "o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "o", "label": "open", "primary": True, "read": True, "payload": {"kind": "open", "url": url}},
             {"key": "a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
             {"key": "c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
             {"key": "g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},

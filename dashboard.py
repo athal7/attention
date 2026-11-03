@@ -155,7 +155,10 @@ class DashboardController:
                 if completed is not False and action:
                     self._invalidate_plugin(action.get("_plugin"))
                 self._acknowledge_action()
-                self._deprioritize(item_id)
+                if action and not action.get("read"):
+                    # Read-only actions (open, yank) leave the item in place
+                    # so it can be acted on again straight away.
+                    self._deprioritize(item_id)
                 self._relaunch_presenter()
         finally:
             with self._presenter_lock:

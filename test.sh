@@ -3912,6 +3912,52 @@ print(events)
 }
 test_manual_refresh_and_accept_relaunch_presenter_without_duplicate_fetches
 
+test_read_actions_leave_the_item_in_place() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [
+             {'key': 'o', 'label': 'open', 'primary': True, 'read': True, '_item_id': 'a'},
+             {'key': 's', 'label': 'session', '_item_id': 'a'},
+         ]},
+        {'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'},
+    ],
+}
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=lambda key, row: None,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+row_for_a = presenter.push_calls()[-1][1][0]
+presenter.send_result('o', row_for_a)
+presenter.wait_for_push_count(3, timeout=5)
+after_open = [r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]]
+row_for_a = presenter.push_calls()[-1][1][0]
+presenter.send_result('s', row_for_a)
+presenter.wait_for_push_count(4, timeout=5)
+after_session = [r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]]
+presenter.send_result('', '')
+th.join(timeout=5)
+print(after_open)
+print(after_session)
+")"
+  check "running a read action ('open') leaves the item where it was in the very next snapshot" \
+    "$(sed -n 1p <<<"$out")" "['A', 'B']"
+  check "running a write action ('session') still moves the item below the others" \
+    "$(sed -n 2p <<<"$out")" "['B', 'A']"
+}
+test_read_actions_leave_the_item_in_place
+
 test_terminal_action_relaunches_existing_list_before_refresh() {
   local out
   out="$(python3 -c "

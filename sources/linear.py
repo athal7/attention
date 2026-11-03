@@ -140,7 +140,7 @@ query AssignedIssues($after: String) {
         }
 
         actions = [
-            {"key": "o", "label": "open", "primary": True, "payload": {"kind": "open", "url": url}},
+            {"key": "o", "label": "open", "primary": True, "read": True, "payload": {"kind": "open", "url": url}},
             {"key": "c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
             {"key": "t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
         ]
