@@ -165,6 +165,10 @@ class SidebarPayloadTests(unittest.TestCase):
             {card["title"] for card in snapshot["items"]},
             {"Unrelated", "Stopped", "Shared branch without identity facet"},
         )
+        self.assertEqual(
+            {card["session_exists"] for card in snapshot["items"]},
+            {True, False},
+        )
 
     def test_absorbed_linear_issue_identity_suppresses_its_github_host(self):
         loader = importlib.machinery.SourceFileLoader(

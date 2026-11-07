@@ -1325,6 +1325,12 @@ def get_repo_from_url(url):
     return m.group(1) if m else ""
 
 
+def _display_context(repo_name):
+    # UI context: show only the repo name (drop the org prefix), so the
+    # row reads as 'kb' rather than 'myorg/kb'.
+    return repo_name.split("/", 1)[-1]
+
+
 def _session_prompt(gtype, reasons):
     """State-aware default message for a work session dispatched from an
     item. The action depends on both whose work it is and why it needs
@@ -1497,7 +1503,7 @@ def fetch(config):
             "slug": slug,
             "repo_project_path": repo_project_path,
             "repo": repo_name,
-            "context": repo_name,
+            "context": _display_context(repo_name),
             "title": title,
             "status": status,
             "details": details,
@@ -1551,7 +1557,6 @@ def fetch(config):
 
         items.append({
             "status": status,
-            "context": repo_name,
             "title": title,
             "details": details,
             "indicators": indicators or {},
@@ -1576,6 +1581,7 @@ def fetch(config):
                 if reference.get("number") is not None
             ] + _body_association_keys(g.get("body", "")),
             "actions": actions,
+            "context": _display_context(repo_name),
         })
     branch_owners = {
         (item["context"].casefold(), item["head_branch"]): item["identity_key"]

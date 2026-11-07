@@ -534,7 +534,11 @@ def attention_payload(items, sessions, token_actions=None, hidden_filters=()):
         matches = _matching_sessions(item, sessions, allow_title=titles.count(title) == 1)
         cards.append({
             "key": item_key,
-            "prefix": _display_text(item.get("_tree_prefix") or item.get("id"), 48),
+            "prefix": (
+                item.get("_tree_prefix")
+                or (item.get("group_icon") or item.get("icon"))
+                or _display_text(item.get("id"), 48)
+            ),
             "title": title, "url": _safe_source_url(item.get("url")),
             "status": _display_text(item.get("status"), 100),
             "context": _display_text(item.get("context"), 160),
@@ -546,6 +550,8 @@ def attention_payload(items, sessions, token_actions=None, hidden_filters=()):
             "actions": actions,
             "session": ({"id": matches[0]["id"], "title": _display_text(
                 matches[0].get("title"), 120) or matches[0]["id"]} if matches else None),
+            "session_exists": bool(matches),
+            "icons": _state_icons([item.get("status") for item in cards if item.get("status")]),
         })
     failures = [{"source": _display_text(item.get("context"), 100),
                  "error": _display_text(item.get("details"), 200)}
@@ -553,11 +559,38 @@ def attention_payload(items, sessions, token_actions=None, hidden_filters=()):
     return {"items": cards, "failures": failures, "filters": filters}
 
 
+STATE_GLYPHS = {
+    "assigned": "check",
+    "open": "circle",
+    "review": "eye",
+    "blocked": "x",
+    "overdue": "clock",
+    "fail": "triangle-alert",
+    "error": "triangle-alert",
+    "completed": "check",
+    "success": "check",
+    "waiting": "clock",
+    "due": "calendar",
+}
+
+
+def _state_icons(statuses):
+    icons = []
+    for status in statuses:
+        if not isinstance(status, str):
+            continue
+        icon = STATE_GLYPHS.get(status.casefold(), "circle")
+        if icon not in icons:
+            icons.append(icon)
+    return icons if icons else ["circle"]
+
+
 def _source_icon(source):
     return {
-        "github": "git-branch", "linear": "circle", "calendar": "calendar",
-        "reminders": "check-square", "generic": "inbox",
-    }.get((source or "").casefold(), "inbox")
+        "github": "github", "github-pr": "github-pr", "github-issue": "github-issue",
+        "linear": "linear", "linear-issue": "linear-issue",
+        "calendar": "calendar", "reminders": "reminders", "generic": "generic",
+    }.get((source or "").casefold(), "source")
 
 
 def _source_label(source):
@@ -655,10 +688,17 @@ def _pane_payload(snapshot, notice="", selected_key=None, prompt=None):
     if cards:
         selected = next((card for card in cards if card["key"] == selected_key), cards[0])
         rows = []
+        sources = set()
+        all_statuses = []
+        for card in cards:
+            if card.get("status"):
+                all_statuses.append(card["status"])
+        combined_icons = _state_icons(all_statuses)
         for card in cards:
             row = {
                 "kind": "row", "label": card["title"],
-                "icon": _source_icon(card["source"]),
+                "icon": card.get("source_icon", _source_icon(card["source"])),
+                "icons": combined_icons,
                 "method": "attention.select_item",
                 "params": {"item_key": card["key"]},
                 "selected": card["key"] == selected["key"],
