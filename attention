@@ -603,6 +603,25 @@ _INDICATOR_LABELS = {
     "state": "Status",
     "due": "Due",
 }
+
+_INDICATOR_GLYPHS = {
+    "ready": "✓", "passed": "✓", "approved": "✓", "completed": "✓",
+    "success": "✓", "yes": "●", "draft": "●",
+    "failed": "✗", "ci failing": "✗", "blocked": "✗", "conflict": "✗",
+    "changes": "✗", "changes requested": "✗", "overdue": "✗",
+    "review requested": "◉", "requested": "◉", "review": "◉",
+    "waiting": "◷", "today": "◷", "due": "◷", "soon": "◷",
+    "open": "○", "in progress": "●", "assigned": "●",
+}
+
+
+def _display_indicator(key, value):
+    if key not in {"state", "ci", "draft", "review", "merge", "due"} or value == "—":
+        return value
+    glyph = _INDICATOR_GLYPHS.get(value.casefold())
+    if glyph is None and key == "state":
+        glyph = "○"
+    return f"{glyph} {value}" if glyph else value
 _INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
 
 
@@ -633,7 +652,7 @@ def _indicator_specs(items, columns):
                 max(
                     len(_INDICATOR_LABELS.get(key, key.replace("_", " ").title())),
                     max(
-                        (len(item.get("indicators", {}).get(key, "—")) for item in items),
+                        (len(_display_indicator(key, item.get("indicators", {}).get(key, "—"))) for item in items),
                         default=0,
                     ),
                 ),
@@ -727,7 +746,7 @@ def render_dashboard_rows(items, columns=None):
         if indicator_specs:
             indicators = item.get("indicators", {})
             indicator_cells = "  ".join(
-                f"{_clip(indicators.get(key, '—'), cell_width):<{cell_width}}"
+                f"{_clip(_display_indicator(key, indicators.get(key, '—')), cell_width):<{cell_width}}"
                 for key, _, cell_width in indicator_specs
             )
             visible = f"{visible}  {indicator_cells}"
@@ -1225,71 +1244,6 @@ def act(key, line):
         return False
 
 
-def worker_action_cli(interactive=False):
-    """Internal JSON bridge; interactive callers answer one prompt at a time."""
-    import builtins
-
-    channel = sys.stdout
-    original_input = builtins.input
-
-    def emit(message):
-        channel.write(json.dumps(message, separators=(",", ":")) + "\n")
-        channel.flush()
-
-    def request_input(prompt):
-        sys.stderr.flush()
-        emit({"prompt": prompt})
-        line = sys.stdin.readline()
-        answer = json.loads(line) if line else None
-        if not isinstance(answer, dict) or "value" not in answer:
-            raise EOFError
-        value = answer["value"]
-        if value is None or not isinstance(value, str):
-            raise EOFError
-        return value
-
-    class InteractiveInput:
-        def __call__(self, text=""):
-            return request_input(str(text))
-
-        def prompt_spec(self, spec):
-            prompt = {"text": str(spec.get("prompt") or "Input")}
-            choices = spec.get("choices")
-            if isinstance(choices, list) and choices:
-                prompt["choices"] = [str(choice) for choice in choices]
-            default = spec.get("default")
-            if default is not None:
-                prompt["default"] = str(default)
-            value = request_input(prompt)
-            if choices:
-                if value not in prompt["choices"]:
-                    raise ValueError("Invalid choice.")
-                return value
-            value = value.strip()
-            if value:
-                return value
-            if default is not None:
-                return str(default)
-            raise EOFError
-
-    try:
-        action = json.loads(sys.stdin.readline()) if interactive else json.load(sys.stdin)
-        sys.stdout = sys.stderr
-        if interactive:
-            builtins.input = InteractiveInput()
-        completed = dispatch_item_action(action)
-        result = {"ok": completed}
-        if not completed:
-            result["error"] = "Action did not complete."
-    except (KeyboardInterrupt, EOFError):
-        result = {"ok": False, "error": "Action canceled."}
-    except Exception as exc:
-        result = {"ok": False, "error": str(exc)[:400]}
-    finally:
-        builtins.input = original_input
-        sys.stdout = channel
-    emit(result)
-    return 0 if result["ok"] else 1
 
 def acknowledge_action():
     try:
@@ -1322,7 +1276,7 @@ def run_dashboard():
         render_rows = lambda items: render_grouped_dashboard_rows(items, groups)
     else:
         presenter = dashboard.CursesPresenter()
-        render_rows = render_dashboard_rows
+        render_rows = lambda items: render_dashboard_rows(_tree_order(items))
 
     controller = dashboard.DashboardController(
         plugin_names, presenter,
@@ -1342,11 +1296,7 @@ def run_dashboard():
         print("Nothing needs attention right now.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "__worker_action__":
-        sys.exit(worker_action_cli())
-    elif len(sys.argv) > 1 and sys.argv[1] == "__worker_action_interactive__":
-        sys.exit(worker_action_cli(interactive=True))
-    elif len(sys.argv) > 3 and sys.argv[1] == "act":
+    if len(sys.argv) > 3 and sys.argv[1] == "act":
         act(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 1 and sys.argv[1] == "expect-keys":
         print(",".join(expect_keys_for(build_prioritized_items(load_config()))))

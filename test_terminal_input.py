@@ -127,6 +127,46 @@ class TerminalInputTests(unittest.TestCase):
         os.write(self.master, b"o")
         self.wait_for(b"PICKED alpha-1")
 
+    def test_dashboard_renders_stacked_rows_with_individual_glyphs(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        config_dir = root / "attention"
+        config_dir.mkdir()
+        plugin = root / "fixture.py"
+        plugin.write_text(
+            "def fetch(config):\n"
+            "    return [\n"
+            "        {'id':'2','identity_key':'pr:2','parent_identity_key':'pr:1',"
+            "'title':'Child','context':'repo','status':'Blocked','details':'','kind':'pull_request',"
+            "'indicators':{'state':'Blocked'},'weight':2},\n"
+            "        {'id':'1','identity_key':'pr:1','title':'Parent','context':'repo',"
+            "'status':'Ready','details':'','kind':'pull_request','indicators':{'state':'Ready'},'weight':1},\n"
+            "    ]\n"
+        )
+        (config_dir / "config.json").write_text(json.dumps({"plugins": [str(plugin)]}))
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color", XDG_CONFIG_HOME=tmp.name,
+                   XDG_STATE_HOME=tmp.name, XDG_CACHE_HOME=tmp.name,
+                   PYTHONDONTWRITEBYTECODE="1")
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(ROOT / "attention")],
+                stdin=slave, stdout=slave, stderr=slave, env=env,
+            )
+        finally:
+            os.close(slave)
+        self.master = master
+        self.transcript = b""
+        self.addCleanup(self.stop_process)
+        self.wait_for(b"Pull Requests (2)")
+        self.send(b"\r")
+        self.wait_for("└─ Child".encode())
+        self.wait_for("✓ Ready".encode())
+        self.wait_for("✗ Blocked".encode())
+
 
 
 if __name__ == "__main__":

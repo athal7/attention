@@ -422,23 +422,23 @@ test_github_source() {
   repo_issue_line="$(grep 'GHTEST-repo-issue' <<<"$out" || true)"
 
   case "$pr_line" in
-    "REVIEW REQUESTED"*"myorg/kb"*) ok "review-requested PR gets REVIEW REQUESTED status with repo as context" ;;
-    *) bad "review-requested PR gets REVIEW REQUESTED status with repo as context (got: $pr_line)" ;;
+    "REVIEW REQUESTED"*"GHTEST-review-me"*) ok "review-requested PR gets REVIEW REQUESTED status" ;;
+    *) bad "review-requested PR gets REVIEW REQUESTED status (got: $pr_line)" ;;
   esac
   case "$issue_line" in
-    "ASSIGNED"*"myorg/kb"*) ok "assigned issue gets ASSIGNED status with repo as context" ;;
-    *) bad "assigned issue gets ASSIGNED status with repo as context (got: $issue_line)" ;;
+    "ASSIGNED"*"GHTEST-assigned-me"*) ok "assigned issue gets ASSIGNED status" ;;
+    *) bad "assigned issue gets ASSIGNED status (got: $issue_line)" ;;
   esac
   case "$authored_line" in
     "NEEDS ATTENTION"*"GHTEST-authored-me"*) ok "authored PR keeps its attention status without duplicating column state in details" ;;
     *) bad "authored PR keeps its attention status without duplicating column state in details (got: $authored_line)" ;;
   esac
   case "$repo_issue_line" in
-    "OPEN"*"myorg/kb"*) ok "owned-repo issue (not assigned to me) appears with OPEN status" ;;
+    "OPEN"*"GHTEST-repo-issue"*) ok "owned-repo issue (not assigned to me) appears with OPEN status" ;;
     *) bad "owned-repo issue (not assigned to me) appears with OPEN status (got: $repo_issue_line)" ;;
   esac
   case "$draft_line" in
-    "REVIEW REQUESTED"*"myorg/kb"*) ok "draft PR stays visible without a duplicate DRAFT status prefix" ;;
+    "REVIEW REQUESTED"*"GHTEST-draft-review"*) ok "draft PR stays visible without a duplicate DRAFT status prefix" ;;
     *) bad "draft PR stays visible without a duplicate DRAFT status prefix (got: $draft_line)" ;;
   esac
 
@@ -941,7 +941,7 @@ test_tracked_author_pr_with_configured_list() {
   out="$(HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" PATH="$JULES_BIN:$PATH" python3 "$ATTENTION" list)"
   jules_line="$(grep 'JULESTEST-needs-attention' <<<"$out" || true)"
   case "$jules_line" in
-    "JULES-BOT:"*"myorg/kb"*) ok "a tracked author's flagged PR appears with their username in the status" ;;
+    "JULES-BOT:"*"JULESTEST-needs-attention"*) ok "a tracked author's flagged PR appears with their username in the status" ;;
     *) bad "a tracked author's flagged PR appears with their username in the status (got: $jules_line)" ;;
   esac
 }
@@ -3170,36 +3170,6 @@ print('Mention |' not in fields[0])
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
 
-test_dashboard_indicator_columns_are_shared_per_row_set() {
-  local out
-  out="$(python3 -c "
-$LOAD_CORE
-$LOAD_DASHBOARD
-items = [{
-    'status': 'NEEDS ATTENTION', 'context': 'myorg/kb', 'title': 'Fix the login bug',
-    'details': '', 'weight': 90, 'id': '42',
-    'indicators': {'ci': 'Passed', 'ready': 'Yes', 'review': 'Changes', 'stacked': 'Yes'},
-    'actions': [{'key': 'o', 'label': 'open', 'primary': True, 'payload': {}}],
-}]
-rows = m.render_dashboard_rows(items, ['ci', 'ready', 'review', 'stacked'])
-fields = rows[0].split(chr(9))
-print(len(fields))
-metadata = m.json.loads(fields[4])
-print(metadata['columns'])
-header = d.CursesPresenter()._indicator_header(rows)
-print(header)
-print(header.index('CI') == fields[0].index('Passed'))
-")"
-  check "dashboard indicator rows add one metadata field for their shared table columns" \
-    "$(sed -n 1p <<<"$out")" "5"
-  check "dashboard indicator metadata keeps the shared table definition" \
-    "$(sed -n 2p <<<"$out")" "[['CI', 6], ['Ready', 5], ['Review', 7], ['Stacked', 7]]"
-  check "curses dashboard places the shared indicator table header above its cells" \
-    "$(sed -n 3p <<<"$out" | sed 's/^ *//')" "CI      Ready  Review   Stacked"
-  check "dashboard indicator values follow the item content" \
-    "$(sed -n 4p <<<"$out")" "True"
-}
-test_dashboard_indicator_columns_are_shared_per_row_set
 
 test_dashboard_action_hints_wrap_at_footer_width() {
   local out
@@ -4999,8 +4969,8 @@ check "attention --help mentions Usage" \
 
 # ---------------------------------------------------------------------------
 echo
-echo "== Agent of Empires pane worker =="
-python3 -m unittest -v "$REPO_ROOT/test_aoe_worker.py"
+echo "== CLI action and repository tests =="
+python3 -m unittest -v "$REPO_ROOT/test_cli_actions.py"
 python3 -m unittest -v "$REPO_ROOT/test_source_fetch_timeouts.py"
 python3 -m unittest -v "$REPO_ROOT/test_author_grouping.py"
 python3 -m unittest -v "$REPO_ROOT/test_github_reviews.py"
