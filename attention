@@ -605,12 +605,14 @@ _INDICATOR_LABELS = {
 }
 
 _INDICATOR_GLYPHS = {
-    "ready": "✓", "passed": "✓", "approved": "✓", "completed": "✓",
-    "success": "✓", "yes": "●", "draft": "●",
+    "ready": "✓", "merge ready": "✓", "passed": "✓", "approved": "✓",
+    "completed": "✓", "success": "✓", "yes": "●", "draft": "●",
     "failed": "✗", "ci failing": "✗", "blocked": "✗", "conflict": "✗",
-    "changes": "✗", "changes requested": "✗", "overdue": "✗",
+    "merge conflict": "✗", "changes": "✗", "changes requested": "✗", "overdue": "✗",
     "review requested": "◉", "requested": "◉", "review": "◉",
-    "waiting": "◷", "today": "◷", "due": "◷", "soon": "◷",
+    "reply needed": "◉", "review update": "◉", "notified": "◉", "commented": "◉",
+    "waiting": "◷", "running": "◷", "today": "◷", "due": "◷",
+    "soon": "◷", "now": "◷", "scheduled": "◷", "upcoming": "◷",
     "open": "○", "in progress": "●", "assigned": "●",
 }
 
@@ -618,10 +620,9 @@ _INDICATOR_GLYPHS = {
 def _display_indicator(key, value):
     if key not in {"state", "ci", "draft", "review", "merge", "due"} or value == "—":
         return value
-    glyph = _INDICATOR_GLYPHS.get(value.casefold())
-    if glyph is None and key == "state":
-        glyph = "○"
-    return f"{glyph} {value}" if glyph else value
+    if value in {"✓", "✗", "●", "○", "◉", "◷", "×"}:
+        return value
+    return _INDICATOR_GLYPHS.get(value.casefold(), "○")
 _INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
 
 

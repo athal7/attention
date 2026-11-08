@@ -520,66 +520,45 @@ class CursesPresenter:
                     query += char
 
 
-class CursesGroupPresenter:
+class CursesGroupPresenter(CursesPresenter):
+    """A single navigable tree of expandable dashboard groups."""
+
     def __init__(self, group_names):
+        super().__init__()
         self._group_names = list(group_names)
-        self._lock = threading.Lock()
-        self._rows = []
-        self._pending = []
-        self._active_group = None
-        self._active_presenter = None
-        self._stopped = False
-        self._reopen_group = None
+        self._expanded = set()
 
-    def launch(self):
-        with self._lock:
-            self._stopped = False
+    def _entries(self, rows, query):
+        grouped = {name: [] for name in self._group_names}
+        for row in rows:
+            item, _, group = row.rpartition("\t")
+            if group in grouped:
+                grouped[group].append(item)
+        entries = []
+        for group in self._group_names:
+            items = grouped[group]
+            matching = self._matching_rows(items, query or "")
+            if not items or (query and not matching):
+                continue
+            entries.append((group, None, len(items)))
+            if group in self._expanded or query:
+                entries.extend((group, item, len(items)) for item in matching)
+        return entries
 
-    def push_snapshot(self, rows, pending):
-        with self._lock:
-            self._rows = list(rows)
-            self._pending = list(pending)
-            group = self._active_group
-            presenter = self._active_presenter
-            scoped_rows = self._rows_for_group(group, self._rows) if group else []
-        if presenter is not None:
-            presenter.push_snapshot(scoped_rows, pending)
-
-    def wait_for_exit(self):
-        import curses
-
-        return curses.wrapper(self._run)
-
-    def stop(self):
-        with self._lock:
-            self._stopped = True
-            presenter = self._active_presenter
-        if presenter is not None:
-            presenter.stop()
-
-    def _rows_for_group(self, group, rows):
-        return [
-            row.rpartition("\t")[0]
-            for row in rows
-            if row.rpartition("\t")[2] == group
-        ]
-
-    def _snapshot(self):
-        with self._lock:
-            rows = list(self._rows)
-            pending = list(self._pending)
-            stopped = self._stopped
-        counts = {
-            group: sum(1 for row in rows if row.rpartition("\t")[2] == group)
-            for group in self._group_names
-        }
-        return rows, pending, stopped, counts
-
-    def _draw(self, screen, pending, counts, selected):
+    def _draw_tree(self, screen, entries, pending, selected, query):
         import curses
 
         height, width = screen.getmaxyx()
         screen.erase()
+        if entries:
+            selected = min(selected, len(entries) - 1)
+        else:
+            selected = 0
+        item = entries[selected][1] if entries else None
+        hints = self._hint_lines(item) if item else ["Enter expand/collapse · / filter · r refresh · Esc quit"]
+        footer_start = max(3, height - max(1, len(hints)))
+        capacity = max(0, footer_start - 3)
+        start = min(max(0, selected - capacity + 1), max(0, len(entries) - capacity))
 
         def write(line, text, attr=0):
             if line < height and width > 1:
@@ -588,49 +567,25 @@ class CursesGroupPresenter:
                 except curses.error:
                     pass
 
-        write(0, "Attention groups", curses.A_BOLD)
+        write(0, "Attention", curses.A_BOLD)
         write(1, _pending_header(pending))
-        visible_groups = [group for group in self._group_names if counts[group]]
-        if not visible_groups:
-            write(3, "No items in any group yet.")
-        for index, group in enumerate(visible_groups):
-            marker = "›" if index == selected else " "
-            attr = curses.A_REVERSE if index == selected else 0
-            write(3 + index, f"{marker} {group} ({counts[group]})", attr)
-        write(height - 1, "↑/↓ select  Enter open group  r refresh  Esc quit")
+        if query is not None:
+            write(2, f"Filter: {query}")
+        elif item:
+            write(2, "  " + self._indicator_header([item]))
+        if not entries:
+            write(3, "No matching items.")
+        for index, (group, row, count) in enumerate(entries[start:start + capacity], start):
+            if row is None:
+                marker = "▾" if group in self._expanded or query else "▸"
+                text = f"{marker} {group} ({count})"
+            else:
+                text = "  " + row.split("\t", 1)[0]
+            write(3 + index - start, text, curses.A_REVERSE if index == selected else 0)
+        for index, hint in enumerate(hints):
+            write(footer_start + index, hint)
         screen.refresh()
-        return visible_groups
-
-
-    def _open_group_and_track(self, screen, group):
-        last_selection = 0
-        while True:
-            presenter = CursesPresenter(group)
-            presenter._last_selection = last_selection
-            with self._lock:
-                self._active_group = group
-                self._active_presenter = presenter
-                rows = self._rows_for_group(group, self._rows)
-                pending = list(self._pending)
-            try:
-                presenter.launch()
-                presenter.push_snapshot(rows, pending)
-                result = presenter._run(screen)
-            finally:
-                presenter.stop()
-                with self._lock:
-                    if self._active_presenter is presenter:
-                        self._active_presenter = None
-                        self._active_group = None
-            if result.key == "" and result.row != "":
-                # Enter was pressed on a row — stay in the group.
-                last_selection = presenter._last_selection
-                continue
-            should_return = result.key is None or bool(result.key)
-            if should_return:
-                with self._lock:
-                    self._reopen_group = group
-            return result, should_return
+        return selected
 
     def _run(self, screen):
         import curses
@@ -642,35 +597,55 @@ class CursesGroupPresenter:
             curses.curs_set(0)
         except curses.error:
             pass
-        selected = 0
-        with self._lock:
-            reopen_group = self._reopen_group
-            self._reopen_group = None
-        if reopen_group is not None:
-            _, _, stopped, counts = self._snapshot()
-            if not stopped and counts.get(reopen_group):
-                result, should_return = self._open_group_and_track(screen, reopen_group)
-                if should_return:
-                    return result
+        selected = self._last_selection
+        query = None
         while True:
-            _, pending, stopped, counts = self._snapshot()
+            rows, pending, stopped, _ = self._snapshot()
             if stopped:
                 return PresenterResult("", "")
-            visible_groups = self._draw(screen, pending, counts, selected)
-            if visible_groups:
-                selected %= len(visible_groups)
-            else:
-                selected = 0
-            key = _read_key(screen)
-            if key in (27, ord("q")):
+            entries = self._entries(rows, query)
+            selected = self._draw_tree(screen, entries, pending, selected, query)
+            key = self._read_key(screen)
+            if key == -1:
+                continue
+            if key == 27 or key == ord("q"):
                 return PresenterResult("", "")
-            if key == ord("r"):
+            if key == ord("r") and query is None:
+                self._last_selection = selected
                 return PresenterResult("r", "")
-            if key in (curses.KEY_UP, ord("k")) and visible_groups:
-                selected = (selected - 1) % len(visible_groups)
-            elif key in (curses.KEY_DOWN, ord("j")) and visible_groups:
-                selected = (selected + 1) % len(visible_groups)
-            elif key in (curses.KEY_ENTER, 10, 13) and visible_groups:
-                result, should_return = self._open_group_and_track(screen, visible_groups[selected])
-                if should_return:
-                    return result
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                if query:
+                    query = query[:-1]
+                elif query is not None:
+                    query = None
+                continue
+            if key in (curses.KEY_UP, ord("k")) and entries:
+                selected = (selected - 1) % len(entries)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")) and entries:
+                selected = (selected + 1) % len(entries)
+                continue
+            if key in (curses.KEY_ENTER, 10, 13) and entries:
+                group, row, _ = entries[selected]
+                if row is None:
+                    if group in self._expanded:
+                        self._expanded.remove(group)
+                    else:
+                        self._expanded.add(group)
+                else:
+                    self._last_selection = selected
+                    return PresenterResult("", row)
+                continue
+            if query is None and entries and entries[selected][1] and 0 <= key <= 255:
+                char = chr(key)
+                row = entries[selected][1]
+                if char not in "qjk" and char in self._action_keys(row):
+                    self._last_selection = selected
+                    return PresenterResult(char, row)
+            if key == ord("/"):
+                query = ""
+                continue
+            if query is not None and 0 <= key <= 255:
+                char = chr(key)
+                if char.isprintable() and not ("A" <= char <= "Z") and char not in "jk":
+                    query += char

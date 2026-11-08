@@ -104,6 +104,7 @@ class TerminalInputTests(unittest.TestCase):
             self.send(sequence, fragmented)
             self.send(b"\r")
             self.wait_for(b"Beta one")
+            self.send(sequence, fragmented)
         self.send(sequence, fragmented)
         os.write(self.master, b"o")
         self.wait_for(b"PICKED beta-2" if grouped else b"PICKED alpha-2")
@@ -126,6 +127,18 @@ class TerminalInputTests(unittest.TestCase):
         self.send(b"\x1b[A")
         os.write(self.master, b"o")
         self.wait_for(b"PICKED alpha-1")
+
+    def test_groups_expand_and_collapse_without_leaving_the_tree(self):
+        self.launch(True)
+        self.send(b"\r")
+        self.wait_for(b"Alpha one")
+        self.send(b"\r")
+        self.send(b"\x1b[B")
+        self.send(b"\r")
+        self.wait_for(b"Beta one")
+        self.send(b"\x1b[B")
+        os.write(self.master, b"o")
+        self.wait_for(b"PICKED beta-1")
 
     def test_dashboard_renders_stacked_rows_with_individual_glyphs(self):
         tmp = tempfile.TemporaryDirectory()
@@ -164,8 +177,10 @@ class TerminalInputTests(unittest.TestCase):
         self.wait_for(b"Pull Requests (2)")
         self.send(b"\r")
         self.wait_for("└─ Child".encode())
-        self.wait_for("✓ Ready".encode())
-        self.wait_for("✗ Blocked".encode())
+        self.wait_for("✓".encode())
+        self.wait_for("✗".encode())
+        self.assertNotIn(b"Ready", self.transcript)
+        self.assertNotIn(b"Blocked", self.transcript)
 
 
 

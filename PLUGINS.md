@@ -80,11 +80,11 @@ defaults shown below if omitted.
 }
 ```
 
-`indicators` holds visible table values. Indicator values should use text
-instead of icons. The shared `state` key should contain a short label such as
-`Ready`, `Blocked`, or `Review requested`. Bundled sources provide this key so
-groups remain one status column wide. Source-specific groups can select detail
-keys such as `ci`, `draft`, `review`, `merge`, and `target`.
+`indicators` holds table values. Provide text for the shared `state` key,
+such as `Ready`, `Blocked`, or `Review requested`; the terminal dashboard
+renders it as a glyph. Bundled sources provide this key so groups remain one
+status column wide. Source-specific groups can select detail keys such as
+`ci`, `draft`, `review`, `merge`, and `target`.
 
 ### Indicator tables
 

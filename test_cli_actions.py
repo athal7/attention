@@ -264,9 +264,12 @@ class TerminalPresentationTests(unittest.TestCase):
         self.assertTrue(rows[0].startswith("Base"))
         self.assertTrue(rows[1].startswith("└─ Child"))
         self.assertTrue(rows[2].startswith("   └─ Grandchild"))
-        self.assertIn("✓ Ready", rows[0])
-        self.assertIn("◉ Review requested", rows[1])
-        self.assertIn("✗ Blocked", rows[2])
+        self.assertIn("✓", rows[0])
+        self.assertIn("◉", rows[1])
+        self.assertIn("✗", rows[2])
+        self.assertNotIn("Ready", rows[0])
+        self.assertNotIn("Review requested", rows[1])
+        self.assertNotIn("Blocked", rows[2])
 
     def test_flat_rows_preserve_tree_order_and_header_alignment(self):
         items = [
@@ -295,10 +298,26 @@ class TerminalPresentationTests(unittest.TestCase):
         ]
         rows = self.core.render_dashboard_rows(items, ["ci", "review"])
         header = dashboard.CursesPresenter()._indicator_header(rows)
-        self.assertEqual(header.index("CI"), rows[0].index("✓ Passed"))
-        self.assertEqual(header.index("Review"), rows[0].index("✗ Changes"))
-        self.assertEqual(header.index("CI"), rows[1].index("✗ Failed"))
-        self.assertEqual(header.index("Review"), rows[1].index("✓ Approved"))
+        self.assertEqual(header.index("CI"), rows[0].index("✓"))
+        self.assertEqual(header.index("Review"), rows[0].index("✗"))
+        self.assertEqual(header.index("CI"), rows[1].index("✗"))
+        self.assertEqual(header.index("Review"), rows[1].index("✓"))
+
+    def test_expanded_groups_remain_together_and_filter_finds_collapsed_items(self):
+        loader = importlib.machinery.SourceFileLoader("attention_tree_presenter", str(ROOT / "dashboard.py"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        dashboard = importlib.util.module_from_spec(spec)
+        loader.exec_module(dashboard)
+        presenter = dashboard.CursesGroupPresenter(["A", "B"])
+        rows = ["alpha\tblob\to\thint\tA", "beta\tblob\to\thint\tB"]
+        presenter._expanded.add("A")
+        self.assertEqual([(group, row) for group, row, _ in presenter._entries(rows, None)],
+                         [("A", None), ("A", "alpha\tblob\to\thint"), ("B", None)])
+        self.assertEqual([(group, row) for group, row, _ in presenter._entries(rows, "beta")],
+                         [("B", None), ("B", "beta\tblob\to\thint")])
+        presenter._expanded.remove("A")
+        self.assertEqual([(group, row) for group, row, _ in presenter._entries(rows, None)],
+                         [("A", None), ("B", None)])
 
     def test_displayed_row_dispatches_its_action_and_wip_transition(self):
         action = {"_plugin": "generic", "_original_key": "o", "key": "1", "label": "open",

@@ -106,12 +106,11 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 
 ### Dashboard groups
 
-The dashboard opens a curses overview with type groups by default. It shows
-pull requests, issues, reminders, events, and other item types separately.
-Use `dashboard.groups` to replace these defaults. Use Up/Down or `j`/`k` to
-select a group. Press Enter to open its scoped terminal list. Esc in a scoped
-list returns to the overview. Press `r` in either view to refresh; opening the
-interactive dashboard performs one initial fetch, with no background refresh.
+The dashboard opens with type groups for pull requests, issues, reminders,
+events, and other items. Use Up/Down or `j`/`k` to select a group and Enter
+to expand or collapse it in place. Select an item and press Enter for its
+primary action. Press `/` to filter, `r` to refresh, or Esc to quit. The
+dashboard fetches once on open and only refreshes on request.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
@@ -150,10 +149,13 @@ Items without author metadata do not match an author rule.
 Each group can select a different table with `columns`. Bundled groups use one
 compact `state` column by default. Its value is a short status label such as
 `Ready`, `Draft`, `CI failing`, or `Review requested`. `Draft` replaces less
-relevant failure or review labels. Status values include a glyph alongside
-the text. Visible pull request stacks are shown as trees within each group.
+relevant failure or review labels. Status values are shown as glyphs without
+words. Visible pull request stacks are shown as trees within each group.
 GitHub pull requests also provide optional `ci`, `draft`, `review`, `merge`,
 and `target` indicators for explicit column configurations.
+
+Glyphs: `✓` ready or passed; `✗` blocked or failing; `◉` review or
+notification; `◷` waiting or due; `●` active or draft; `○` open or unknown.
 
 ## What each bundled plugin surfaces
 
