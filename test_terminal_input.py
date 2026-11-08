@@ -140,6 +140,35 @@ class TerminalInputTests(unittest.TestCase):
         os.write(self.master, b"o")
         self.wait_for(b"PICKED beta-1")
 
+    def test_linked_action_disclosure_and_hidden_hotkey(self):
+        script = (
+            "import base64,json,curses,dashboard\n"
+            "a=[{'key':'o','label':'open'},{'key':'1','label':'comment (linked)','_original_key':'c'}]\n"
+            "blob=base64.b64encode(json.dumps(a).encode()).decode()\n"
+            "p=dashboard.CursesPresenter();p.push_snapshot(['Item\\t'+blob+'\\to,1\\to open'],[])\n"
+            "r=curses.wrapper(p._run);print('RESULT',r.key,flush=True)\n"
+        )
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color", PYTHONDONTWRITEBYTECODE="1")
+        try:
+            self.process = subprocess.Popen([sys.executable, "-c", script], stdin=slave,
+                                            stdout=slave, stderr=slave, env=env, cwd=ROOT)
+        finally:
+            os.close(slave)
+        self.master, self.transcript = master, b""
+        self.addCleanup(self.stop_process)
+        self.wait_for(b"show linked actions")
+        self.assertNotIn(b"comment (linked)", self.transcript)
+        self.send(b"?")
+        self.wait_for(b"comment (linked)")
+        self.transcript = b""
+        self.send(b"?")
+        self.wait_for(b"? show")
+        os.write(self.master, b"1")
+        self.wait_for(b"RESULT 1")
+
     def test_dashboard_renders_stacked_rows_with_individual_glyphs(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

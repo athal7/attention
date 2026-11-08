@@ -353,6 +353,7 @@ class CursesPresenter:
         self._stopped = False
         self._snapshot_version = 0
         self._last_selection = 0
+        self._expanded_action_rows = set()
 
     def launch(self):
         with self._lock:
@@ -397,6 +398,38 @@ class CursesPresenter:
         fields = row.split("\t")
         return fields[3].split("\x0b") if len(fields) > 3 and fields[3] else []
 
+    def _display_hints(self, row, width):
+        import textwrap
+
+        try:
+            actions = json.loads(base64.b64decode(row.split("\t")[1]))
+            linked = [action for action in actions if "_original_key" in action]
+            if not linked:
+                return self._hint_lines(row)
+            identity = row.split("\t")[1]
+            expanded = identity in self._expanded_action_rows
+            visible = actions if expanded else [action for action in actions if "_original_key" not in action]
+            parts = [f"{action['key']} {action['label']}" for action in visible]
+            parts.append(f"? {'hide' if expanded else 'show'} linked actions ({len(linked)})")
+            return textwrap.wrap("  ".join(parts), width=max(1, width - 1),
+                                 replace_whitespace=False, drop_whitespace=True)
+        except (IndexError, TypeError, ValueError, KeyError):
+            return self._hint_lines(row)
+
+    def _toggle_linked_actions(self, row):
+        try:
+            identity = row.split("\t")[1]
+            actions = json.loads(base64.b64decode(identity))
+            if not any("_original_key" in action for action in actions):
+                return False
+            if identity in self._expanded_action_rows:
+                self._expanded_action_rows.remove(identity)
+            else:
+                self._expanded_action_rows.add(identity)
+            return True
+        except (IndexError, TypeError, ValueError):
+            return False
+
     @staticmethod
     def _indicator_header(rows):
         if not rows:
@@ -436,7 +469,7 @@ class CursesPresenter:
             selected %= len(visible)
         else:
             selected = 0
-        hint_lines = self._hint_lines(visible[selected]) if visible else []
+        hint_lines = self._display_hints(visible[selected], width) if visible else []
         footer_start = max(3, height - max(1, len(hint_lines)))
         capacity = max(0, footer_start - 3)
         start = min(max(0, selected - capacity + 1), max(0, len(visible) - capacity))
@@ -503,6 +536,9 @@ class CursesPresenter:
             if key in (curses.KEY_DOWN, ord("j")) and visible:
                 selected = (selected + 1) % len(visible)
                 continue
+            if query is None and key == ord("?") and visible:
+                self._toggle_linked_actions(visible[selected])
+                continue
             if query is None and visible and 0 <= key <= 255:
                 char = chr(key)
                 if char not in "qjk" and char in self._action_keys(visible[selected]):
@@ -555,7 +591,7 @@ class CursesGroupPresenter(CursesPresenter):
         else:
             selected = 0
         item = entries[selected][1] if entries else None
-        hints = self._hint_lines(item) if item else ["Enter expand/collapse · / filter · r refresh · Esc quit"]
+        hints = self._display_hints(item, width) if item else ["Enter expand/collapse · / filter · r refresh · Esc quit"]
         footer_start = max(3, height - max(1, len(hints)))
         capacity = max(0, footer_start - 3)
         start = min(max(0, selected - capacity + 1), max(0, len(entries) - capacity))
@@ -635,6 +671,9 @@ class CursesGroupPresenter(CursesPresenter):
                 else:
                     self._last_selection = selected
                     return PresenterResult("", row)
+                continue
+            if query is None and key == ord("?") and entries and entries[selected][1]:
+                self._toggle_linked_actions(entries[selected][1])
                 continue
             if query is None and entries and entries[selected][1] and 0 <= key <= 255:
                 char = chr(key)

@@ -35,6 +35,8 @@ Press `/` to filter visible rows with lowercase letters or digits. Use Backspace
 to edit the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter`
 to run a row's primary action. Press an action letter on the highlighted row.
 Lowercase `q`, `j`, and `k` are reserved for dashboard controls.
+For items with linked actions, press `?` to show or hide those actions in the
+footer. Their hotkeys work even while the linked actions are hidden.
 An item is marked work in progress by running a custom action configured with `"wip": true`, then unmarked by one configured with `"wip": "clear"` (see [Configuration](#configuration)). Either update lands only when the action completes successfully -- a canceled prompt or a failed command leaves the current state unchanged. Marked items show a `WORK IN PROGRESS` banner in their details. Marks persist in `$XDG_STATE_HOME/attention/wip.json`, defaulting to `~/.local/state/attention/wip.json`.
 
 | Row type | Hotkeys |
