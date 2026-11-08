@@ -177,5 +177,83 @@ class RequestedReviewTests(unittest.TestCase):
         self.assertEqual(sorted(fallbacks), [0, *range(limit, 2 * limit)])
 
 
+class NotificationReuseTests(unittest.TestCase):
+    def test_overlapping_notification_needs_no_second_graphql_request(self):
+        pr = candidate(1)
+        notification = {
+            "id": "thread-1", "unread": True, "reason": "mention",
+            "repository": {"full_name": "owner/repo"},
+            "subject": {"type": "PullRequest", "url": "https://api.github.com/repos/owner/repo/pulls/1"},
+        }
+        queries = []
+
+        def transport(args, **kwargs):
+            if args[:2] == ["search", "prs"]:
+                return [copy.deepcopy(pr)] if "--review-requested=@me" in args else []
+            if args[:2] == ["search", "issues"]:
+                return []
+            if args[:2] == ["api", "/notifications"]:
+                return [notification]
+            if args[:2] == ["api", "graphql"]:
+                queries.append(args[-1])
+                return {"data": {"r0": {"isArchived": False, "p0_0": {
+                    "state": "OPEN", "isDraft": False, "baseRefName": "main",
+                    "headRefName": "feature", "author": {"login": "author"},
+                }}}}
+            raise AssertionError(args)
+
+        with (patch.object(github, "_gh_json", side_effect=transport),
+              patch.object(github, "_get_gh_login", return_value="viewer"),
+              patch.object(github, "_fetch_my_repo_issues", return_value=[])):
+            items = github._fetch_raw({})
+        self.assertEqual(len(queries), 1)
+        self.assertEqual([(item["number"], item["notification_ids"]) for item in items],
+                         [(1, ["thread-1"])])
+        self.assertNotIn("_notification_state", items[0])
+
+    def test_incomplete_search_detail_falls_back_to_notification_query(self):
+        notification = {
+            "id": "thread-1", "unread": True, "reason": "mention",
+            "repository": {"full_name": "owner/repo"},
+            "subject": {"type": "PullRequest", "url": "https://api.github.com/repos/owner/repo/pulls/1"},
+        }
+        pr = candidate(1)
+        github._apply_pr_detail(pr, {"state": "OPEN", "isDraft": False})
+
+        def transport(args, **kwargs):
+            if args[:2] == ["api", "/notifications"]:
+                return [notification]
+            if args[:2] == ["api", "graphql"]:
+                return {"data": {"r0": {"isArchived": False, "s0_0": {
+                    "state": "CLOSED",
+                }}}}
+            raise AssertionError(args)
+
+        with patch.object(github, "_gh_json", side_effect=transport):
+            items, _ = github._fetch_notification_delta(search_items=[pr])
+        self.assertEqual(items, [{"notification_id": "thread-1", "_remove": True}])
+
+    def test_mixed_subjects_and_archived_repository_preserve_filtering(self):
+        cached = {"number": 1, "repository": {"nameWithOwner": "owner/repo"},
+                  "_notification_state": {"archived": True, "state": "open", "draft": False,
+                                          "base": {}, "head": {}, "author": {}}}
+        def notice(number):
+            return {"id": str(number), "unread": True, "reason": "mention",
+                    "repository": {"full_name": "owner/repo"},
+                    "subject": {"type": "PullRequest",
+                                "url": f"https://api.github.com/repos/owner/repo/pulls/{number}"}}
+
+        def transport(args, **kwargs):
+            if args[:2] == ["api", "/notifications"]:
+                return [notice(1), notice(2)]
+            if args[:2] == ["api", "graphql"]:
+                return {"data": {"r0": {"isArchived": True, "s0_0": {"state": "OPEN"}}}}
+            raise AssertionError(args)
+
+        with patch.object(github, "_gh_json", side_effect=transport):
+            items, _ = github._fetch_notification_delta(search_items=[cached])
+        self.assertEqual([item["notification_id"] for item in items if item.get("_remove")], ["1", "2"])
+
+
 if __name__ == "__main__":
     unittest.main()

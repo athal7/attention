@@ -176,6 +176,8 @@ notification; `◷` waiting or due; `●` active or draft; `○` open or unknown
   reviews, and your own assignment do not count. A review whose author type is
   unknown does not hide a request, including when the detail fallback lacks
   bot metadata. PR details are fetched in bounded batches with per-PR fallback.
+  Search and notification validation reuse complete PR and repository state
+  within a refresh; missing state is fetched separately.
   Merge ready requires an open, non-draft PR with approved review, a clean
   merge state, a known mergeable result, and complete successful CI checks.
   It ranks above NOTIFIED. Unknown, incomplete, pending, or failing state is

@@ -241,7 +241,7 @@ def _fetch_pr_details(prs):
             owner, _, name = repo.partition("/")
             query.append(
                 f"r{repo_index}: repository(owner: {json.dumps(owner)}, "
-                f"name: {json.dumps(name)}) {{"
+                f"name: {json.dumps(name)}) {{ isArchived "
             )
             for entry_index, (_key, number) in enumerate(repo_entries):
                 query.append(f"p{repo_index}_{entry_index}: {_PR_GRAPHQL_SELECTION % number}")
@@ -263,6 +263,8 @@ def _fetch_pr_details(prs):
                 raw = repository.get(f"p{repo_index}_{entry_index}")
                 detail = _normalize_pr_detail(raw)
                 if detail is not None:
+                    if isinstance(repository.get("isArchived"), bool):
+                        detail["_repositoryArchived"] = repository["isArchived"]
                     details[key] = detail
     return details
 
@@ -438,6 +440,19 @@ def _apply_pr_detail(pr, detail):
         return
     if detail.get("author"):
         pr["author"] = detail["author"]
+    if (
+        isinstance(detail.get("_repositoryArchived"), bool)
+        and detail.get("state") in {"OPEN", "CLOSED", "MERGED"}
+        and isinstance(detail.get("isDraft"), bool)
+    ):
+        pr["_notification_state"] = {
+            "archived": detail["_repositoryArchived"],
+            "state": detail["state"].lower(),
+            "draft": detail["isDraft"],
+            "base": {"ref": detail.get("baseRefName") or ""},
+            "head": {"ref": detail.get("headRefName") or ""},
+            "author": detail.get("author") or {},
+        }
     pr["reviewRequested"] = bool(detail.get("reviewRequests"))
     pr["mergeReady"] = _merge_ready(detail)
     pr["headRefOid"] = detail.get("headRefOid") or ""
@@ -630,23 +645,39 @@ def _fetch_my_repo_issues(required=False):
     return [issue for issue in issues or [] if not issue.get("assignees")]
 
 
-def _fetch_notification_state(notifications):
-    """Fetch notification repository and subject state in one GraphQL query."""
+def _fetch_notification_state(notifications, search_items=()):
+    """Fetch missing notification repository and subject state in one GraphQL query."""
+    repository_archived = {}
+    subject_state = {}
+    for item in search_items:
+        key = _pr_key(item)
+        state = item.get("_notification_state")
+        if key is None or not isinstance(state, dict):
+            continue
+        repo, number = key
+        try:
+            subject_key = (repo, "PullRequest", int(number))
+        except (TypeError, ValueError):
+            continue
+        repository_archived[repo] = state["archived"]
+        subject_state[subject_key] = state
     targets = {}
     for notif in notifications:
         subject = notif.get("subject") or {}
         repo = (notif.get("repository") or {}).get("full_name", "")
         if not repo:
             continue
-        repo_targets = targets.setdefault(repo, set())
+        if repo not in repository_archived:
+            targets.setdefault(repo, set())
         subject_url = subject.get("url") or ""
         match = re.search(r"/(issues|pulls)/(\d+)$", subject_url)
         if subject.get("type") not in {"Issue", "PullRequest"} or not match:
             continue
         subject_type = "PullRequest" if match.group(1) == "pulls" else "Issue"
-        repo_targets.add((subject_type, int(match.group(2))))
+        if (repo, subject_type, int(match.group(2))) not in subject_state:
+            targets.setdefault(repo, set()).add((subject_type, int(match.group(2))))
     if not targets:
-        return {}, {}
+        return repository_archived, subject_state
 
     query = ["query {"]
     target_aliases = {}
@@ -677,8 +708,6 @@ def _fetch_notification_state(notifications):
     if not isinstance(data, dict):
         return None
 
-    repository_archived = {}
-    subject_state = {}
     for repo_index, (repo, repo_targets) in enumerate(targets.items()):
         repository = data.get(f"r{repo_index}")
         if not isinstance(repository, dict):
@@ -842,7 +871,7 @@ def _only_bot_timeline_comments_since_read(notification, repo, number):
             saw_unread_comment = True
     return saw_unread_comment
 
-def _fetch_notification_delta(since=None, current_login=None):
+def _fetch_notification_delta(since=None, current_login=None, search_items=()):
     """Fetch and validate a durable delta of unread notification threads."""
     poll_started = datetime.now(timezone.utc)
     args = ["api", "/notifications", "--method", "GET", "--paginate", "-f", "per_page=50"]
@@ -877,7 +906,10 @@ def _fetch_notification_delta(since=None, current_login=None):
             continue
         accepted.append(notification)
 
-    batched_state = _fetch_notification_state(accepted)
+    batched_state = (
+        _fetch_notification_state(accepted, search_items)
+        if search_items else _fetch_notification_state(accepted)
+    )
     if batched_state is None:
         repository_archived = {}
         repo_names = sorted({
@@ -1315,7 +1347,11 @@ def _fetch_raw(config):
     """Live retrieval seam retained for focused tests and manual refreshes."""
     current_login = _get_gh_login()
     search_items = _fetch_search_items(config, current_login)
-    notification_items, _ = _fetch_notification_delta(current_login=current_login)
+    notification_items, _ = _fetch_notification_delta(
+        current_login=current_login, search_items=search_items,
+    )
+    for item in search_items:
+        item.pop("_notification_state", None)
     return _compose_raw(search_items, notification_items)
 
 
