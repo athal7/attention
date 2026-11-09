@@ -162,8 +162,21 @@ words. Visible pull request stacks are shown as trees within each group.
 GitHub pull requests also provide optional `ci`, `draft`, `review`, `merge`,
 and `target` indicators for explicit column configurations.
 
-Glyphs: `✓` ready or passed; `✗` blocked or failing; `◉` review or
-notification; `◷` waiting or due; `●` active or draft; `○` open or unknown.
+Glyphs are the same one-character marks the aoe-github plugin paints on its
+session rows: `✓` approved, ready, or merged; `✔`/`✘` CI passing/failing; `~`
+running or happening now; `⇨` CI queued; `?` unknown; `✗` changes requested,
+blocked, or overdue; `❝` commented or a review update; `↻` pushed since review;
+`⧗` awaiting someone else's review or due soon; `◷` partially approved; `⊘` merge
+conflict; `⇉` in a merge queue; `✉` unresolved review comments (reply needed);
+`◌` draft or not started; `⇄` open; `◉` your review requested by someone else,
+which is the plugin's own "awaiting your review" status. `⚑` (notification) and
+`◍` (assigned or in progress) are local marks for states that plugin has no
+equivalent for. `◉` never stands in for feedback you owe a reply to, so a request
+for your review is distinguishable from a review that landed, and `⧗` only ever
+means waiting on someone else. Every mark is a single narrow cell, and no two
+distinct outcomes share a mark: synonyms such as `Ready`/`Merge ready` or
+`Approved`/`Done`/`Merged` deliberately share one, because the mark names the
+outcome rather than the word a source chose for it.
 
 ## What each bundled plugin surfaces
 

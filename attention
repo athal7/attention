@@ -604,25 +604,65 @@ _INDICATOR_LABELS = {
     "due": "Due",
 }
 
+# One mark per outcome, sharing the single-character vocabulary aoe-github paints
+# on its session rows (its uistate module's `_REVIEW_GLYPH`,
+# `_YOUR_REVIEW_GLYPH`, `_CHECK_GLYPH`, `_PR_GLYPH`, `_DRAFT_GLYPH`,
+# `_CONFLICT_GLYPH`, `_COMMENT_GLYPH`, `_QUEUE_GLYPH`, `_ERROR_GLYPH`): light
+# marks name a review position (✓ approved, ✗ changes requested, ❝ commented,
+# ⧗ awaiting review, ↻ pushed since review, ◷ partially approved), heavy ones
+# name CI (✔ passing, ✘ failing, ~ running, ⇨ queued, ? unknown), and the PR
+# facts keep their own (⇄ open, ◌ draft, ⊘ merge conflict, ⇉ in merge queue, ✉
+# unresolved comments).
+#
+# ◉ is the request *on you*: someone else asked for your review, the rung that
+# plugin draws as an eye and ranks above CI and comments because it is the one
+# signal you can clear yourself. It shares no mark with feedback you owe a reply
+# to (✉ unresolved) or with a review that merely landed (❝), so "they want my
+# review" reads apart from "a review arrived".
+#
+# ⚑ (notification) and ◍ (assigned or in progress) are attention-only marks for
+# states that plugin has no equivalent for. Every mark is one East-Asian-Neutral
+# cell -- never the Ambiguous ●/○/▲ this table used to hold, which cost two
+# columns in a CJK locale. No two distinct outcomes share a mark; synonyms do so
+# on purpose (✓ covers ready/approved/merge ready/done/merged, ⧗ the waiting
+# values, ✗ changes/blocked/overdue), because a mark names the outcome, not the
+# word a source chose for it.
 _INDICATOR_GLYPHS = {
-    "ready": "✓", "merge ready": "✓", "passed": "✓", "approved": "✓",
-    "completed": "✓", "success": "✓", "yes": "●", "draft": "●",
-    "failed": "✗", "ci failing": "✗", "blocked": "✗", "conflict": "✗",
-    "merge conflict": "✗", "changes": "✗", "changes requested": "✗", "overdue": "✗",
-    "review requested": "◉", "requested": "◉", "review": "◉",
-    "reply needed": "◉", "review update": "◉", "notified": "◉", "commented": "◉",
-    "waiting": "◷", "running": "◷", "today": "◷", "due": "◷",
-    "soon": "◷", "now": "◷", "scheduled": "◷", "upcoming": "◷",
-    "open": "○", "in progress": "●", "assigned": "●",
+    "approved": "✓", "ready": "✓", "merge ready": "✓", "completed": "✓",
+    "done": "✓", "past": "✓", "merged": "✓",
+    "partial": "◷", "partially approved": "◷",
+    "changes": "✗", "changes requested": "✗", "blocked": "✗", "overdue": "✗",
+    "changes pushed": "↻", "pushed since review": "↻",
+    "commented": "❝", "review update": "❝",
+    # "awaiting your review" is the exact status the plugin sends for a request on
+    # the viewer (its rank-4 rung), so it belongs on the eye. Plain "awaiting
+    # review" and "in review" mean waiting on someone else and stay on ⧗.
+    "review requested": "◉", "requested": "◉", "awaiting your review": "◉",
+    "reply needed": "✉",
+    "notified": "⚑",
+    "waiting": "⧗", "awaiting review": "⧗",
+    "in review": "⧗", "today": "⧗", "due": "⧗", "soon": "⧗",
+    "scheduled": "⧗", "upcoming": "⧗",
+    "success": "✔", "passed": "✔", "failed": "✘", "ci failing": "✘",
+    "running": "~", "now": "~", "queued": "⇨",
+    "none": "?", "unknown": "?", "error": "!", "fetch failed": "!",
+    "conflict": "⊘", "merge conflict": "⊘",
+    "queue": "⇉",
+    "draft": "◌", "yes": "◌", "wip": "◌", "todo": "◌", "backlog": "◌",
+    "open": "⇄", "no": "⇄", "triage": "⇄",
+    "assigned": "◍", "in progress": "◍", "active": "◍",
 }
 
 
 def _display_indicator(key, value):
     if key not in {"state", "ci", "draft", "review", "merge", "due"} or value == "—":
         return value
-    if value in {"✓", "✗", "●", "○", "◉", "◷", "×"}:
+    if value in {
+        "✓", "✔", "✗", "✘", "◷", "↻", "❝", "⧗", "◉", "⊘", "◌", "⇄",
+        "⇉", "~", "⇨", "?", "✉", "!", "⚑", "◍",
+    }:
         return value
-    return _INDICATOR_GLYPHS.get(value.casefold(), "○")
+    return _INDICATOR_GLYPHS.get(value.casefold(), "?")
 _INDICATOR_ORDER = tuple(_INDICATOR_LABELS)
 
 

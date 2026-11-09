@@ -4565,7 +4565,7 @@ groups, error = m.dashboard_groups({})
 items = [
     {'status': 'S', 'context': 'c', 'title': 'PR', 'details': '', 'weight': 1, 'kind': 'pull_request', 'indicators': {'ci': '✓'}, 'actions': []},
     {'status': 'S', 'context': 'c', 'title': 'Issue', 'details': '', 'weight': 1, 'kind': 'issue', 'indicators': {'state': 'OPEN'}, 'actions': []},
-    {'status': 'S', 'context': 'c', 'title': 'Reminder', 'details': '', 'weight': 1, 'kind': 'reminder', 'indicators': {'due': '×'}, 'actions': []},
+    {'status': 'S', 'context': 'c', 'title': 'Reminder', 'details': '', 'weight': 1, 'kind': 'reminder', 'indicators': {'due': '⧗'}, 'actions': []},
     {'status': 'S', 'context': 'c', 'title': 'Event', 'details': '', 'weight': 1, 'kind': 'event', 'actions': []},
 ]
 rows = m.render_grouped_dashboard_rows(items, groups)

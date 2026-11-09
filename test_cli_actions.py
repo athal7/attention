@@ -271,6 +271,38 @@ class TerminalPresentationTests(unittest.TestCase):
         self.assertNotIn("Review requested", rows[1])
         self.assertNotIn("Blocked", rows[2])
 
+    def test_review_request_stays_distinct_from_feedback_and_notifications(self):
+        glyph = self.core._display_indicator
+        self.assertEqual(glyph("state", "Review requested"), "◉")
+        # The plugin's own row label for a request on the viewer; the shared
+        # "awaiting review" values must not be painted with it.
+        self.assertEqual(glyph("state", "Awaiting your review"), "◉")
+        self.assertEqual(glyph("state", "Awaiting review"), "⧗")
+        self.assertEqual(glyph("state", "In review"), "⧗")
+        self.assertEqual(glyph("state", "Merged"), "✓")
+        self.assertEqual(glyph("ci", "Success"), "✔")
+        self.assertEqual(glyph("state", "Reply needed"), "✉")
+        self.assertEqual(glyph("state", "Review update"), "❝")
+        self.assertEqual(glyph("state", "Notified"), "⚑")
+        self.assertEqual(glyph("state", "Merge conflict"), "⊘")
+        self.assertEqual(glyph("state", "Changes requested"), "✗")
+        self.assertEqual(glyph("state", "CI failing"), "✘")
+        self.assertEqual(glyph("ci", "Passed"), "✔")
+        self.assertEqual(glyph("ci", "Running"), "~")
+        # Ready and Merge ready share ✓ on purpose: both mean "good to go".
+        states = ["Ready", "Draft", "Merge conflict", "Changes requested",
+                  "CI failing", "Reply needed", "Review requested",
+                  "Review update", "Notified", "Triage", "Awaiting review"]
+        marks = [glyph("state", state) for state in states]
+        self.assertEqual(len(set(marks)), len(marks))
+
+    def test_glyphs_are_single_narrow_cells(self):
+        import unicodedata
+
+        for mark in [*self.core._INDICATOR_GLYPHS.values(), "?"]:
+            self.assertEqual(len(mark), 1, mark)
+            self.assertIn(unicodedata.east_asian_width(mark), {"N", "Na", "H"}, mark)
+
     def test_flat_rows_preserve_tree_order_and_header_alignment(self):
         items = [
             {"title": "Child", "identity_key": "c", "parent_identity_key": "p",
@@ -298,9 +330,11 @@ class TerminalPresentationTests(unittest.TestCase):
         ]
         rows = self.core.render_dashboard_rows(items, ["ci", "review"])
         header = dashboard.CursesPresenter()._indicator_header(rows)
-        self.assertEqual(header.index("CI"), rows[0].index("✓"))
+        # CI takes the heavy marks and review the light ones, so the two columns
+        # stay readable without their words.
+        self.assertEqual(header.index("CI"), rows[0].index("✔"))
         self.assertEqual(header.index("Review"), rows[0].index("✗"))
-        self.assertEqual(header.index("CI"), rows[1].index("✗"))
+        self.assertEqual(header.index("CI"), rows[1].index("✘"))
         self.assertEqual(header.index("Review"), rows[1].index("✓"))
 
     def test_expanded_groups_remain_together_and_filter_finds_collapsed_items(self):

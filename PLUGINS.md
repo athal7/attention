@@ -84,7 +84,11 @@ defaults shown below if omitted.
 `indicators` holds table values. Provide text for the shared `state` key,
 such as `Ready`, `Blocked`, or `Review requested`; the terminal dashboard
 renders it as a glyph. Bundled sources provide this key so groups remain one
-status column wide. Source-specific groups can select detail keys such as
+status column wide. Use `Review requested` only when someone else asked for
+the user's review, and `Reply needed` or `Review update` for feedback the user
+still owes a reply to; the two render as different glyphs (`◉` and `✉`) and
+should not be collapsed into one status. See the [glyph
+list](README.md#dashboard-groups) for the recognized values. Source-specific groups can select detail keys such as
 `ci`, `draft`, `review`, `merge`, and `target`.
 
 ### Indicator tables
