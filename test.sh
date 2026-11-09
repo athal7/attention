@@ -4479,6 +4479,33 @@ print(typed_prefix_error)
 }
 test_dashboard_group_rules_and_rows
 
+test_dashboard_group_prefixes_match_repository_identity() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, error = m.dashboard_groups({
+    'dashboard': {'groups': [
+        {'name': 'Work', 'match': {'plugins': ['github'], 'contextPrefixes': ['myorg/']}},
+        {'name': 'Open source', 'match': {'plugins': ['github']}},
+        {'name': 'Everything else', 'fallback': True},
+    ]},
+})
+items = [
+    {'status': 'NEEDS', 'context': 'kb', 'repo': 'myorg/kb', 'title': 'Work PR', 'details': '', 'weight': 90, 'id': '1', 'actions': [], '_plugin': 'github'},
+    {'status': 'NEEDS', 'context': 'attention', 'repo': 'you/attention', 'title': 'OSS PR', 'details': '', 'weight': 80, 'id': '2', 'actions': [], '_plugin': 'github'},
+    {'status': 'NEEDS', 'context': 'Personal', 'title': 'Reminder', 'details': '', 'weight': 70, 'id': '3', 'actions': [], '_plugin': 'reminders'},
+]
+rows = m.render_grouped_dashboard_rows(items, groups)
+print(error)
+print(','.join(row.rpartition(chr(9))[2] for row in rows))
+print('myorg/kb' in rows[0].split(chr(9))[0])
+")"
+  check "repository-identity grouping has no validation error" "$(sed -n 1p <<<"$out")" "None"
+  check "organization prefixes match the item repository identity" "$(sed -n 2p <<<"$out")" "Work,Open source,Everything else"
+  check "prefix matching leaves the short display context alone" "$(sed -n 3p <<<"$out")" "False"
+}
+test_dashboard_group_prefixes_match_repository_identity
+
 test_dashboard_group_any_alternatives() {
   local out
   out="$(python3 -c "

@@ -869,12 +869,30 @@ def dashboard_groups(config):
     return groups, None
 
 
+def _group_context_candidates(item):
+    """Values a `contextPrefixes` rule can match.
+
+    A source may render a shorter context for readability -- the bundled
+    github plugin shows only the repository name -- while still reporting the
+    provider-qualified identity as `repo`. Organization prefixes have to see
+    that identity, or every item of that source falls through to a broader
+    rule that also matches it.
+    """
+    return [
+        value
+        for value in (item.get("context", ""), item.get("repo", ""))
+        if isinstance(value, str) and value
+    ]
+
+
 def _group_matches(item, match):
     context = item.get("context", "")
     if "authors" in match and not item.get("author"):
         return False
     if "contextPrefixes" in match and not any(
-        context.startswith(prefix) for prefix in match["contextPrefixes"]
+        candidate.startswith(prefix)
+        for candidate in _group_context_candidates(item)
+        for prefix in match["contextPrefixes"]
     ):
         return False
     fields = {

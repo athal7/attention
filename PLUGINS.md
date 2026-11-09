@@ -55,6 +55,7 @@ defaults shown below if omitted.
 {
     "status":  "REVIEW REQUESTED",   # str, required -- normalized, all-caps by convention
     "context": "myorg/myrepo",       # str, required -- where this came from
+    "repo":    "myorg/myrepo",       # str, optional (default "") -- provider-qualified identity that `contextPrefixes` grouping and `session.agents` match when `context` is shorter
     "title":   "Fix the login bug",  # str, required
     "details": "",                   # str, required -- may be empty
     "weight":  90,                   # int, required -- sort key, descending (bool rejected)
