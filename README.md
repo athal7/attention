@@ -191,10 +191,11 @@ outcome rather than the word a source chose for it.
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
   Review requests are omitted when another confirmed person has submitted a
-  review or another user is assigned to the PR; bots, pending and dismissed
-  reviews, and your own assignment do not count. A review whose author type is
-  unknown does not hide a request, including when the detail fallback lacks
-  bot metadata. PR details are fetched in bounded batches with per-PR fallback.
+  review, unless you have also submitted a review; a PR assigned to another
+  user is still omitted. Bots, pending and dismissed reviews, and your own
+  assignment do not count. A review whose author type is unknown does not hide
+  a request, including when the detail fallback lacks bot metadata. PR details
+  are fetched in bounded batches with per-PR fallback.
   Search and notification validation reuse complete PR and repository state
   within a refresh; missing state is fetched separately.
   Merge ready requires an open, non-draft PR with approved review, a clean

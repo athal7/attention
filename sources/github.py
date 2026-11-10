@@ -1149,7 +1149,7 @@ def _review_handled_by_other(detail, current_login):
         if isinstance(login, str) and login and login.casefold() != current_login:
             return True
 
-    excluded = current_login
+    handled_by_other = False
     for review in detail.get("latestReviews") or []:
         if not isinstance(review, dict) or review.get("state") not in {
             "APPROVED", "CHANGES_REQUESTED", "COMMENTED",
@@ -1159,10 +1159,12 @@ def _review_handled_by_other(detail, current_login):
         if not isinstance(author, dict):
             continue
         login = author.get("login")
+        if isinstance(login, str) and login.casefold() == current_login:
+            return False
         if (
             isinstance(login, str)
             and login
-            and login.casefold() != excluded
+            and login.casefold() != current_login
             and (author.get("__typename") == "User"
                  or author.get("type") == "User"
                  or author.get("is_bot") is False)
@@ -1171,8 +1173,8 @@ def _review_handled_by_other(detail, current_login):
             and author.get("is_bot") is not True
             and not login.casefold().endswith("[bot]")
         ):
-            return True
-    return False
+            handled_by_other = True
+    return handled_by_other
 
 
 def _fetch_search_items(config, current_login=None):

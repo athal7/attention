@@ -110,6 +110,24 @@ class RequestedReviewTests(unittest.TestCase):
                     expected = ["1"] if visible or state in {"PENDING", "DISMISSED"} else []
                     self.assertEqual([item["id"] for item in items], expected)
 
+    def test_prior_submitted_review_preserves_rerequest_despite_other_review(self):
+        other = {"author": {"login": "human", "__typename": "User"}, "state": "APPROVED"}
+        for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"):
+            for reverse in (False, True):
+                for assigned in (False, True):
+                    with self.subTest(state=state, reverse=reverse, assigned=assigned):
+                        own = {"author": {"login": "VIEWER"}, "state": state}
+                        raw = detail(assignees=[{"login": "other"}] if assigned else [])
+                        raw["latestReviews"] = [own, other] if reverse else [other, own]
+                        transport = self.search_transport([candidate(1)], lambda args: (
+                            [] if args[:2] == ["api", "graphql"] else raw
+                        ))
+                        visible = state not in {"PENDING", "DISMISSED"} and not assigned
+                        self.assertEqual(
+                            [item["id"] for item in self.collect([candidate(1)], transport)],
+                            ["1"] if visible else [],
+                        )
+
     def test_assignee_policy_is_independent_of_unknown_reviewer_identity(self):
         for assignees, visible in (([], True), ([{"login": "VIEWER"}], True),
                                    ([{"login": "other"}], False),
