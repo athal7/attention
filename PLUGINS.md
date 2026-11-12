@@ -239,6 +239,13 @@ answering with nothing runs the default. `{input}` and `{input.<name>}`
 are reserved -- they always mean prompted values, so a record field
 literally named `input` can't be referenced by name.
 
+An action labeled `session` or `New session` is also what an automation
+rule of `"type": "session"` starts (see the
+[README](README.md#automation)): its `{input}` is filled from the rule's
+message template instead of being prompted, and it always runs in the
+background. A session action without `{input}` in its `command` is never
+started automatically.
+
 An action may set `"wip": true` to mark the item work in progress, or
 `"wip": "clear"` to unmark it. A custom configured action like "start a
 session" can flag an item, while a "stop" or "done" action can clear it.

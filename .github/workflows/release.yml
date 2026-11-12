@@ -60,9 +60,9 @@ jobs:
 
           if [ "$bump" = none ]; then
             if [ "$last_tag" = v0.0.0 ]; then
-              changed=$(git ls-tree -r --name-only HEAD -- attention dashboard.py sources)
+              changed=$(git ls-tree -r --name-only HEAD -- attention dashboard.py automation.py sources)
             else
-              changed=$(git diff --name-only "$range" -- attention dashboard.py sources)
+              changed=$(git diff --name-only "$range" -- attention dashboard.py automation.py sources)
             fi
             if [ -n "$changed" ]; then
               echo "::error::Release source changed since ${last_tag}, but no Conventional Commit declares a version bump."
