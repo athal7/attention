@@ -134,8 +134,10 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}`), optional `"terminal": true` to run in a separate terminal window, optional `"background": true` for fire-and-forget commands, optional `"wip"` to update work-in-progress state, optional `"read": true` for an action that only reads (open, copy) so running it leaves the item in place instead of moving it down the list, and optional `"input"`/`"inputs"` prompts (see [PLUGINS.md](PLUGINS.md)). GitHub action templates also expose `{head_branch}` and `{base_branch}` for PR worktrees (empty when unavailable). An action labeled `session` or `New session` also gets the agent `session.agents` resolves for the item, both as `AOE_TOOL` in the action process's environment and as the `{session_tool}` placeholder. |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `session.agents` | Which agent AoE sessions start per repository or directory. Each entry pairs an AoE `tool` (`aoe add --tool`, e.g. `omp` or `freebuf`) with either a GitHub `repo` -- `"owner/name"` or an `"owner/*"` owner prefix, matched case-insensitively from the item's repository -- or a `path` (a directory; `~` is expanded). An exact repository match beats an owner prefix; the longest configured directory containing the item's project directory is the fallback. This drives both the generated `New session` action and configured actions labeled `session`/`New session`. Items matching no entry keep AoE's default agent. An invalid entry fails the refresh instead of starting the wrong agent. |
-| `automation.rules` | Rules that act on the fetched list without a keypress: each has a unique `name`, a `type` (`"session"` or `"nudge"`), a required `match` using the same selectors as a dashboard group, an optional `message` (`{field}` template), and an optional `cooldownMinutes`. See [Automation](#automation). |
+| `automation.rules` | Rules that act on the fetched list without a keypress: each has a unique `name`, a `type` (`"session"` or `"nudge"`), a required `match` using the same selectors as a dashboard group, an optional `message` (`{field}` template), an optional `cooldownMinutes`, and an optional `maxWip` capping how many sessions that rule alone may hold. See [Automation](#automation). |
 | `automation.maxWip` | Non-negative integer cap on items work in progress at once; session rules stop starting when it is reached. Unset means no cap, `0` starts nothing. Manual hotkeys are never blocked. |
+| `automation.maxWipByProvider` | Object mapping a plugin name (`"github"`, `"linear"`) to a cap on that provider's sessions; unlisted providers are uncapped. |
+| `automation.maxSessions` | Object mapping an AoE agent (`"freebuff"`, `"omp"`) to a cap on its live sessions, counted from `aoe list --state live` plus this round's starts. Needs `session.agents` to know which agent a dispatch starts. |
 | `dashboard.autoExpand` | `true` opens the dashboard with every group expanded instead of collapsed. Default `false`; groups still toggle with `Enter`, and a filter expands matching groups regardless. |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, `authors`, and/or `any`) or `fallback: true`. `contextPrefixes` matches an item's `context` or the provider-qualified identity it reports as `repo`, so an organization prefix groups GitHub items even though their rows show only the repository name. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
@@ -185,20 +187,47 @@ a service](#running-as-a-service)) is a headless nudge/session runner.
 configuration disables automation with one warning instead of half-applying
 rules.
 
-`automation.maxWip` caps how many items may be work in progress at once, so
-a broad rule cannot fan out into a dozen agent sessions:
+Automation reads what is already in flight before it starts anything: the
+items marked work in progress, and the live sessions `aoe list --state live`
+reports. A session rule skips an item a live session already covers -- one
+started from a hotkey, say -- joining GitHub items on their pull request's
+`head_branch` and Linear items on their issue identifier, so a piece of work
+never gets two agents. A snoozed session is set aside: it covers nothing and
+holds no slot.
+
+Four budgets bound what automation starts, each enforced against existing
+state and within the round itself:
 
 ```json
-{ "automation": { "maxWip": 2, "rules": [ /* ... */ ] } }
+{ "automation": {
+  "maxWip": 2,
+  "maxWipByProvider": { "github": 2, "linear": 1 },
+  "maxSessions": { "freebuff": 6, "omp": 3 },
+  "rules": [
+    { "name": "address-changes", "type": "session", "maxWip": 1,
+      "match": { "plugins": ["github"], "statuses": ["NEEDS ATTENTION"] } }
+  ] } }
 ```
 
-Session rules stop starting at the cap, counted against the items still in
-the list that carry a `WORK IN PROGRESS` mark (a mark left behind by an item
-that is gone no longer holds a slot), and the round that hits it says so once
-on stderr. Nudge rules are unaffected, and pressing a hotkey yourself is
-never blocked -- the cap governs what automation starts, not what you ask
-for. `"maxWip": 0` keeps every rule configured but starts nothing, which is
-a kill switch for a service you want quiet for a while.
+`maxWip` caps every session at once, `maxWipByProvider` caps one plugin's
+items, a rule's own `maxWip` caps that rule alone, and `maxSessions` caps how
+many live sessions one AoE agent may hold -- the provider limit you would
+otherwise meet as a usage error. An agent budget needs to know which agent a
+dispatch will start, which is what [`session.agents`](#configuration)
+supplies through the same resolution the session action already uses; an item
+with no configured agent falls through to AoE's own default and is bound only
+by the other budgets. `0` is a real cap for each of them: the rule or
+provider keeps its configuration and starts nothing, which makes
+`"maxWip": 0` a kill switch for a service you want quiet for a while.
+
+Budgets count the items still in the list that are in flight, so a mark left
+behind by an item that is gone (merged, closed, archived) never wedges one.
+Only a live session suppresses a dispatch: a `WORK IN PROGRESS` mark counts
+toward a budget but does not block a rule, because nothing clears that mark
+automatically and skipping on it would disable the rule for that item for
+good. The round that hits a budget names it once on stderr. Nudge rules are
+unaffected by every budget, and pressing a hotkey yourself is never blocked --
+budgets govern what automation starts, not what you ask for.
 
 ### Running as a service
 

@@ -5293,6 +5293,137 @@ check "a rule whose action raised is not recorded as fired" \
   "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['fired']))" \
     "$AUTOMATION_STATE/attention/automation.json")" "0"
 
+# Budgets are independent: a rule's own cap, a provider's cap, and an agent's
+# cap each hold on their own, and a live AoE session both covers its item and
+# occupies its agent's slot.
+AUTOMATION_BUDGET="$AUTOMATION_DIR/budget.py"
+cat > "$AUTOMATION_BUDGET" <<PY
+import subprocess
+
+AUTHORS = {'1': 'alice', '2': 'alice', '3': 'bob', '4': 'bob'}
+
+
+def _item(item_id):
+    return {
+        'status': 'NEEDS ATTENTION', 'context': 'atrepo',
+        'title': f'Budget item {item_id}', 'details': '',
+        'weight': 90 - int(item_id), 'id': item_id, 'kind': 'pull_request',
+        'author': AUTHORS[item_id], 'repo': 'acme/one', 'repo_path': '$WORK',
+        'head_branch': f'branch-{item_id}', 'session_prompt': 'Fix it.',
+        'actions': [
+            {'key': 's', 'label': 'session', 'wip': False,
+             'payload': {'command': ['$SESSION_CMD', '-n', 'slug', '{input}']}},
+        ],
+    }
+
+
+def fetch(config):
+    return [_item(str(number)) for number in range(1, 5)]
+
+
+def act(key, payload):
+    subprocess.run(payload['command'], check=False)
+    return True
+PY
+
+AUTOMATION_FAKE_AOE="$AUTOMATION_DIR/aoe"
+AOE_FIXTURE="$WORK/aoe-sessions.json"
+cat > "$AUTOMATION_FAKE_AOE" <<SH
+#!/bin/sh
+cat "$AOE_FIXTURE"
+SH
+chmod +x "$AUTOMATION_FAKE_AOE"
+printf '[]\n' > "$AOE_FIXTURE"
+
+echo
+write_config <<JSON
+{"plugins": ["$AUTOMATION_BUDGET"], "automation": {"rules": [
+  {"name": "alice", "type": "session", "match": {"authors": ["alice"]}, "maxWip": 1},
+  {"name": "bob", "type": "session", "match": {"authors": ["bob"]}, "maxWip": 2}
+]}}
+JSON
+reset_automation
+AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list >/dev/null 2>&1
+check "a rule's own maxWip caps that rule and not its neighbours" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "3"
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_BUDGET"],
+ "automation": {"maxWipByProvider": {"$AUTOMATION_BUDGET": 1}, "rules": [
+  {"name": "all", "type": "session", "match": {"kinds": ["pull_request"]}}
+]}}
+JSON
+reset_automation
+provider_err="$(AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list 2>&1 >/dev/null)"
+check "automation.maxWipByProvider caps one provider's sessions" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "1"
+if grep -q 'maxWipByProvider' <<<"$provider_err"; then
+  ok "the exhausted provider budget is named on stderr"
+else
+  bad "the exhausted provider budget is named on stderr (got: $provider_err)"
+fi
+
+# A live freebuff session fills the agent's only slot.
+cat > "$AOE_FIXTURE" <<JSON
+[{"id": "abc", "title": "Busy elsewhere", "tool": "freebuff", "state": "live",
+  "worktree": {"branch": "unrelated"}}]
+JSON
+write_config <<JSON
+{"plugins": ["$AUTOMATION_BUDGET"],
+ "session": {"agents": [{"repo": "acme/*", "tool": "freebuff"}]},
+ "automation": {"maxSessions": {"freebuff": 1}, "rules": [
+  {"name": "all", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "{head_branch}"}
+]}}
+JSON
+reset_automation
+agent_err="$(AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list 2>&1 >/dev/null)"
+check "automation.maxSessions counts live sessions of that agent" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "0"
+if grep -q 'maxSessions.freebuff' <<<"$agent_err"; then
+  ok "the exhausted agent budget is named on stderr"
+else
+  bad "the exhausted agent budget is named on stderr (got: $agent_err)"
+fi
+
+# Snoozing that same session frees the agent's slot: the cap of one now lets
+# a single session start, where the live session above allowed none.
+cat > "$AOE_FIXTURE" <<JSON
+[{"id": "abc", "title": "Snoozed elsewhere", "tool": "freebuff", "state": "live",
+  "snoozed_until": "2999-01-01T00:00:00Z", "worktree": {"branch": "athal/branch-2"}}]
+JSON
+reset_automation
+AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list >/dev/null 2>&1
+check "a snoozed session frees its agent's slot" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "1"
+
+# A snoozed session covers nothing, so the item on its branch still starts.
+write_config <<JSON
+{"plugins": ["$AUTOMATION_BUDGET"], "automation": {"rules": [
+  {"name": "all", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "{head_branch}"}
+]}}
+JSON
+reset_automation
+AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list >/dev/null 2>&1
+check "a snoozed session suppresses nothing" \
+  "$(grep -c 'branch-2' "$AUTOMATION_LOG")" "1"
+
+# Without the snooze, the session covers the item on its branch: that one is
+# skipped and the other three start.
+cat > "$AOE_FIXTURE" <<JSON
+[{"id": "abc", "title": "Running now", "tool": "freebuff", "state": "live",
+  "worktree": {"branch": "athal/branch-2"}}]
+JSON
+reset_automation
+AOE_BIN="$AUTOMATION_FAKE_AOE" run_attention list >/dev/null 2>&1
+check "a live AoE session on the item's branch suppresses a start" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "3"
+check "the suppressed item is the one the session covers" \
+  "$(grep -c 'branch-2' "$AUTOMATION_LOG")" "0"
+
+printf '[]\n' > "$AOE_FIXTURE"
+
 # ---------------------------------------------------------------------------
 echo
 echo "== --help =="

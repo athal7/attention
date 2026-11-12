@@ -28,6 +28,12 @@ Two rule types:
 Message text is a `{field}` template resolved against the item (the same
 syntax configured actions and generic providers already use), defaulting
 to the item's `session_prompt` for session rules and its title otherwise.
+
+Caps are loaded here but enforced by the caller, which is the only side
+that knows what is already in flight: `load_max_wip` for the global cap,
+`load_limits` for per-provider and per-agent budgets, and `maxWip` on a
+rule for that rule alone. `fired_for` exposes the fired map so a caller can
+attribute a session already running to the rule that started it.
 """
 from __future__ import annotations
 
@@ -40,10 +46,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SECTION_FIELDS = {"rules", "maxWip"}
+SECTION_FIELDS = {"rules", "maxWip", "maxWipByProvider", "maxSessions"}
 
-RULE_FIELDS = {"name", "match", "type", "message", "cooldownMinutes"}
+RULE_FIELDS = {"name", "match", "type", "message", "cooldownMinutes", "maxWip"}
 RULE_TYPES = {"session", "nudge"}
+
+# Both cap how many sessions automation may have in flight at once; they
+# differ only in what they key on -- the item's provider, or the AoE agent
+# the dispatch will start.
+LIMIT_MAPS = ("maxWipByProvider", "maxSessions")
 
 NUDGE_STATUS = "NUDGE"
 NUDGE_PLUGIN = "automation"
@@ -109,6 +120,14 @@ def load_rules(config, normalize_match):
         ):
             return None, f"{path}.cooldownMinutes must be a non-negative integer"
 
+        rule_cap = raw_rule.get("maxWip")
+        if rule_cap is not None and (
+            isinstance(rule_cap, bool)
+            or not isinstance(rule_cap, int)
+            or rule_cap < 0
+        ):
+            return None, f"{path}.maxWip must be a non-negative integer"
+
         normalized_match, error = normalize_match(
             raw_rule.get("match"), f"{path}.match",
         )
@@ -120,9 +139,40 @@ def load_rules(config, normalize_match):
             "type": rule_type,
             "message": message,
             "cooldownMinutes": cooldown,
+            "maxWip": rule_cap,
             "match": normalized_match,
         })
     return rules, None
+
+
+def load_limits(config):
+    """Validate the per-provider and per-agent session caps.
+
+    Returns (limits, error), where limits holds two maps: providers by
+    plugin name (`maxWipByProvider`) and agent names (`maxSessions`). A
+    non-negative integer cap, or absent to leave that key uncapped; `0`
+    stops automation from starting anything of that provider or agent
+    while other keys keep their own budgets.
+    """
+    section = config.get("automation") if isinstance(config, dict) else None
+    limits = {field: {} for field in LIMIT_MAPS}
+    if not isinstance(section, dict):
+        return limits, None
+    for field in LIMIT_MAPS:
+        raw = section.get(field)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            return None, f"automation.{field} must be an object"
+        for name, cap in raw.items():
+            if not isinstance(name, str) or not name.strip():
+                return None, f"automation.{field} keys must be non-empty strings"
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+                return None, (
+                    f"automation.{field}.{name} must be a non-negative integer"
+                )
+            limits[field][name.strip()] = cap
+    return limits, None
 
 
 def _iso(timestamp):
@@ -274,12 +324,23 @@ def load_max_wip(config):
     return raw, None
 
 
-def evaluate(rules, items, *, matches, item_key, start_session, state_path, clock=None):
+def fired_for(state_path):
+    """The `fired` map, so a caller can attribute past starts to rules."""
+    return _read_state(state_path)["fired"]
+
+
+def evaluate(rules, items, *, matches, item_key, start_session, state_path,
+             in_progress=None, clock=None):
     """Fire every rule that is due, then return the still-pending nudges.
 
     A session rule is only recorded as fired once `start_session` reports
     it started, so a failed dispatch is retried on the next refresh.
     Nudges for rules that no longer exist are dropped.
+
+    `in_progress(item)` reports whether something outside automation is
+    already working the item -- a session running from a hotkey, say. Session
+    rules skip those; nudges still render, since a reminder about work in
+    flight is information rather than a second dispatch.
     """
     if not rules:
         return []
@@ -305,7 +366,9 @@ def evaluate(rules, items, *, matches, item_key, start_session, state_path, cloc
                     continue
                 message = _message_for(rule, item)
                 if rule["type"] == "session":
-                    if not start_session(item, message):
+                    if in_progress and in_progress(item):
+                        continue
+                    if not start_session(item, message, rule):
                         continue
                 else:
                     state["nudges"][key] = {
