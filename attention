@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -1129,9 +1130,18 @@ def apply_session_agent(items, config):
 
 _automation_warned = False
 
-# Per-run state for `automation.maxWip`: how many slots were taken when the
-# round began, and how many sessions it has already started from them.
-_automation_wip_gate = {"limit": None, "used": 0, "warned": False}
+# Per-round automation budget: the caps in force, what was already in flight
+# when the round began, and what this round has started out of those budgets.
+_automation_gate = {
+    "maxWip": None,
+    "maxWipByProvider": {},
+    "maxSessions": {},
+    "wip_used": 0,
+    "provider_used": {},
+    "rule_used": {},
+    "tool_used": {},
+    "warned": set(),
+}
 
 
 def load_automation_rules(config):
@@ -1156,6 +1166,129 @@ def load_automation_rules(config):
     return rules
 
 
+def load_automation_limits(config):
+    """Validated `automation.maxWipByProvider` / `automation.maxSessions`.
+
+    Returns None when the configuration is invalid, having disabled
+    automation for the run -- a cap that cannot be trusted must not be
+    silently ignored.
+    """
+    global _automation_warned
+    limits, error = automation.load_limits(config)
+    if error:
+        if not _automation_warned:
+            _automation_warned = True
+            print(
+                f"attention: invalid automation configuration: {error}; automation disabled.",
+                file=sys.stderr,
+            )
+        return None
+    return limits
+
+
+def live_aoe_sessions():
+    """Live AoE sessions, snoozed ones excluded, read once per round.
+
+    This is the only record of work already in flight outside this process:
+    `aoe list --state live --json` costs one subprocess per round, and a
+    snoozed session is one the user has explicitly set aside, so it neither
+    covers its item nor holds an agent slot. Any failure (no aoe, a daemon
+    that will not answer, unparseable output) reads as "nothing running"
+    rather than failing the refresh.
+    """
+    aoe_bin = os.environ.get("AOE_BIN") or "aoe"
+    try:
+        result = subprocess.run(
+            [aoe_bin, "list", "--all", "--state", "live", "--json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        rows = json.loads(result.stdout) if result.returncode == 0 else []
+    except Exception:
+        rows = []
+    now = datetime.now(timezone.utc)
+    sessions = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        snoozed_until = row.get("snoozed_until")
+        if isinstance(snoozed_until, str) and snoozed_until:
+            try:
+                wakes = datetime.fromisoformat(snoozed_until.replace("Z", "+00:00"))
+            except ValueError:
+                wakes = None
+            if wakes is not None and wakes > now:
+                continue
+        sessions.append(row)
+    return sessions
+
+
+def _session_branch(session):
+    worktree = session.get("worktree")
+    branch = worktree.get("branch") if isinstance(worktree, dict) else None
+    return branch.casefold() if isinstance(branch, str) and branch else ""
+
+
+def item_in_live_session(item, sessions):
+    """Whether a live AoE session already covers this item.
+
+    GitHub items carry the head branch of their pull request, and an AoE
+    session's worktree is cut from that same branch, so the branch name is
+    the join (a session branch may still be prefixed with the owner, hence
+    the suffix test). Linear sessions are titled with the issue identifier,
+    which a branch may carry too. Providers with neither join never match,
+    rather than guessing from titles alone.
+    """
+    head = item.get("head_branch")
+    if isinstance(head, str) and head.strip():
+        head = head.strip().casefold()
+        return any(
+            branch == head or branch.endswith("/" + head)
+            for branch in (_session_branch(session) for session in sessions)
+            if branch
+        )
+    if item.get("_plugin") != "linear":
+        return False
+    identifier = item.get("id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    identifier = identifier.strip().casefold()
+    for session in sessions:
+        title = session.get("title")
+        if isinstance(title, str) and identifier in title.casefold():
+            return True
+        if identifier in _session_branch(session):
+            return True
+    return False
+
+
+def _automation_session_tool(item):
+    """The agent this item's session will start, from `session.agents`.
+
+    Empty when the item's provider or repository has no configured agent: the
+    dispatch then falls through to AoE's own default, which automation cannot
+    predict and so does not budget for.
+    """
+    action = _automation_session_action(item)
+    if action is None:
+        return ""
+    tool = (action.get("payload") or {}).get("session_tool")
+    return tool if isinstance(tool, str) else ""
+
+
+def _automation_cap_reached(name, used, limit):
+    """Whether a budget is spent, naming it once per round on stderr."""
+    if limit is None or used < limit:
+        return False
+    if name not in _automation_gate["warned"]:
+        _automation_gate["warned"].add(name)
+        print(
+            f"attention: not starting an automation session: {used} already in"
+            f" flight and automation.{name} is {limit}.",
+            file=sys.stderr,
+        )
+    return True
+
+
 def _automation_session_action(item):
     """The item's configured session action, or None if it has none."""
     for action in item.get("actions", []):
@@ -1172,7 +1305,7 @@ def _automation_session_action(item):
     return None
 
 
-def start_automation_session(item, message):
+def start_automation_session(item, message, rule):
     """Start the item's configured session action with `message` as `{input}`.
 
     Same command a `session` hotkey runs, minus the prompt: the input is
@@ -1181,19 +1314,33 @@ def start_automation_session(item, message):
     `{input}` placeholder, or one whose command resolves an empty token,
     starts nothing -- better to skip than to launch an agent with no
     instructions or in the wrong directory.
+
+    Every budget is checked before the dispatch: the global `maxWip`, the
+    item provider's `maxWipByProvider`, this rule's own `maxWip`, and the
+    agent's `maxSessions`. Counters are per round as well as from existing
+    state, so one round cannot exceed a budget before any of its starts are
+    visible anywhere else.
     """
-    limit = _automation_wip_gate["limit"]
-    if limit is not None and _automation_wip_gate["used"] >= limit:
-        # Counted per round, not just from the WIP file, so one round cannot
-        # start more sessions than the cap allows before any of them is marked.
-        if not _automation_wip_gate["warned"]:
-            _automation_wip_gate["warned"] = True
-            print(
-                "attention: not starting an automation session:"
-                f" {_automation_wip_gate['used']} item(s) already work in progress"
-                f" and automation.maxWip is {limit}.",
-                file=sys.stderr,
-            )
+    gate = _automation_gate
+    plugin = item.get("_plugin", "")
+    tool = _automation_session_tool(item)
+    if _automation_cap_reached("maxWip", gate["wip_used"], gate["maxWip"]):
+        return False
+    if _automation_cap_reached(
+        f"maxWipByProvider.{plugin}" if plugin else "maxWipByProvider",
+        gate["provider_used"].get(plugin, 0),
+        gate["maxWipByProvider"].get(plugin),
+    ):
+        return False
+    if _automation_cap_reached(
+        f"rules.{rule['name']}.maxWip",
+        gate["rule_used"].get(rule["name"], 0),
+        rule.get("maxWip"),
+    ):
+        return False
+    if tool and _automation_cap_reached(
+        f"maxSessions.{tool}", gate["tool_used"].get(tool, 0), gate["maxSessions"].get(tool),
+    ):
         return False
     action = _automation_session_action(item)
     if action is None:
@@ -1233,7 +1380,11 @@ def start_automation_session(item, message):
             file=sys.stderr,
         )
     else:
-        _automation_wip_gate["used"] += 1
+        gate["wip_used"] += 1
+        gate["provider_used"][plugin] = gate["provider_used"].get(plugin, 0) + 1
+        gate["rule_used"][rule["name"]] = gate["rule_used"].get(rule["name"], 0) + 1
+        if tool:
+            gate["tool_used"][tool] = gate["tool_used"].get(tool, 0) + 1
     return started
 
 
@@ -1251,23 +1402,68 @@ def apply_automation(items, config):
                 file=sys.stderr,
             )
         return items
+    limits = load_automation_limits(config)
+    if limits is None:
+        return items
     rules = load_automation_rules(config)
     if not rules:
         return items
-    # Only items still in the list hold a slot, so a WIP mark left behind by
-    # an item that is gone (merged, closed, archived) never wedges the cap.
-    wip_items = get_wip_items() if limit is not None else set()
-    _automation_wip_gate.update(
-        limit=limit,
-        used=sum(1 for item in items if get_wip_item_id(item) in wip_items),
-        warned=False,
+    state_path = get_automation_state_path()
+    # Only items still in the list hold a slot, so a mark left behind by an
+    # item that is gone (merged, closed, archived) never wedges a budget.
+    wip_items = get_wip_items()
+    sessions = live_aoe_sessions()
+
+    def covered_by_session(item):
+        """Whether a live AoE session is already working this item."""
+        return item_in_live_session(item, sessions)
+
+    # A budget slot is held by anything in flight: marked WIP here, or running
+    # under a live session. Only the live session suppresses a dispatch -- a
+    # WIP mark outlives the session that set it and nothing clears it, so
+    # skipping on it would wedge a rule for that item for good.
+    in_flight = [
+        item for item in items
+        if get_wip_item_id(item) in wip_items or covered_by_session(item)
+    ]
+    provider_used = {}
+    for item in in_flight:
+        plugin = item.get("_plugin", "")
+        provider_used[plugin] = provider_used.get(plugin, 0) + 1
+    # A rule's budget counts sessions it started that are still in flight; its
+    # starts are keyed "<rule>|<item key>" in the fired map.
+    fired = automation.fired_for(state_path)
+    in_flight_keys = {get_wip_item_id(item) for item in in_flight}
+    rule_used = {
+        rule["name"]: sum(
+            1 for key in in_flight_keys if f"{rule['name']}|{key}" in fired
+        )
+        for rule in rules
+    }
+    # Agent budgets are about the provider's capacity, so every live session of
+    # that agent holds a slot -- including ones no attention item is behind.
+    tool_used = {}
+    for session in sessions:
+        tool = session.get("tool")
+        if isinstance(tool, str) and tool:
+            tool_used[tool] = tool_used.get(tool, 0) + 1
+    _automation_gate.update(
+        maxWip=limit,
+        maxWipByProvider=limits["maxWipByProvider"],
+        maxSessions=limits["maxSessions"],
+        wip_used=len(in_flight),
+        provider_used=provider_used,
+        rule_used=rule_used,
+        tool_used=tool_used,
+        warned=set(),
     )
     nudges = automation.evaluate(
         rules, items,
         matches=_group_matches,
         item_key=get_wip_item_id,
         start_session=start_automation_session,
-        state_path=get_automation_state_path(),
+        state_path=state_path,
+        in_progress=covered_by_session,
     )
     if not nudges:
         return items
