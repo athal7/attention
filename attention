@@ -17,8 +17,10 @@ the box, gated only by their own auth availability.
 from __future__ import annotations
 
 import base64
+import contextlib
 import curses
 import fcntl
+import io
 import importlib.util
 import json
 import os
@@ -46,12 +48,20 @@ DEFAULT_PLUGINS = ["calendar", "reminders", "github", "linear", "generic"]
 
 
 _WIP_STATE_FILENAME = "wip.json"
+_AUTOMATION_STATE_FILENAME = "automation.json"
 _wip_items = None
 
 
 def get_wip_state_path():
     xdg_state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     return Path(xdg_state_home) / "attention" / _WIP_STATE_FILENAME
+
+
+def get_automation_state_path():
+    """Automation remembers fired rules and pending nudges next to the
+    work-in-progress marks, in the same state directory.
+    """
+    return get_wip_state_path().with_name(_AUTOMATION_STATE_FILENAME)
 
 
 def _read_wip_items():
@@ -179,6 +189,12 @@ _dashboard_spec = importlib.util.spec_from_file_location(
 )
 dashboard = importlib.util.module_from_spec(_dashboard_spec)
 _dashboard_spec.loader.exec_module(dashboard)
+
+_automation_spec = importlib.util.spec_from_file_location(
+    "automation", Path(__file__).resolve().parent / "automation.py"
+)
+automation = importlib.util.module_from_spec(_automation_spec)
+_automation_spec.loader.exec_module(automation)
 
 _plugin_cache = {}
 
@@ -1111,6 +1127,157 @@ def apply_session_agent(items, config):
                 payload["session_tool"] = tool
 
 
+_automation_warned = False
+
+# Per-run state for `automation.maxWip`: how many slots were taken when the
+# round began, and how many sessions it has already started from them.
+_automation_wip_gate = {"limit": None, "used": 0, "warned": False}
+
+
+def load_automation_rules(config):
+    """Validated `automation.rules`; a bad configuration disables
+    automation for the run (warned once, never repeated per render).
+    """
+    global _automation_warned
+    rules, error = automation.load_rules(
+        config,
+        normalize_match=lambda raw, path: _normalize_group_match(
+            raw, path, allow_any=True,
+        ),
+    )
+    if error:
+        if not _automation_warned:
+            _automation_warned = True
+            print(
+                f"attention: invalid automation configuration: {error}; automation disabled.",
+                file=sys.stderr,
+            )
+        return []
+    return rules
+
+
+def _automation_session_action(item):
+    """The item's configured session action, or None if it has none."""
+    for action in item.get("actions", []):
+        label = action.get("label")
+        payload = action.get("payload")
+        if (
+            isinstance(label, str)
+            and label.strip().casefold() in {"session", "new session"}
+            and isinstance(payload, dict)
+            and isinstance(payload.get("command"), list)
+            and payload["command"]
+        ):
+            return action
+    return None
+
+
+def start_automation_session(item, message):
+    """Start the item's configured session action with `message` as `{input}`.
+
+    Same command a `session` hotkey runs, minus the prompt: the input is
+    forced into the background so an automated start never opens a
+    terminal window or blocks the dashboard. A session action with no
+    `{input}` placeholder, or one whose command resolves an empty token,
+    starts nothing -- better to skip than to launch an agent with no
+    instructions or in the wrong directory.
+    """
+    limit = _automation_wip_gate["limit"]
+    if limit is not None and _automation_wip_gate["used"] >= limit:
+        # Counted per round, not just from the WIP file, so one round cannot
+        # start more sessions than the cap allows before any of them is marked.
+        if not _automation_wip_gate["warned"]:
+            _automation_wip_gate["warned"] = True
+            print(
+                "attention: not starting an automation session:"
+                f" {_automation_wip_gate['used']} item(s) already work in progress"
+                f" and automation.maxWip is {limit}.",
+                file=sys.stderr,
+            )
+        return False
+    action = _automation_session_action(item)
+    if action is None:
+        return False
+    command = action["payload"]["command"]
+    if not any(isinstance(token, str) and "{input}" in token for token in command):
+        return False
+    filled = [
+        token.replace("{input}", message) if isinstance(token, str) else token
+        for token in command
+    ]
+    if any(not isinstance(token, str) or not token for token in filled):
+        return False
+    payload = {
+        key: value for key, value in action["payload"].items() if key != "inputs"
+    }
+    payload["command"] = filled
+    payload["terminal"] = False
+    payload["background"] = True
+    # Automation runs behind `attention list`'s tab-delimited output and the
+    # curses dashboard, so a dispatch's own chatter only surfaces on failure.
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            started = dispatch_item_action(dict(action, payload=payload)) is not False
+    except Exception as error:
+        # A raising action (a missing binary in a service's PATH, say) must not
+        # take down the list or dashboard that merely triggered it -- the same
+        # way the keypress path reports it instead of propagating.
+        started = False
+        print(f"{error}", file=output)
+    if not started:
+        detail = output.getvalue().strip()
+        print(
+            "attention: automation could not start a session"
+            f" for {item.get('title', '')!r}{': ' + detail if detail else ''}",
+            file=sys.stderr,
+        )
+    else:
+        _automation_wip_gate["used"] += 1
+    return started
+
+
+def apply_automation(items, config):
+    """Fire `automation.rules` against a snapshot, then add the nudges
+    still pending from earlier rounds back on top of it.
+    """
+    global _automation_warned
+    limit, limit_error = automation.load_max_wip(config)
+    if limit_error:
+        if not _automation_warned:
+            _automation_warned = True
+            print(
+                f"attention: invalid automation configuration: {limit_error}; automation disabled.",
+                file=sys.stderr,
+            )
+        return items
+    rules = load_automation_rules(config)
+    if not rules:
+        return items
+    # Only items still in the list hold a slot, so a WIP mark left behind by
+    # an item that is gone (merged, closed, archived) never wedges the cap.
+    wip_items = get_wip_items() if limit is not None else set()
+    _automation_wip_gate.update(
+        limit=limit,
+        used=sum(1 for item in items if get_wip_item_id(item) in wip_items),
+        warned=False,
+    )
+    nudges = automation.evaluate(
+        rules, items,
+        matches=_group_matches,
+        item_key=get_wip_item_id,
+        start_session=start_automation_session,
+        state_path=get_automation_state_path(),
+    )
+    if not nudges:
+        return items
+    failures = [item for item in items if item.get("_collector_failure")]
+    visible = [item for item in items if not item.get("_collector_failure")]
+    visible.extend(nudges)
+    visible.sort(key=lambda item: item.get("weight", 0), reverse=True)
+    return [*visible, *failures]
+
+
 def _tree_order(items):
     by_identity = {
         item["identity_key"]: item
@@ -1241,16 +1408,21 @@ def build_snapshot(items_by_plugin, recently_acted=None):
     return [*items, *failures]
 
 
-def build_prioritized_items(config, recently_acted=None):
+def build_prioritized_items(config, recently_acted=None, apply_rules=True):
     """Fetch every configured plugin, group the results by which plugin
     produced each item, and delegate to build_snapshot() for the merge/
     age-boost/recently-acted/sort pipeline shared with the interactive
-    dashboard's per-round snapshots.
+    dashboard's per-round snapshots, then apply automation rules.
+
+    `apply_rules=False` skips the automation pass for read-only callers
+    that inspect the list (`expect-keys`); automation fires actions and
+    writes state, so only the display/act paths run it.
     """
     items_by_plugin = {}
     for item in fetch_all(config):
         items_by_plugin.setdefault(item.get("_plugin"), []).append(item)
-    return build_snapshot(items_by_plugin, recently_acted)
+    items = build_snapshot(items_by_plugin, recently_acted)
+    return apply_automation(items, config) if apply_rules else items
 
 
 def print_rows():
@@ -1261,10 +1433,14 @@ def print_rows():
 def dispatch_item_action(action):
     """Run a normalized source action and apply its WIP transition."""
     plugin = action["_plugin"]
-    mod = load_plugin(plugin)
     payload = action.get("payload")
     if not isinstance(payload, dict):
         raise ValueError(f"plugin '{plugin}' act() received a malformed payload: expected a dictionary, got {type(payload).__name__}")
+    if plugin == automation.NUDGE_PLUGIN and payload.get("kind") == "dismiss_nudge":
+        return automation.dismiss_nudge(
+            payload.get("nudge_id"), get_automation_state_path(),
+        )
+    mod = load_plugin(plugin)
     completed = mod.act(action.get("_original_key", action.get("key", "")), payload)
     if completed is False:
         return False
@@ -1354,11 +1530,18 @@ def run_dashboard():
         presenter = dashboard.CursesPresenter()
         render_rows = lambda items: render_dashboard_rows(_tree_order(items))
 
+    def build_automated_snapshot(items_by_plugin, recently_acted):
+        # Idempotent: a rule records what it already fired, so re-rendering a
+        # round never repeats a session start or a nudge.
+        return apply_automation(
+            build_snapshot(items_by_plugin, recently_acted), config,
+        )
+
     controller = dashboard.DashboardController(
         plugin_names, presenter,
         fetch_plugin=fetch_plugin,
         on_fetch_error=collector_failure_item,
-        build_snapshot=build_snapshot,
+        build_snapshot=build_automated_snapshot,
         render_rows=render_rows,
         act=act,
         acknowledge_action=acknowledge_action,
@@ -1375,7 +1558,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "act":
         act(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 1 and sys.argv[1] == "expect-keys":
-        print(",".join(expect_keys_for(build_prioritized_items(load_config()))))
+        print(",".join(expect_keys_for(build_prioritized_items(load_config(), apply_rules=False))))
     elif len(sys.argv) > 1 and sys.argv[1] == "list":
         print_rows()
     elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):

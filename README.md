@@ -18,6 +18,13 @@ brew install athal7/tap/attention
 The dashboard uses Python's built-in curses UI. Everything else below is
 optional, per plugin.
 
+To run the list on a schedule -- which is what makes automation fire without
+you opening the dashboard -- install it as a [service](#running-as-a-service):
+
+```sh
+brew services start attention
+```
+
 ## Usage
 
 ```sh
@@ -44,6 +51,7 @@ An item is marked work in progress by running a custom action configured with `"
 |---|---|
 | Calendar event | `y` yank to clipboard; `x` (+ digits for extra linked reminders) complete a reminder matched to this event by title |
 | Reminder | `x` complete |
+| Nudge (from an automation rule) | `d` dismiss |
 | GitHub PR/issue | `o` open · `a` approve · `m` merge (only for a verified Merge ready PR; confirms, rechecks state and pins the displayed head commit) · `c` comment · `g` add label. If the item cross-links to a Linear issue (title contains its identifier), that issue's open/comment/transition actions are folded in too, each labeled *(linked)*; any key that collides with an existing one is remapped to a digit, shown in the footer hint |
 | Linear issue | `o` open · `c` comment · `t` transition (lists the issue's own team's workflow states) |
 
@@ -85,6 +93,24 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
       { "path": "~/code/personal", "tool": "freebuf" }
     ]
   },
+  "automation": {
+    "maxWip": 2,
+    "rules": [
+      {
+        "name": "pick-up-changes",
+        "type": "session",
+        "match": { "plugins": ["github"], "statuses": ["NEEDS ATTENTION"] },
+        "message": "Address the requested changes on {title}."
+      },
+      {
+        "name": "stale-nudge",
+        "type": "nudge",
+        "match": { "kinds": ["pull_request"], "statuses": ["REVIEW REQUESTED"] },
+        "message": "{title} has waited since {created_at}.",
+        "cooldownMinutes": 1440
+      }
+    ]
+  },
   "dashboard": {
     "autoExpand": true,
     "groups": [
@@ -108,13 +134,123 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}`), optional `"terminal": true` to run in a separate terminal window, optional `"background": true` for fire-and-forget commands, optional `"wip"` to update work-in-progress state, optional `"read": true` for an action that only reads (open, copy) so running it leaves the item in place instead of moving it down the list, and optional `"input"`/`"inputs"` prompts (see [PLUGINS.md](PLUGINS.md)). GitHub action templates also expose `{head_branch}` and `{base_branch}` for PR worktrees (empty when unavailable). An action labeled `session` or `New session` also gets the agent `session.agents` resolves for the item, both as `AOE_TOOL` in the action process's environment and as the `{session_tool}` placeholder. |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `session.agents` | Which agent AoE sessions start per repository or directory. Each entry pairs an AoE `tool` (`aoe add --tool`, e.g. `omp` or `freebuf`) with either a GitHub `repo` -- `"owner/name"` or an `"owner/*"` owner prefix, matched case-insensitively from the item's repository -- or a `path` (a directory; `~` is expanded). An exact repository match beats an owner prefix; the longest configured directory containing the item's project directory is the fallback. This drives both the generated `New session` action and configured actions labeled `session`/`New session`. Items matching no entry keep AoE's default agent. An invalid entry fails the refresh instead of starting the wrong agent. |
+| `automation.rules` | Rules that act on the fetched list without a keypress: each has a unique `name`, a `type` (`"session"` or `"nudge"`), a required `match` using the same selectors as a dashboard group, an optional `message` (`{field}` template), and an optional `cooldownMinutes`. See [Automation](#automation). |
+| `automation.maxWip` | Non-negative integer cap on items work in progress at once; session rules stop starting when it is reached. Unset means no cap, `0` starts nothing. Manual hotkeys are never blocked. |
 | `dashboard.autoExpand` | `true` opens the dashboard with every group expanded instead of collapsed. Default `false`; groups still toggle with `Enter`, and a filter expands matching groups regardless. |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, `authors`, and/or `any`) or `fallback: true`. `contextPrefixes` matches an item's `context` or the provider-qualified identity it reports as `repo`, so an organization prefix groups GitHub items even though their rows show only the repository name. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
+
+### Automation
+
+`automation.rules` reuses the `{field}` templates and `session` actions you
+already configure, but runs them without a keypress. A rule fires at most
+once per item -- or again once its `cooldownMinutes` has passed -- and what
+it has fired is remembered in `$XDG_STATE_HOME/attention/automation.json`,
+so refreshing never repeats work.
+
+```json
+{ "automation": { "rules": [
+  { "name": "pick-up-changes", "type": "session",
+    "match": { "plugins": ["github"], "statuses": ["NEEDS ATTENTION"] },
+    "message": "Address the requested changes on {title}." },
+  { "name": "stale-nudge", "type": "nudge",
+    "match": { "kinds": ["pull_request"], "statuses": ["REVIEW REQUESTED"] },
+    "message": "{title} has waited since {created_at}.",
+    "cooldownMinutes": 1440 }
+] } }
+```
+
+`match` takes the same selectors as a [dashboard
+group](#dashboard-groups) (`plugins`, `kinds`, `contexts`,
+`contextPrefixes`, `statuses`, `authors`, and `any`) and is required: a
+rule without one would fire for every item.
+
+A `session` rule starts the item's own `session` / `New session` action --
+the same command its hotkey runs -- with the rule's message filled into
+`{input}`, in the background and without a prompt. The action's `command`
+must contain `{input}`, and every token must resolve non-empty; otherwise
+nothing starts, rather than launching an agent with no instructions or in
+the wrong directory. Without a `message`, the item's `session_prompt` is
+used, so the GitHub source's state-aware prompts ("Fix the failing CI
+checks.", "Review it.") carry over unchanged.
+
+A `nudge` rule adds a `NUDGE` row carrying the item's title and context
+plus the resolved message, ranked just above the item it is about. Nudges
+are remembered until you dismiss them with `d`, so they outlast refreshes
+and restarts even after the item itself has moved down the list.
+
+Rules run wherever the list is built: the dashboard, and `attention list`
+-- so a cron entry, a `launchd` agent, or `brew services` (see [Running as
+a service](#running-as-a-service)) is a headless nudge/session runner.
+`expect-keys` and `act` never fire rules. An invalid `automation`
+configuration disables automation with one warning instead of half-applying
+rules.
+
+`automation.maxWip` caps how many items may be work in progress at once, so
+a broad rule cannot fan out into a dozen agent sessions:
+
+```json
+{ "automation": { "maxWip": 2, "rules": [ /* ... */ ] } }
+```
+
+Session rules stop starting at the cap, counted against the items still in
+the list that carry a `WORK IN PROGRESS` mark (a mark left behind by an item
+that is gone no longer holds a slot), and the round that hits it says so once
+on stderr. Nudge rules are unaffected, and pressing a hotkey yourself is
+never blocked -- the cap governs what automation starts, not what you ask
+for. `"maxWip": 0` keeps every rule configured but starts nothing, which is
+a kill switch for a service you want quiet for a while.
+
+### Running as a service
+
+`attention list` needs no terminal: it prints its rows, fires any due rule,
+and starts sessions detached (`start_new_session`), so whatever it launches
+outlives the run that launched it. That makes it safe to run on a timer.
+
+```sh
+brew services start attention   # and again at login
+brew services info attention    # state, schedule, and log paths
+brew services stop attention
+```
+
+The formula defines that service as `attention list` on a 15-minute interval
+through a LaunchAgent -- `brew services info attention` shows the schedule
+and the log paths. Every tick picks up new items, starts the sessions your
+`session` rules are due, and re-asserts pending nudges. Automation state is
+shared with the interactive dashboard -- the nudge a tick raised is a row you
+can dismiss with `d`, and a session it started shows `WORK IN PROGRESS` -- so
+the two never disagree or double-fire. Consider setting
+[`automation.maxWip`](#automation) before turning the timer on.
+
+**`PATH` is the one thing that bites.** A service starts with launchd's bare
+`PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which cannot find `gh`, `aoe`, or
+`remindctl`; rules then fail closed and warn on stderr instead of starting
+sessions. Point the service at your real `PATH` in Homebrew's per-service env
+file, which survives upgrades and applies on the next `brew services restart`:
+
+```sh
+# ~/.homebrew/services/attention.env
+PATH=/opt/homebrew/bin:/usr/local/bin:/Users/you/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+```
+
+Anything else your session command needs from the environment (an agent's
+API key, a `AOE_*` default) belongs in that same file; it is plain text, so
+keep it `chmod 600`. Two more service notes: calendar and reminder plugins
+shell out to CLIs whose macOS privacy grants follow those binaries rather
+than `attention`, so they normally keep working here, and `"terminal": true`
+actions have no window to open from a timer -- automation forces background
+dispatch, so it never asks for one.
+
+No Homebrew? Any periodic `attention list` works the same way -- a launchd
+agent of your own, a cron entry, a systemd timer -- as long as `PATH` and
+your config are reachable. `attention` exits 0 with an empty list, so a
+scheduler has nothing to report.
 
 ### Dashboard groups
 
 The dashboard opens with type groups for pull requests, issues, reminders,
 events, and other items, collapsed unless `dashboard.autoExpand` is `true`.
+Automation nudges make up their own `nudge` kind, so a `kinds: ["nudge"]`
+group can collect them and the default grouping falls back to `Other`.
 Use Up/Down or `j`/`k` to select a group and Enter to expand or collapse it
 in place. Select an item and press Enter for its primary action. Press `/`
 to filter, `r` to refresh, or Esc to quit. The dashboard fetches once on open

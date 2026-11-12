@@ -4998,6 +4998,303 @@ check "an unmatched item leaves the {session_tool} placeholder empty" \
 
 # ---------------------------------------------------------------------------
 echo
+echo "== automation: rules that start sessions and raise nudges =="
+
+AUTOMATION_DIR="$WORK/automation"
+mkdir -p "$AUTOMATION_DIR"
+AUTOMATION_LOG="$WORK/automation-session.log"
+SESSION_CMD="$AUTOMATION_DIR/session.sh"
+cat > "$SESSION_CMD" <<SH
+#!/bin/sh
+printf 'ARGS:%s\n' "\$*" >> "$AUTOMATION_LOG"
+SH
+chmod +x "$SESSION_CMD"
+
+AUTOMATION_PLUGIN="$AUTOMATION_DIR/plugin.py"
+cat > "$AUTOMATION_PLUGIN" <<PY
+import subprocess
+
+
+def _item(command, item_id="7", title="AutomateABLE item"):
+    return {
+        'status': 'NEEDS ATTENTION', 'context': 'atrepo', 'title': title,
+        'details': '', 'weight': 88, 'id': item_id, 'kind': 'pull_request',
+        'session_prompt': 'Address the requested changes.',
+        'actions': [
+            {'key': 's', 'label': 'session', 'wip': True,
+             'payload': {'command': command}},
+        ],
+    }
+
+
+def fetch(config):
+    return [
+        _item(['$SESSION_CMD', '-n', 'slug', '{input}']),
+        _item(['$SESSION_CMD', '-n', 'no-input'], item_id='8', title='No input item'),
+    ]
+
+
+def act(key, payload):
+    subprocess.run(payload['command'], check=False)
+    return True
+PY
+
+# The second item's session action has no {input} placeholder: an automation
+# rule must never start it.
+
+AUTOMATION_STATE="$WORK/automation-state"
+reset_automation() {
+  rm -rf "$AUTOMATION_STATE"
+  : > "$AUTOMATION_LOG"
+}
+
+run_attention() {
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$XDG_CONFIG" XDG_STATE_HOME="$AUTOMATION_STATE" \
+    python3 "$ATTENTION" "$@"
+}
+
+write_config <<JSON
+{
+  "plugins": ["$AUTOMATION_PLUGIN"],
+  "automation": {"rules": [
+    {"name": "pick-up", "type": "session", "match": {"kinds": ["pull_request"], "statuses": ["NEEDS ATTENTION"]}}
+  ]}
+}
+JSON
+
+reset_automation
+run_attention list >/dev/null
+check "a session rule starts the item's session action once" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "1"
+check "an empty rule message falls back to the item's session_prompt" \
+  "$(sed -n 1p "$AUTOMATION_LOG")" "ARGS:-n slug Address the requested changes."
+run_attention list >/dev/null
+check "the same item's rule does not fire again on the next run" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "1"
+second_run_list="$(run_attention list)"
+if grep -q 'WORK IN PROGRESS' <<<"$second_run_list"; then
+  ok "an automated session goes through the action's wip mark"
+else
+  bad "an automated session goes through the action's wip mark"
+fi
+if grep -q 'No input item' <<<"$second_run_list"; then
+  ok "a rule does not fire while its plugin item is still listed"
+else
+  bad "a rule does not fire while its plugin item is still listed"
+fi
+check "a session action without {input} is never started automatically" \
+  "$(grep -c 'no-input' "$AUTOMATION_LOG")" "0"
+
+write_config <<JSON
+{
+  "plugins": ["$AUTOMATION_PLUGIN"],
+  "automation": {"rules": [
+    {"name": "again", "type": "session", "cooldownMinutes": 0,
+     "match": {"kinds": ["pull_request"]},
+     "message": "Handle {title} now"}
+  ]}
+}
+JSON
+
+reset_automation
+run_attention list >/dev/null
+run_attention list >/dev/null
+check "an expired cooldown lets the rule fire again" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "2"
+check "a rule message template resolves {field} against the item" \
+  "$(sed -n 1p "$AUTOMATION_LOG")" "ARGS:-n slug Handle AutomateABLE item now"
+
+write_config <<JSON
+{
+  "plugins": ["$AUTOMATION_PLUGIN"],
+  "automation": {"rules": [
+    {"name": "stale", "type": "nudge", "match": {"statuses": ["NEEDS ATTENTION"]},
+     "message": "{title} in {context} still needs you"}
+  ]}
+}
+JSON
+
+reset_automation
+nudge_list="$(run_attention list)"
+if grep -q 'NUDGE' <<<"$nudge_list" && grep -q 'AutomateABLE item in atrepo still needs you' <<<"$nudge_list"; then
+  ok "a nudge rule adds a NUDGE row with the resolved message"
+else
+  bad "a nudge rule adds a NUDGE row with the resolved message (got: $nudge_list)"
+fi
+if grep -q 'WORK IN PROGRESS' < <(run_attention list | grep 'NUDGE'); then
+  bad "a nudge is not itself work in progress"
+else
+  ok "a nudge is not itself work in progress"
+fi
+while IFS= read -r nudge_row; do
+  run_attention act d "$nudge_row" > /dev/null
+done < <(grep 'NUDGE' <<<"$nudge_list")
+if grep -q 'NUDGE' < <(run_attention list); then
+  bad "dismissing a nudge removes it from the next snapshot"
+else
+  ok "dismissing a nudge removes it from the next snapshot"
+fi
+reset_automation
+nudge_list="$(run_attention list)"
+if grep -q 'NUDGE' <<<"$nudge_list"; then
+  ok "a fresh state file raises the nudge again"
+else
+  bad "a fresh state file raises the nudge again"
+fi
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_PLUGIN"], "automation": {"rules": [
+  {"name": "broken", "type": "teleport", "match": {"kinds": ["pull_request"]}}
+]}}
+JSON
+
+reset_automation
+broken_err="$(run_attention list 2>&1 >/dev/null)"
+if grep -q 'invalid automation configuration' <<<"$broken_err"; then
+  ok "a malformed automation rule warns instead of crashing"
+else
+  bad "a malformed automation rule warns instead of crashing (got: $broken_err)"
+fi
+check "a malformed automation configuration starts nothing" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "0"
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_PLUGIN"], "automation": {"rules": [
+  {"name": "keys", "type": "session", "match": {"kinds": ["pull_request"]}}
+]}}
+JSON
+
+reset_automation
+run_attention expect-keys >/dev/null
+check "expect-keys never fires automation rules" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "0"
+
+# automation.maxWip caps how many sessions automation may have going at once.
+AUTOMATION_CAPPED="$AUTOMATION_DIR/capped.py"
+cat > "$AUTOMATION_CAPPED" <<PY
+import subprocess
+
+
+def _item(item_id):
+    return {
+        'status': 'NEEDS ATTENTION', 'context': 'atrepo', 'title': f'Capped item {item_id}',
+        'details': '', 'weight': 90 - int(item_id), 'id': item_id, 'kind': 'pull_request',
+        'actions': [
+            {'key': 's', 'label': 'session', 'wip': True,
+             'payload': {'command': ['$SESSION_CMD', '-n', 'slug', '{input}']}},
+        ],
+    }
+
+
+def fetch(config):
+    return [_item('1'), _item('2'), _item('3')]
+
+
+def act(key, payload):
+    subprocess.run(payload['command'], check=False)
+    return True
+PY
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_CAPPED"], "automation": {"maxWip": 2, "rules": [
+  {"name": "busy", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "Work on {title}"}
+]}}
+JSON
+
+reset_automation
+capped_err="$(run_attention list 2>&1 >/dev/null)"
+check "automation.maxWip limits how many sessions one round starts" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "2"
+if grep -q 'automation.maxWip is 2' <<<"$capped_err"; then
+  ok "hitting the work in progress cap is reported once on stderr"
+else
+  bad "hitting the work in progress cap is reported once on stderr (got: $capped_err)"
+fi
+run_attention list >/dev/null 2>&1
+check "a later round does not start past the cap either" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "2"
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_CAPPED"], "automation": {"maxWip": 0, "rules": [
+  {"name": "busy", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "Work on {title}"}
+]}}
+JSON
+
+reset_automation
+run_attention list >/dev/null 2>&1
+check "maxWip 0 starts nothing while keeping the rules configured" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "0"
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_CAPPED"], "automation": {"maxWip": "two", "rules": [
+  {"name": "busy", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "Work on {title}"}
+]}}
+JSON
+
+reset_automation
+bad_cap_err="$(run_attention list 2>&1 >/dev/null)"
+if grep -q 'invalid automation configuration' <<<"$bad_cap_err"; then
+  ok "a malformed maxWip warns instead of crashing"
+else
+  bad "a malformed maxWip warns instead of crashing (got: $bad_cap_err)"
+fi
+check "a malformed maxWip disables automation" \
+  "$(wc -l < "$AUTOMATION_LOG" | tr -d ' ')" "0"
+
+# A raising action (a missing binary in a service's PATH, say) is reported and
+# retried later; it never takes down the list that merely triggered it.
+AUTOMATION_RAISER="$AUTOMATION_DIR/raiser.py"
+cat > "$AUTOMATION_RAISER" <<PY
+import subprocess
+
+
+def fetch(config):
+    return [{
+        'status': 'NEEDS ATTENTION', 'context': 'atrepo', 'title': 'Raising item',
+        'details': '', 'weight': 70, 'id': '9', 'kind': 'pull_request',
+        'actions': [
+            {'key': 's', 'label': 'session',
+             'payload': {'command': ['$SESSION_CMD', '{input}']}},
+        ],
+    }]
+
+
+def act(key, payload):
+    raise RuntimeError('[Errno 2] No such file or directory: aoe')
+PY
+
+write_config <<JSON
+{"plugins": ["$AUTOMATION_RAISER"], "automation": {"rules": [
+  {"name": "boom", "type": "session", "match": {"kinds": ["pull_request"]},
+   "message": "Handle {title}"}
+]}}
+JSON
+
+reset_automation
+if raising_out="$(run_attention list 2>"$WORK/automation-raising.err")"; then
+  ok "a raising automation action does not abort the list"
+else
+  bad "a raising automation action does not abort the list"
+fi
+if grep -q 'Raising item' <<<"$raising_out"; then
+  ok "the item from a raising automation action is still listed"
+else
+  bad "the item from a raising automation action is still listed (got: $raising_out)"
+fi
+if grep -q 'automation could not start a session' "$WORK/automation-raising.err"; then
+  ok "a raising automation action reports on stderr"
+else
+  bad "a raising automation action reports on stderr (got: $(cat "$WORK/automation-raising.err"))"
+fi
+check "a rule whose action raised is not recorded as fired" \
+  "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['fired']))" \
+    "$AUTOMATION_STATE/attention/automation.json")" "0"
+
+# ---------------------------------------------------------------------------
+echo
 echo "== --help =="
 
 check "attention --help mentions Usage" \
