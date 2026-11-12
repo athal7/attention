@@ -1200,6 +1200,70 @@ print(json.dumps(items[0]['actions'][5]['payload']['command']))
 test_plugin_configurable_actions
 
 echo
+echo "== provider TUI open actions =="
+
+test_resolve_open_action() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py _util)
+import json
+record = {'url': 'https://github.com/myorg/repo/pull/42', 'repo': 'myorg/repo', 'id': '42'}
+action = p.resolve_open_action(
+    {'tui': {'command': ['gh-dash', '--repo', '{repo}', '{url}']}}, record, record['url'],
+)
+print('tui', action['key'], action['label'], action['primary'], action['read'])
+print(json.dumps(action['payload']))
+blocking = p.resolve_open_action(
+    {'tui': {'command': ['tui', '{id}'], 'terminal': False}}, record, record['url'],
+)
+print(json.dumps(blocking['payload']))
+fallback = p.resolve_open_action({'tui': {'command': []}}, record, record['url'])
+print(json.dumps(fallback['payload']))
+unconfigured = p.resolve_open_action(None, record, record['url'])
+print(json.dumps(unconfigured['payload']))
+")"
+  check "a registered tui keeps the primary open action shape" \
+    "$(sed -n 1p <<<"$out")" "tui o open True True"
+  check "tui command tokens resolve {field} placeholders from the item and default to a terminal window" \
+    "$(sed -n 2p <<<"$out")" '{"command": ["gh-dash", "--repo", "myorg/repo", "https://github.com/myorg/repo/pull/42"], "terminal": true, "background": false}'
+  check "tui may declare a blocking (non-terminal) command" \
+    "$(sed -n 3p <<<"$out")" '{"command": ["tui", "42"], "terminal": false, "background": false}'
+  check "an empty tui command falls back to opening the URL in the browser" \
+    "$(sed -n 4p <<<"$out")" '{"kind": "open", "url": "https://github.com/myorg/repo/pull/42"}'
+  check "a provider without a tui keeps opening the URL in the browser" \
+    "$(sed -n 5p <<<"$out")" '{"kind": "open", "url": "https://github.com/myorg/repo/pull/42"}'
+}
+test_resolve_open_action
+
+test_provider_fetch_uses_registered_tui() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+import json
+p._fetch_raw = lambda cfg: [{'number': 42, 'title': 'Fix bug', 'repository': {'nameWithOwner': 'myorg/repo'}, 'url': 'https://github.com/myorg/repo/pull/42', 'type': 'review_request'}]
+item = p.fetch({'github': {'tui': {'command': ['gh-dash', '--repo', '{repo}']}}})[0]
+print(json.dumps(item['actions'][0]))
+")"
+  check "github o uses the configured tui instead of the browser" "$out" \
+    '{"key": "o", "label": "open", "primary": true, "read": true, "payload": {"command": ["gh-dash", "--repo", "myorg/repo"], "terminal": true, "background": false}}'
+
+  out="$(python3 -c "
+$(load_plugin_py linear)
+import json
+p._query = lambda token, query, variables=None: {'data': {'viewer': {'assignedIssues': {
+  'nodes': [{'id': 'db-1', 'identifier': 'ABC-1', 'title': 'Fix it', 'url': 'https://linear.app/x/issue/ABC-1',
+             'state': {'name': 'Todo'}, 'project': {'name': 'Backend'}, 'relations': {'nodes': []}}],
+  'pageInfo': {'hasNextPage': False, 'endCursor': 'cursor-1'},
+}}}}
+item = p.fetch({'linear': {'apiToken': 'token', 'tui': {'command': ['linear-tui', '{identifier}']}}})[0]
+print(json.dumps(item['actions'][0]))
+")"
+  check "linear o uses the configured tui instead of the browser" "$out" \
+    '{"key": "o", "label": "open", "primary": true, "read": true, "payload": {"command": ["linear-tui", "ABC-1"], "terminal": true, "background": false}}'
+}
+test_provider_fetch_uses_registered_tui
+
+echo
 echo "== action input: text/choice prompts, {input} substitution, cancel =="
 
 INPUT_BIN="$WORK/bin-action-input"
@@ -4478,6 +4542,34 @@ print(typed_prefix_error)
   check "non-string context prefix is rejected" "$(sed -n 8p <<<"$out")" "dashboard.groups[1].match.contextPrefixes must be a non-empty list of strings"
 }
 test_dashboard_group_rules_and_rows
+
+test_dashboard_group_auto_expand() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+groups, _ = m.dashboard_groups({'dashboard': {'autoExpand': True, 'groups': [
+    {'name': 'Alpha', 'match': {'kinds': ['Alpha']}},
+    {'name': 'Beta', 'fallback': True},
+]}})
+names = [group['name'] for group in groups]
+rows = ['Alpha one' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'Alpha',
+        'Beta one' + chr(9) + 'blob' + chr(9) + 'o' + chr(9) + 'hint' + chr(9) + 'Beta']
+print(m.dashboard_auto_expand({'dashboard': {'autoExpand': True}})[0])
+print(m.dashboard_auto_expand({})[0])
+print(m.dashboard_auto_expand({'dashboard': {'autoExpand': 'yes'}})[1])
+print(len(m.dashboard.CursesGroupPresenter(names)._entries(rows, None)))
+print(len(m.dashboard.CursesGroupPresenter(names, expanded=names)._entries(rows, None)))
+print(m.dashboard.CursesGroupPresenter(names, expanded=['Beta'])._entries(rows, None)[2][1])
+")"
+  check "dashboard.autoExpand true is accepted" "$(sed -n 1p <<<"$out")" "True"
+  check "dashboard.autoExpand defaults to false" "$(sed -n 2p <<<"$out")" "False"
+  check "a non-boolean dashboard.autoExpand is rejected" "$(sed -n 3p <<<"$out")" "dashboard.autoExpand must be true or false"
+  check "grouped presenter starts with only group headers when not auto-expanded" "$(sed -n 4p <<<"$out")" "2"
+  check "auto-expanded groups start with their items visible" "$(sed -n 5p <<<"$out")" "4"
+  check "the presenter expands only the groups it was given" \
+    "$(sed -n 6p <<<"$out")" $'Beta one\tblob\to\thint'
+}
+test_dashboard_group_auto_expand
 
 test_dashboard_group_prefixes_match_repository_identity() {
   local out

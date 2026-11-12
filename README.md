@@ -27,9 +27,10 @@ attention expect-keys # print the action keys in the current item list
 attention act K LINE  # dispatch a single hotkey press against one dashboard row
 ```
 
-In the dashboard: `Enter` runs a row's primary action (open in browser for
-GitHub/Linear items); every other hotkey acts immediately on the highlighted
-row. Press `r` to refresh explicitly. `Esc` quits.
+In the dashboard: `Enter` runs a row's primary action (open the item for
+GitHub/Linear items -- in a registered terminal UI, or else in your browser);
+every other hotkey acts immediately on the highlighted row. Press `r` to
+refresh explicitly. `Esc` quits.
 
 Press `/` to filter visible rows with lowercase letters or digits. Use Backspace
 to edit the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter`
@@ -58,6 +59,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
   "calendar":  { "names": ["Work"] },
   "reminders": { "lists": ["Personal", "Work"] },
   "github":    {
+    "tui": { "command": ["gh-dash", "--repo", "{repo}"] },
     "actions": [
       {
         "key": "s",
@@ -84,6 +86,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
     ]
   },
   "dashboard": {
+    "autoExpand": true,
     "groups": [
       { "name": "Pull Requests", "match": { "kinds": ["pull_request"] }, "columns": ["state"] },
       { "name": "Needs Attention", "match": { "statuses": ["OVERDUE"] }, "columns": ["due"] },
@@ -101,18 +104,21 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `calendar.names` | Calendar names to pull near-term events from (via [`ical`](https://github.com/BRO3886/ical) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `reminders.lists` | Reminder list names to pull open items from (via [`remindctl`](https://github.com/steipete/remindctl) on `PATH`). Missing/empty = the plugin contributes nothing. |
 | `github.trackAuthors` | GitHub usernames of teammates whose open PRs to also flag for failing checks, changes requested, merge conflicts, or review feedback and updates -- same check as your own authored PRs. Missing/empty = no extra queries. |
+| `github.tui` / `linear.tui` | Optional terminal UI to open this provider's items in instead of your browser when you press `o`/`Enter`. An object with a `command` list whose tokens are `{field}` templates resolved against the item (the same fields `actions` see, plus `{url}`), optional `"terminal": false` to run it blocking in the current terminal instead of a separate one (the default), and optional `"background": true` for fire-and-forget. A malformed or empty `command` is ignored and items keep opening in the browser. Config-only (`generic`) providers already declare their own open action, so give that action the TUI `command` instead. |
 | `github.actions` / `linear.actions` | Optional custom actions to attach to items. Each action specifies `"key"`, `"label"`, `"command"` (with `{field}` placeholders like `{url}`, `{id}`, `{repo_path}`, `{slug}`, `{identifier}`, and `{input}`), optional `"terminal": true` to run in a separate terminal window, optional `"background": true` for fire-and-forget commands, optional `"wip"` to update work-in-progress state, optional `"read": true` for an action that only reads (open, copy) so running it leaves the item in place instead of moving it down the list, and optional `"input"`/`"inputs"` prompts (see [PLUGINS.md](PLUGINS.md)). GitHub action templates also expose `{head_branch}` and `{base_branch}` for PR worktrees (empty when unavailable). An action labeled `session` or `New session` also gets the agent `session.agents` resolves for the item, both as `AOE_TOOL` in the action process's environment and as the `{session_tool}` placeholder. |
 | `linear.apiToken` | Your [Linear personal API key](https://linear.app/settings/account/security). Falls back to the `LINEAR_API_TOKEN` or `LINEAR_TOKEN` environment variable if omitted -- put it there instead if you'd rather not keep a secret in a config file. Missing entirely = the plugin contributes nothing (no error). |
 | `session.agents` | Which agent AoE sessions start per repository or directory. Each entry pairs an AoE `tool` (`aoe add --tool`, e.g. `omp` or `freebuf`) with either a GitHub `repo` -- `"owner/name"` or an `"owner/*"` owner prefix, matched case-insensitively from the item's repository -- or a `path` (a directory; `~` is expanded). An exact repository match beats an owner prefix; the longest configured directory containing the item's project directory is the fallback. This drives both the generated `New session` action and configured actions labeled `session`/`New session`. Items matching no entry keep AoE's default agent. An invalid entry fails the refresh instead of starting the wrong agent. |
+| `dashboard.autoExpand` | `true` opens the dashboard with every group expanded instead of collapsed. Default `false`; groups still toggle with `Enter`, and a filter expands matching groups regardless. |
 | `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, `authors`, and/or `any`) or `fallback: true`. `contextPrefixes` matches an item's `context` or the provider-qualified identity it reports as `repo`, so an organization prefix groups GitHub items even though their rows show only the repository name. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
 ### Dashboard groups
 
 The dashboard opens with type groups for pull requests, issues, reminders,
-events, and other items. Use Up/Down or `j`/`k` to select a group and Enter
-to expand or collapse it in place. Select an item and press Enter for its
-primary action. Press `/` to filter, `r` to refresh, or Esc to quit. The
-dashboard fetches once on open and only refreshes on request.
+events, and other items, collapsed unless `dashboard.autoExpand` is `true`.
+Use Up/Down or `j`/`k` to select a group and Enter to expand or collapse it
+in place. Select an item and press Enter for its primary action. Press `/`
+to filter, `r` to refresh, or Esc to quit. The dashboard fetches once on open
+and only refreshes on request.
 
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both

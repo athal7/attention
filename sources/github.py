@@ -10,7 +10,8 @@ on subscribed PRs, and CI failures on watched repos.
 
 Config (config["github"]): none required. codeDir (top-level, shared
 with other repo-resolving plugins) is used to resolve each item's local
-checkout.
+checkout. A `tui` command opens items in a terminal UI instead of the
+browser.
 """
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,10 @@ import subprocess
 import threading
 from pathlib import Path
 
-from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
+from _util import (
+    resolve_configured_actions, resolve_open_action, run_cmd,
+    run_configured_action, slugify,
+)
 
 _MAX_WORKERS = 8
 _MAX_PR_DETAIL_WORKERS = 32
@@ -1549,7 +1553,7 @@ def fetch(config):
          }
 
         actions = [
-            {"key": "o", "label": "open", "primary": True, "read": True, "payload": {"kind": "open", "url": url}},
+            resolve_open_action(config.get("github"), record, url),
             {"key": "a", "label": "approve", "payload": {"kind": "approve", "id": number, "url": url}},
             {"key": "c", "label": "comment", "payload": {"kind": "comment", "id": number, "url": url}},
             {"key": "g", "label": "label", "payload": {"kind": "label", "id": number, "url": url}},

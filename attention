@@ -851,6 +851,17 @@ def _normalize_group_match(match, path, *, allow_any=False):
     return normalized_match, None
 
 
+def dashboard_auto_expand(config):
+    """Whether dashboard groups open expanded (`dashboard.autoExpand`)."""
+    dashboard_config = config.get("dashboard")
+    if not isinstance(dashboard_config, dict):
+        return False, None
+    value = dashboard_config.get("autoExpand", False)
+    if not isinstance(value, bool):
+        return False, "dashboard.autoExpand must be true or false"
+    return value, None
+
+
 def dashboard_groups(config):
     dashboard_config = config.get("dashboard")
     if dashboard_config is None:
@@ -1316,6 +1327,9 @@ def run_dashboard():
     groups, group_error = dashboard_groups(config)
     if group_error:
         print(f"attention: invalid dashboard.groups configuration: {group_error}; using flat dashboard.", file=sys.stderr)
+    auto_expand, auto_expand_error = dashboard_auto_expand(config)
+    if auto_expand_error:
+        print(f"attention: invalid dashboard.autoExpand configuration: {auto_expand_error}; groups start collapsed.", file=sys.stderr)
     plugin_names = config.get("plugins", DEFAULT_PLUGINS)
     if not plugin_names:
         print("Nothing needs attention right now.")
@@ -1331,7 +1345,10 @@ def run_dashboard():
         return fetch_plugin_items(name, config)
 
     if groups:
-        presenter = dashboard.CursesGroupPresenter([group["name"] for group in groups])
+        group_names = [group["name"] for group in groups]
+        presenter = dashboard.CursesGroupPresenter(
+            group_names, expanded=group_names if auto_expand else (),
+        )
         render_rows = lambda items: render_grouped_dashboard_rows(items, groups)
     else:
         presenter = dashboard.CursesPresenter()

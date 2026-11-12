@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 class TerminalInputTests(unittest.TestCase):
-    def launch(self, grouped):
+    def launch(self, grouped, auto_expand=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         config_dir = Path(tmp.name) / "attention"
@@ -46,6 +46,8 @@ class TerminalInputTests(unittest.TestCase):
                 {"name": "Alpha", "match": {"kinds": ["Alpha"]}},
                 {"name": "Beta", "fallback": True},
             ]}
+            if auto_expand:
+                config["dashboard"]["autoExpand"] = True
         else:
             config["dashboard"] = {"groups": []}
         (config_dir / "config.json").write_text(json.dumps(config))
@@ -139,6 +141,14 @@ class TerminalInputTests(unittest.TestCase):
         self.send(b"\x1b[B")
         os.write(self.master, b"o")
         self.wait_for(b"PICKED beta-1")
+
+    def test_auto_expand_opens_group_items_without_toggling(self):
+        self.launch(True, auto_expand=True)
+        self.wait_for(b"Alpha one")
+        self.wait_for(b"Beta two")
+        self.send(b"\x1b[B")
+        os.write(self.master, b"o")
+        self.wait_for(b"PICKED alpha-1")
 
     def test_linked_action_disclosure_and_hidden_hotkey(self):
         script = (

@@ -559,10 +559,12 @@ class CursesPresenter:
 class CursesGroupPresenter(CursesPresenter):
     """A single navigable tree of expandable dashboard groups."""
 
-    def __init__(self, group_names):
+    def __init__(self, group_names, expanded=()):
         super().__init__()
         self._group_names = list(group_names)
-        self._expanded = set()
+        self._expanded = {
+            name for name in expanded if name in self._group_names
+        }
 
     def _entries(self, rows, query):
         grouped = {name: [] for name in self._group_names}

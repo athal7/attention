@@ -2,6 +2,7 @@
 
 Config (config["linear"]):
     {"apiToken": "lin_api_..."}   # falls back to LINEAR_API_TOKEN/LINEAR_TOKEN env vars
+    {"tui": {"command": ["..."]}}  # open items in a terminal UI instead of the browser
 
 Scope: issues assigned to you, in an active (non-completed/canceled/
 duplicate) state, AND in your current cycle -- past-cycle and
@@ -13,7 +14,10 @@ import os
 import urllib.error
 import urllib.request
 
-from _util import resolve_configured_actions, run_cmd, run_configured_action, slugify
+from _util import (
+    resolve_configured_actions, resolve_open_action, run_cmd,
+    run_configured_action, slugify,
+)
 
 GRAPHQL_URL = "https://api.linear.app/graphql"
 
@@ -140,7 +144,7 @@ query AssignedIssues($after: String) {
         }
 
         actions = [
-            {"key": "o", "label": "open", "primary": True, "read": True, "payload": {"kind": "open", "url": url}},
+            resolve_open_action(config.get("linear"), record, url),
             {"key": "c", "label": "comment", "payload": {"kind": "comment", "db_id": db_id, "token": None}},
             {"key": "t", "label": "transition", "payload": {"kind": "transition", "db_id": db_id, "token": None}},
         ]

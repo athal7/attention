@@ -263,6 +263,44 @@ def resolve_configured_actions(configured_actions, record):
     return actions
 
 
+def resolve_open_action(section_config, record, url):
+    """A provider's primary "open" action.
+
+    A provider section may register a terminal UI under `tui`, e.g.
+    `{"command": ["gh-dash", "--repo", "{repo}"], "terminal": true}`;
+    pressing the open key then launches that instead of the item's URL in a
+    browser. Command tokens resolve against `record` like any other
+    configured action. A terminal UI runs in its own terminal window by
+    default (`terminal` may be set false to block instead); a malformed or
+    empty registration is ignored, leaving the browser action in place.
+    """
+    tui = section_config.get("tui") if isinstance(section_config, dict) else None
+    command = tui.get("command") if isinstance(tui, dict) else None
+    if (
+        isinstance(command, list)
+        and command
+        and all(isinstance(token, str) for token in command)
+    ):
+        return {
+            "key": "o",
+            "label": "open",
+            "primary": True,
+            "read": True,
+            "payload": {
+                "command": [resolve_template(token, record) for token in command],
+                "terminal": tui.get("terminal", True) is not False,
+                "background": tui.get("background", False) is True,
+            },
+        }
+    return {
+        "key": "o",
+        "label": "open",
+        "primary": True,
+        "read": True,
+        "payload": {"kind": "open", "url": url},
+    }
+
+
 def prompt_for_input(spec):
     interactive = getattr(input, "prompt_spec", None)
     if callable(interactive):
