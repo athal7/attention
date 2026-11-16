@@ -36,7 +36,7 @@ _NOTIFICATION_REASONS = {
 
 _PR_DETAIL_FIELDS = (
     "author,state,headRefOid,mergeable,mergeStateStatus,reviewDecision,"
-    "statusCheckRollup,latestReviews,closingIssuesReferences,isDraft,"
+    "statusCheckRollup,latestReviews,reviews,closingIssuesReferences,isDraft,"
     "reviewRequests,assignees,baseRefName,headRefName"
 )
 _PR_GRAPHQL_SELECTION = """
@@ -73,6 +73,9 @@ pullRequest(number: %d) {
       submittedAt
       author { login __typename }
   }
+  }
+  viewerLatestReview {
+    state
   }
   discussionComments: comments(first: 100) {
     pageInfo { hasNextPage }
@@ -196,6 +199,11 @@ def _normalize_pr_detail(detail):
             )
         ),
         "latestReviews": reviews,
+        # A reviewer's stale review leaves latestReviews after later commits but
+        # stays in these two fields; they are how a re-requested reviewer is
+        # still recognised as having reviewed.
+        "viewerLatestReview": detail.get("viewerLatestReview"),
+        "reviews": detail.get("reviews"),
         "latestReviewsComplete": (
             isinstance(reviews_payload, dict)
             and (reviews_payload.get("pageInfo") or {}).get("hasNextPage") is False
@@ -1147,6 +1155,38 @@ def _repo_dir_index(code_dir):
 
 
 
+_SUBMITTED_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+
+
+def _submitted_review_by_viewer(detail, current_login):
+    """Whether the current user already submitted a review on this PR.
+
+    New commits drop a reviewer's now-stale review from latestReviews, so a
+    re-requested reviewer looks like someone who never reviewed. `viewerLatestReview`
+    (GraphQL detail) and the full `reviews` list (the `gh pr view` fallback)
+    keep that history.
+    """
+    if not isinstance(current_login, str) or not current_login:
+        return False
+    viewer_review = detail.get("viewerLatestReview")
+    if (
+        isinstance(viewer_review, dict)
+        and viewer_review.get("state") in _SUBMITTED_REVIEW_STATES
+    ):
+        return True
+    reviews = detail.get("reviews")
+    if not isinstance(reviews, list):
+        return False
+    for review in reviews:
+        if not isinstance(review, dict) or review.get("state") not in _SUBMITTED_REVIEW_STATES:
+            continue
+        author = review.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if isinstance(login, str) and login and login.casefold() == current_login.casefold():
+            return True
+    return False
+
+
 def _review_handled_by_other(detail, current_login):
     if not isinstance(detail, dict) or not isinstance(current_login, str) or not current_login:
         return False
@@ -1156,11 +1196,15 @@ def _review_handled_by_other(detail, current_login):
         if isinstance(login, str) and login and login.casefold() != current_login:
             return True
 
+    if _submitted_review_by_viewer(detail, current_login):
+        return False
+
     handled_by_other = False
     for review in detail.get("latestReviews") or []:
-        if not isinstance(review, dict) or review.get("state") not in {
-            "APPROVED", "CHANGES_REQUESTED", "COMMENTED",
-        }:
+        if (
+            not isinstance(review, dict)
+            or review.get("state") not in _SUBMITTED_REVIEW_STATES
+        ):
             continue
         author = review.get("author") or {}
         if not isinstance(author, dict):

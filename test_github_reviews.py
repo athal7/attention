@@ -128,6 +128,32 @@ class RequestedReviewTests(unittest.TestCase):
                             ["1"] if visible else [],
                         )
 
+    def test_stale_own_review_preserves_rerequest_after_later_commits(self):
+        # New commits drop a reviewer's stale review from latestReviews, but the
+        # re-requested reviewer must still see the PR.
+        other = {"author": {"login": "human", "__typename": "User"}, "state": "COMMENTED"}
+        for viewer_state, visible in (("CHANGES_REQUESTED", True), ("APPROVED", True),
+                                      ("COMMENTED", True), ("DISMISSED", False),
+                                      ("PENDING", False)):
+            for stale_source in ("viewerLatestReview", "reviews"):
+                with self.subTest(state=viewer_state, source=stale_source):
+                    raw = detail()
+                    raw["latestReviews"] = [other]
+                    if stale_source == "viewerLatestReview":
+                        raw["viewerLatestReview"] = {"state": viewer_state}
+                    else:
+                        raw["reviews"] = [
+                            {"author": {"login": "other"}, "state": "COMMENTED"},
+                            {"author": {"login": "VIEWER"}, "state": viewer_state},
+                        ]
+                    transport = self.search_transport([candidate(1)], lambda args: (
+                        [] if args[:2] == ["api", "graphql"] else raw
+                    ))
+                    self.assertEqual(
+                        [item["id"] for item in self.collect([candidate(1)], transport)],
+                        ["1"] if visible else [],
+                    )
+
     def test_assignee_policy_is_independent_of_unknown_reviewer_identity(self):
         for assignees, visible in (([], True), ([{"login": "VIEWER"}], True),
                                    ([{"login": "other"}], False),

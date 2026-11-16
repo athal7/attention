@@ -370,7 +370,9 @@ outcome rather than the word a source chose for it.
   Review requests are omitted when another confirmed person has submitted a
   review, unless you have also submitted a review; a PR assigned to another
   user is still omitted. Bots, pending and dismissed reviews, and your own
-  assignment do not count. A review whose author type is unknown does not hide
+  assignment do not count. Your own review still counts after later commits
+  make it stale and drop it from the PR's latest reviews, so a re-requested
+  PR stays visible. A review whose author type is unknown does not hide
   a request, including when the detail fallback lacks bot metadata. PR details
   are fetched in bounded batches with per-PR fallback.
   Search and notification validation reuse complete PR and repository state
