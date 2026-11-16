@@ -784,6 +784,9 @@ def _notification_item(notification, subject_state=None, subject_info=None, curr
     }
     if subject_type == "PullRequest" and isinstance(subject_state, dict):
         item["isDraft"] = bool(subject_state.get("draft"))
+        state = subject_state.get("state")
+        if isinstance(state, str) and state:
+            item["subject_state"] = state.lower()
         item["baseRefName"] = (subject_state.get("base") or {}).get("ref", "")
         item["headRefName"] = (subject_state.get("head") or {}).get("ref", "")
         author = subject_state.get("author") or subject_state.get("user") or {}
@@ -1513,6 +1516,16 @@ def fetch(config):
             is_draft,
             g.get("mergeReady") is True and not g.get("reviewRequested"),
         )
+        if gtype == "notification" and g.get("subject_type") == "PullRequest":
+            # A notification row's own label ("Notified") says nothing about
+            # the pull request it points at, so surface the PR's state.
+            pr_state = str(g.get("subject_state") or "").lower()
+            indicators["state"] = (
+                "Draft" if is_draft
+                else {"open": "Open", "merged": "Merged", "closed": "Closed"}.get(
+                    pr_state, indicators["state"],
+                )
+            )
         kind = (
             "pull_request" if is_pull_request
             else "issue" if gtype in {"assigned_issue", "repo_issue"}

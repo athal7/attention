@@ -93,9 +93,9 @@ class FakePresenter:
             self.calls.append(('launch',))
             self._cond.notify_all()
 
-    def push_snapshot(self, rows, pending):
+    def push_snapshot(self, rows, pending, notice=''):
         with self._lock:
-            self.calls.append(('push', list(rows), list(pending)))
+            self.calls.append(('push', list(rows), list(pending), notice))
             self._cond.notify_all()
 
     def push_calls(self):
@@ -853,6 +853,31 @@ print(p._notification_item(notification, state, current_login='me').get('_is_own
   check "unread PR notifications carry case-insensitive author identity" "$(sed -n 1p <<<"$out")" "True"
 }
 test_github_notification_own_pr_marker
+test_github_notification_pr_shows_state_and_author() {
+  local out
+  out="$(python3 -c "
+$(load_plugin_py github)
+notification = {
+    'id': '7',
+    'subject': {'type': 'PullRequest', 'title': 'Their PR', 'url': 'https://api.github.com/repos/o/r/pulls/7'},
+    'repository': {'full_name': 'o/r'},
+    'reason': 'mention',
+}
+state = {
+    'state': 'open', 'draft': False, 'author': {'login': 'octocat'},
+    'base': {'ref': 'main'}, 'head': {'ref': 'feat'},
+}
+p._fetch_raw = lambda config: [p._notification_item(notification, state)]
+p._repo_dir_index = lambda code_dir: {}
+item = p.fetch({'github': {}, 'codeDir': '/tmp'})[0]
+print(item['indicators']['state'])
+print(item['author'])
+" )"
+  check "a notification about an open PR shows the PR's state instead of the notification mark" \
+    "$(sed -n 1p <<<"$out")" "Open"
+  check "a notification about a PR carries its author" "$(sed -n 2p <<<"$out")" "octocat"
+}
+test_github_notification_pr_shows_state_and_author
 echo
 echo "-- repo_path resolves via git-remote auto-detection, not the repo's own name --"
 
@@ -2739,6 +2764,7 @@ def fake_urlopen(req, timeout=10):
         None: {'nodes': [
             {'id': 'u1', 'identifier': 'ABC-1', 'title': 'Fix it',
              'url': 'https://linear.app/x/issue/ABC-1',
+             'description': 'Ships with https://github.com/acme/kb/pull/12.',
              'state': {'name': 'In Progress'}, 'project': {'name': 'Backend'},
              'relations': {'nodes': [
                  {'type': 'related',
@@ -2807,6 +2833,11 @@ print(json.dumps({
     *'"indicators": {"state": "In Progress"}'*'"kind": "issue"'*)
       ok "Linear issues expose an issue type and state indicator" ;;
     *) bad "Linear issues expose an issue type and state indicator (got: $out)" ;;
+  esac
+  case "$out" in
+    *'"association_keys": ["github:acme/kb#12"]'*)
+      ok "a Linear issue declares the GitHub PR its description links to" ;;
+    *) bad "a Linear issue declares the GitHub PR its description links to (got: $out)" ;;
   esac
 }
 test_fetch_linear_functional
@@ -2964,11 +2995,13 @@ $LOAD_CORE
 gh_item = {
     'status': 'REVIEW REQUESTED', 'context': 'myorg/kb', 'title': 'Fix the thing ABC-1', 'details': 'Review Commented',
     'weight': 90, 'id': '1', 'actions': [],
+    'indicators': {'state': 'Review requested', 'ci': 'Passed'},
 }
 lin_item = {
     'status': 'IN PROGRESS', 'context': 'Backend', 'title': 'Fix it', 'details': '',
     'weight': 80, 'id': 'ABC-1', 'absorb_note': 'Linear ABC-1: IN PROGRESS',
     'status_priority': 10, 'actions': [],
+    'indicators': {'state': 'In progress'},
 }
 merged = m.merge_cross_links([gh_item, lin_item])
 import json
@@ -2988,8 +3021,30 @@ print(json.dumps(merged))
     *'"status_priority": 10'*) ok "the merged row's status_priority carries the winning side's value" ;;
     *) bad "the merged row's status_priority carries the winning side's value (got: $out)" ;;
   esac
+  case "$out" in
+    *'"indicators": {"state": "In progress", "ci": "Passed"}'*)
+      ok "the winning status's indicator wins too, keeping the loser's other indicators" ;;
+    *) bad "the winning status's indicator wins too (got: $out)" ;;
+  esac
 }
 test_status_priority_swaps_visible_status_on_merge
+
+test_mutual_association_prefers_the_heavier_item_as_host() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+pr = {'status': 'NEEDS ATTENTION', 'context': 'kb', 'title': 'Fix it', 'details': '', 'weight': 90, 'id': '7', 'identity_key': 'github:myorg/kb#7', 'association_keys': [], 'actions': [], 'kind': 'pull_request'}
+issue = {'status': 'IN PROGRESS', 'context': 'Backend', 'title': 'Fix it in Linear', 'details': '', 'weight': 60, 'id': 'ABC-1', 'identity_key': 'linear:ABC-1', 'association_keys': ['github:myorg/kb#7'], 'actions': [], 'kind': 'issue'}
+import json
+merged = m.merge_cross_links([issue, pr])
+print(len(merged))
+print(merged[0]['title'])
+")"
+  check "a Linear issue that links its PR merges into one attention row" \
+    "$(sed -n 1p <<<"$out")" "1"
+  check "the heavier linked item keeps the row's title" "$(sed -n 2p <<<"$out")" "Fix it"
+}
+test_mutual_association_prefers_the_heavier_item_as_host
 
 test_declared_association_key_merge() {
   local out
@@ -3233,6 +3288,25 @@ print('Mention |' not in fields[0])
   check "render_dashboard_rows() omits verbose details from the compact dashboard" "$(sed -n 7p <<<"$out")" "True"
 }
 test_render_dashboard_rows_omits_status_and_retains_action_fields
+
+test_dashboard_rows_show_an_author_column_only_when_present() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+items = [
+    {'status': 'S', 'context': 'kb', 'title': 'Fix it', 'details': '', 'weight': 90, 'author': 'octocat', 'actions': []},
+    {'status': 'S', 'context': 'kb', 'title': 'Todo', 'details': '', 'weight': 80, 'actions': []},
+]
+row = m.render_dashboard_rows(items)[0].split(chr(9))[0]
+plain = m.render_rows([dict(items[1])])[0].split(chr(9))[0]
+print(row.strip())
+print('@octocat' in row, '@' in plain)
+")"
+  check "dashboard rows show an @login author column after the context" \
+    "$(sed -n 1p <<<"$out")" "Fix it  kb  @octocat"
+  check "rows without an author gain no author column" "$(sed -n 2p <<<"$out")" "True False"
+}
+test_dashboard_rows_show_an_author_column_only_when_present
 
 
 test_dashboard_action_hints_wrap_at_footer_width() {
@@ -3987,9 +4061,85 @@ print(after_session)
 ")"
   check "running a read action ('open') leaves the item where it was in the very next snapshot" \
     "$(sed -n 1p <<<"$out")" "['A', 'B']"
-  check "running a write action ('session') still moves the item below the others" \
-    "$(sed -n 2p <<<"$out")" "['B', 'A']"
+  check "running a write action ('session') reports done without moving the item" \
+    "$(sed -n 2p <<<"$out")" "['A', 'B']"
 }
+
+test_actions_show_a_notice_and_keep_the_page_in_place() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [{'key': 's', 'label': 'session', '_item_id': 'a'}]},
+        {'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'},
+    ],
+}
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=lambda key, row: True,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+row_for_a = presenter.push_calls()[-1][1][0]
+presenter.send_result('s', row_for_a)
+presenter.wait_for_push_count(3, timeout=5)
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+print(repr(presenter.push_calls()[-1][3]))
+print(presenter.launch_count)
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a completed action republishes the same rows in the same order" \
+    "$(sed -n 1p <<<"$out")" "['A', 'B']"
+  check "a completed action reports that it is done in the header notice" \
+    "$(sed -n 2p <<<"$out")" "'Done: session'"
+  check "the page is redrawn instead of waiting for an Enter prompt" \
+    "$(sed -n 3p <<<"$out")" "2"
+}
+test_actions_show_a_notice_and_keep_the_page_in_place
+
+test_failed_actions_show_a_failure_notice() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [{'key': 's', 'label': 'session', '_item_id': 'a'}]},
+    ],
+}
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=lambda key, row: False,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+row_for_a = presenter.push_calls()[-1][1][0]
+presenter.send_result('s', row_for_a)
+presenter.wait_for_push_count(3, timeout=5)
+print(repr(presenter.push_calls()[-1][3]))
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a failed action reports the failure in the header notice" \
+    "$(sed -n 1p <<<"$out")" "'Action failed: session'"
+}
+test_failed_actions_show_a_failure_notice
+
 test_read_actions_leave_the_item_in_place
 
 test_terminal_action_relaunches_existing_list_before_refresh() {
@@ -4196,7 +4346,7 @@ new_rows = presenter.push_calls()[-1][1]
 presenter.send_result('', '')
 th.join(timeout=5)
 print(calls.snapshot())
-print(stale_push[1:])
+print(stale_push[1:3])
 print(new_rows)
 ")"
   check "manual refresh fetches again despite a fresh in-memory cache entry" "$(sed -n 1p <<<"$out")" "['a', 'a']"

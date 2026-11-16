@@ -147,7 +147,10 @@ regardless of which plugin produced it:
 
 1. **Declared association**: an item that lists an `association_keys`
    value absorbs the item whose `identity_key` equals one of those keys. This pass runs
-   first; the declaring item is the host.
+   first; the declaring item is the host. Sources may declare the link in
+   either direction (a PR naming an issue, or an issue linking its PR's URL).
+   The heavier item is the host, so the more urgent line keeps its title and
+   context.
 2. **ID-shaped title match**: if item A's title contains a token shaped
    like `[A-Z]+-\d+` (e.g. `ABC-123`) and some other item B's `id`
    (case-insensitive) equals that token, B is absorbed into A.
@@ -158,7 +161,10 @@ regardless of which plugin produced it:
 (ties keep A's) keeps its `status` on the merged row; the other's
 `status`/`details` collapse into a note appended to the winner's
 `details` (B's `absorb_note`, if it lost, or a generic status/title
-fallback). A's `weight` becomes `max(A.weight, B.weight) + 5`; and B's
+fallback). The winner's `indicators` win too (the loser's indicators fill
+in keys the winner does not have), because the dashboard paints
+`indicators["state"]` rather than `status`. A's `weight` becomes
+`max(A.weight, B.weight) + 5`; and B's
 `actions` get appended to A's, each renamed only if its key would
 otherwise collide with one A already has (remapped to the lowest unused bare
 digit)

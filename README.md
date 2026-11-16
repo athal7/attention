@@ -36,8 +36,10 @@ attention act K LINE  # dispatch a single hotkey press against one dashboard row
 
 In the dashboard: `Enter` runs a row's primary action (open the item for
 GitHub/Linear items -- in a registered terminal UI, or else in your browser);
-every other hotkey acts immediately on the highlighted row. Press `r` to
-refresh explicitly. `Esc` quits.
+every other hotkey acts immediately on the highlighted row. Running an action
+leaves the rows where they were and reports the outcome in the header
+(`Done: comment`, or `Action failed: comment`) instead of prompting for a key.
+Press `r` to refresh explicitly. `Esc` quits.
 
 Press `/` to filter visible rows with lowercase letters or digits. Use Backspace
 to edit the filter. Use Up/Down or `j`/`k` to move, `q` to quit, and `Enter`
@@ -285,6 +287,10 @@ in place. Select an item and press Enter for its primary action. Press `/`
 to filter, `r` to refresh, or Esc to quit. The dashboard fetches once on open
 and only refreshes on request.
 
+When any visible item reports an author (GitHub pull requests do), rows gain
+an `@login` author column after the context, so you can tell whose work a PR
+is before opening it. `attention list` appends the same login to the row.
+
 Group rules are evaluated in configuration order. Values within a rule field
 are alternatives, while specified fields are combined: a rule with both
 `kinds` and `statuses` matches only items satisfying both. Use `any` for OR
@@ -376,7 +382,9 @@ outcome rather than the word a source chose for it.
   or explicitly tracked PRs; it is user-triggered, rechecks readiness after
   confirmation, and pins the displayed head commit. No automatic merging.
   Eligible unread notifications appear in the default Other group unless they
-  concern a pull request. Author notifications use NOTIFIED rather than claiming
+  concern a pull request; a notification about an open pull request shows that
+  PR's state (`Open`, or `Draft` for a draft) rather than the generic
+  notification mark. Author notifications use NOTIFIED rather than claiming
   a reply is needed: the unread event can be your own or a bot's activity. Read
   threads, closed PR/issue threads, and threads from archived repositories are
   omitted. For an unread authored PR, an ordinary bot timeline comment is

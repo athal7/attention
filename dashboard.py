@@ -40,7 +40,9 @@ class PresenterResult(NamedTuple):
 
 class Presenter(Protocol):
     def launch(self) -> None: ...
-    def push_snapshot(self, rows: list[str], pending: list[str]) -> None: ...
+    def push_snapshot(
+        self, rows: list[str], pending: list[str], notice: str = "",
+    ) -> None: ...
     def wait_for_exit(self) -> PresenterResult: ...
     def stop(self) -> None: ...
 
@@ -123,6 +125,11 @@ class DashboardController:
         self._empty_final = False
         self._closed = False
         self._refresh_after_round = False
+        # The last page actually shown, so an action's notice can be
+        # rendered over it without recomputing (and reordering) the list.
+        self._last_rows = []
+        self._last_pending = []
+        self._notice = ""
 
     @staticmethod
     def _default_fetch_error(name, exc):
@@ -159,12 +166,37 @@ class DashboardController:
                     # Read-only actions (open, yank) leave the item in place
                     # so it can be acted on again straight away.
                     self._deprioritize(item_id)
-                self._relaunch_presenter()
+                self._notice = self._notice_for(action, completed)
+                self._repost_page()
         finally:
             with self._presenter_lock:
                 with self._state_lock:
                     self._closed = True
                 self.presenter.stop()
+
+    @staticmethod
+    def _notice_for(action, completed):
+        label = (action or {}).get("label", "")
+        if completed is False:
+            return f"Action failed: {label}" if label else "Action failed"
+        return f"Done: {label}" if label else "Done"
+
+    def _repost_page(self):
+        """Redraw the page the user was already looking at, with a notice.
+
+        An action must not move, remove, or reorder the rows: acting on an
+        item and then finding it somewhere else is disorienting. The
+        acted-on item is still deprioritized for the next real refresh.
+        """
+        with self._state_lock:
+            rows = list(self._last_rows)
+            pending = list(self._last_pending)
+            notice = self._notice
+        with self._presenter_lock:
+            if self._empty_final:
+                return
+            self.presenter.launch()
+            self.presenter.push_snapshot(rows, pending, notice)
 
     def _refresh(self):
         if self._round_is_terminal():
@@ -188,6 +220,7 @@ class DashboardController:
         self._submit_round_fetches(round_)
 
     def _create_round(self, force=False):
+        self._notice = ""
         now = self._clock()
         with self._state_lock:
             cached = {
@@ -250,7 +283,18 @@ class DashboardController:
                 self._empty_final = True
                 self.presenter.stop()
                 return
-            self.presenter.push_snapshot(rows, pending)
+            # Fresh data supersedes the last action's notice.
+            with self._state_lock:
+                self._notice = ""
+            self._push(rows, pending)
+
+    def _push(self, rows, pending):
+        with self._state_lock:
+            self._last_rows = list(rows)
+            self._last_pending = list(pending)
+            notice = self._notice
+        self.presenter.push_snapshot(rows, pending, notice)
+
     def _relaunch_presenter(self):
         with self._state_lock:
             round_ = self._round
@@ -266,7 +310,7 @@ class DashboardController:
                 self.presenter.stop()
                 return
             self.presenter.launch()
-            self.presenter.push_snapshot(rows, pending)
+            self._push(rows, pending)
 
     def _render_snapshot(self, items_by_plugin):
         with self._state_lock:
@@ -350,6 +394,7 @@ class CursesPresenter:
         self._lock = threading.Lock()
         self._rows = []
         self._pending = []
+        self._notice = ""
         self._stopped = False
         self._snapshot_version = 0
         self._last_selection = 0
@@ -359,10 +404,11 @@ class CursesPresenter:
         with self._lock:
             self._stopped = False
 
-    def push_snapshot(self, rows, pending):
+    def push_snapshot(self, rows, pending, notice=""):
         with self._lock:
             self._rows = list(rows)
             self._pending = list(pending)
+            self._notice = notice
             self._snapshot_version += 1
 
     def wait_for_exit(self):
@@ -376,7 +422,16 @@ class CursesPresenter:
 
     def _snapshot(self):
         with self._lock:
-            return list(self._rows), list(self._pending), self._stopped, self._snapshot_version
+            return (
+                list(self._rows), list(self._pending), self._notice,
+                self._stopped, self._snapshot_version,
+            )
+
+    @staticmethod
+    def _status_line(pending, notice):
+        if notice:
+            return notice
+        return _pending_header(pending)
 
     @staticmethod
     def _matching_rows(rows, query):
@@ -451,7 +506,7 @@ class CursesPresenter:
         except (TypeError, ValueError, KeyError):
             return ""
 
-    def _draw(self, screen, rows, pending, selected, query):
+    def _draw(self, screen, rows, pending, selected, query, notice=""):
         import curses
 
         height, width = screen.getmaxyx()
@@ -475,7 +530,7 @@ class CursesPresenter:
         start = min(max(0, selected - capacity + 1), max(0, len(visible) - capacity))
 
         write(0, self._title, curses.A_BOLD)
-        write(1, _pending_header(pending))
+        write(1, self._status_line(pending, notice))
         header = self._indicator_header(rows)
         filter_text = f"Filter: {query}" if query is not None else ""
         header_line = f"{filter_text}  {header}" if filter_text and header else header or filter_text
@@ -506,17 +561,19 @@ class CursesPresenter:
         selected = self._last_selection
         query = None
         while True:
-            rows, pending, stopped, version = self._snapshot()
+            rows, pending, notice, stopped, version = self._snapshot()
             if stopped:
                 return PresenterResult("", "")
-            visible, selected = self._draw(screen, rows, pending, selected, query)
+            visible, selected = self._draw(
+                screen, rows, pending, selected, query, notice,
+            )
             key = self._read_key(screen)
             if query is None and key == ord("r"):
                 return PresenterResult("r", "")
             if key == -1:
                 # Check for a new snapshot pushed by the controller
                 # (e.g. after an action) without exiting the loop.
-                _, _, stopped2, version2 = self._snapshot()
+                _, _, _, stopped2, version2 = self._snapshot()
                 if stopped2 or version2 != version:
                     continue
                 continue
@@ -583,7 +640,7 @@ class CursesGroupPresenter(CursesPresenter):
                 entries.extend((group, item, len(items)) for item in matching)
         return entries
 
-    def _draw_tree(self, screen, entries, pending, selected, query):
+    def _draw_tree(self, screen, entries, pending, selected, query, notice=""):
         import curses
 
         height, width = screen.getmaxyx()
@@ -606,7 +663,7 @@ class CursesGroupPresenter(CursesPresenter):
                     pass
 
         write(0, "Attention", curses.A_BOLD)
-        write(1, _pending_header(pending))
+        write(1, self._status_line(pending, notice))
         if query is not None:
             write(2, f"Filter: {query}")
         elif item:
@@ -638,11 +695,13 @@ class CursesGroupPresenter(CursesPresenter):
         selected = self._last_selection
         query = None
         while True:
-            rows, pending, stopped, _ = self._snapshot()
+            rows, pending, notice, stopped, _ = self._snapshot()
             if stopped:
                 return PresenterResult("", "")
             entries = self._entries(rows, query)
-            selected = self._draw_tree(screen, entries, pending, selected, query)
+            selected = self._draw_tree(
+                screen, entries, pending, selected, query, notice,
+            )
             key = self._read_key(screen)
             if key == -1:
                 continue

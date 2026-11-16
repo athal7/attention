@@ -11,6 +11,7 @@ a short "what's live right now" list rather than your whole backlog.
 """
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -55,6 +56,28 @@ def _blocking_issue(issue):
             return relation.get("issue") or {}
     return {}
 
+_GITHUB_PR_URL = re.compile(
+    r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", re.IGNORECASE,
+)
+
+
+def _github_pr_association_keys(*texts):
+    """Declare the GitHub pull requests an issue references.
+
+    An issue's description usually links to its PR, while the PR body
+    usually links back to the issue identifier. Declaring both directions
+    means the two merge into one attention line whichever plugin happened
+    to notice the other.
+    """
+    keys = []
+    for text in texts:
+        for owner, repo, number in _GITHUB_PR_URL.findall(text or ""):
+            key = f"github:{owner}/{repo.rstrip('.,)>')}#{number}".lower()
+            if key not in keys:
+                keys.append(key)
+    return keys
+
+
 def fetch(config):
     token = _get_token(config)
     if not token:
@@ -68,6 +91,7 @@ query AssignedIssues($after: String) {
         id
         identifier
         title
+        description
         url
         state {
           name
@@ -167,6 +191,9 @@ query AssignedIssues($after: String) {
             "kind": "issue",
             "absorb_note": f"Linear {identifier}: {state.upper()}",
             "identity_key": f"linear:{identifier}",
+            "association_keys": _github_pr_association_keys(
+                title, l.get("description") or "",
+            ),
             # Linear's workflow state is the authoritative signal for
             # "where is this work" -- when a PR title/body cross-links to
             # this issue and the two get merged into one dashboard row,

@@ -464,7 +464,8 @@ def _absorb(host, guest):
     (e.g. a GitHub PR's review/CI state), regardless of which side ended
     up as the structural host.
     """
-    if guest.get("status_priority", 0) > host.get("status_priority", 0):
+    guest_wins = guest.get("status_priority", 0) > host.get("status_priority", 0)
+    if guest_wins:
         demoted_status, demoted_details = host.get("status", ""), host.get("details", "")
         host["status"] = guest.get("status", demoted_status)
         host["status_priority"] = guest.get("status_priority", 0)
@@ -472,6 +473,18 @@ def _absorb(host, guest):
     else:
         note = guest.get("absorb_note") or f"{guest.get('status', '')}: {guest.get('title', '')}"
         host["details"] = f"{host['details']} | {note}" if host.get("details") else note
+    guest_indicators = guest.get("indicators") or {}
+    if guest_indicators:
+        # The dashboard paints `indicators["state"]`, not `status`, so the
+        # status swap above has to carry its indicator with it -- otherwise
+        # the merged row still looks like the host alone.
+        indicators = dict(host.get("indicators") or {})
+        if guest_wins:
+            indicators.update(guest_indicators)
+        else:
+            for key, value in guest_indicators.items():
+                indicators.setdefault(key, value)
+        host["indicators"] = indicators
     host["weight"] = max(host.get("weight", 0), guest.get("weight", 0)) + 5
     host["_linked_item_urls"] = list(dict.fromkeys(
         [*host.get("_linked_item_urls", []), guest.get("url"),
@@ -501,10 +514,18 @@ def merge_cross_links(items):
     for host in items:
         if id(host) in absorbed_associations:
             continue
-        for key in host.get("association_keys", []):
+        host_keys = host.get("association_keys", [])
+        for key in host_keys:
             guest = by_identity.get(key)
             if guest is None or guest is host or id(guest) in absorbed_associations:
                 continue
+            if guest.get("weight", 0) > host.get("weight", 0):
+                # The more urgent item keeps the row so its own title and
+                # context stay in front of the user, no matter which side
+                # declared the link.
+                _absorb(guest, host)
+                absorbed_associations.add(id(host))
+                break
             _absorb(host, guest)
             absorbed_associations.add(id(guest))
     items = [it for it in items if id(it) not in absorbed_associations]
@@ -595,7 +616,7 @@ def _dashboard_hint_for_actions(actions):
     return "\v".join(lines)
 
 
-_STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX = 20, 30, 60
+_STATUS_MAX, _CONTEXT_MAX, _TITLE_MAX, _AUTHOR_MAX = 20, 30, 60, 20
 
 
 def _clip(text, width):
@@ -649,6 +670,7 @@ _INDICATOR_GLYPHS = {
     "done": "✓", "past": "✓", "merged": "✓",
     "partial": "◷", "partially approved": "◷",
     "changes": "✗", "changes requested": "✗", "blocked": "✗", "overdue": "✗",
+    "closed": "✗",
     "changes pushed": "↻", "pushed since review": "↻",
     "commented": "❝", "review update": "❝",
     # "awaiting your review" is the exact status the plugin sends for a request on
@@ -751,6 +773,10 @@ def _visible_row_text(item, status_col, context_col, title_col, include_status=T
     separator_width = 7 if include_status else 5
     details_width = max(0, w - status_col - context_col - title_col - separator_width)
     details = _clip(item["details"], details_width) if w < 80 else item["details"]
+    # Authors are only meaningful for some sources (GitHub pull requests);
+    # show them after the details so the other columns keep their widths.
+    author = f"@{item['author']}" if item.get("author") else ""
+    details = f"{details} {author}".strip()
     if include_status:
         return f"{status:<{status_col}}  {title:<{title_col}}  {context:<{context_col}}  {details} "
     return f"{title:<{title_col}}  {context:<{context_col}}  {details} "
@@ -786,13 +812,17 @@ def render_dashboard_rows(items, columns=None):
         max((len(item["context"]) for item in items), default=0),
         _CONTEXT_MAX,
     )
+    # Only some sources know who owns an item (GitHub pull requests do); the
+    # author column exists only when the visible list has one to show.
+    authors = [f"@{item['author']}" for item in items if item.get("author")]
+    author_col = min(max((len(a) for a in authors), default=0), _AUTHOR_MAX)
     title_col = min(
         max((len(item["title"]) for item in items), default=0),
         _TITLE_MAX,
-        max(0, width - context_col - indicator_width - 2),
+        max(0, width - context_col - author_col - indicator_width - 4),
     )
     indicator_metadata = json.dumps({
-        "offset": title_col + context_col + 4,
+        "offset": title_col + context_col + author_col + (6 if author_col else 4),
         "columns": [(label, cell_width) for _, label, cell_width in indicator_specs],
     })
 
@@ -801,6 +831,9 @@ def render_dashboard_rows(items, columns=None):
         title = _clip(item["title"], title_col)
         context = _clip(item["context"], context_col)
         visible = f"{title:<{title_col}}  {context:<{context_col}}"
+        if author_col:
+            author = _clip(f"@{item['author']}" if item.get("author") else "", author_col)
+            visible = f"{visible}  {author:<{author_col}}"
         if indicator_specs:
             indicators = item.get("indicators", {})
             indicator_cells = "  ".join(
@@ -1686,13 +1719,6 @@ def act(key, line):
         return False
 
 
-
-def acknowledge_action():
-    try:
-        input("Press Enter to return to the dashboard...")
-    except EOFError:
-        pass
-
 def run_dashboard():
     """Fetch once on open, then refresh only when the user presses r."""
     config = load_config()
@@ -1740,7 +1766,6 @@ def run_dashboard():
         build_snapshot=build_automated_snapshot,
         render_rows=render_rows,
         act=act,
-        acknowledge_action=acknowledge_action,
     )
     try:
         found_something = controller.run()
