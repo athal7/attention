@@ -204,6 +204,21 @@ class RequestedReviewTests(unittest.TestCase):
                 self.assertEqual([item["id"] for item in self.collect([candidate(1)], transport)],
                                  ["1"] if visible else [])
 
+    def test_a_merged_or_closed_pull_request_is_not_a_review_request(self):
+        # The search index returns a just-merged pull request as open, and
+        # GitHub leaves the viewer in reviewRequests after the merge, so only
+        # the detail's own state says the review is no longer owed.
+        for state in ("MERGED", "CLOSED"):
+            with self.subTest(state=state):
+                raw = detail(requested=True)
+                raw["state"] = state
+                transport = self.search_transport([candidate(1423, "0din-ai/odin")], lambda args: (
+                    [] if args[:2] == ["api", "graphql"] else raw
+                ))
+                self.assertEqual(
+                    self.collect([candidate(1423, "0din-ai/odin")], transport), [],
+                )
+
     def test_detail_failure_keeps_request_visible(self):
         for batch in (None, [], {}, {"data": None}, {"data": {"r0": None}}):
             for fallback in (None, []):
@@ -344,6 +359,108 @@ class DraftVisibilityTests(unittest.TestCase):
             kept = github._fetch_raw({})
         self.assertEqual([(item["number"], item["notification_ids"]) for item in kept],
                          [(7, ["thread-7"])])
+
+
+class ReviewRequestNotificationTests(unittest.TestCase):
+    def test_a_review_request_notification_surfaces_a_pr_the_search_has_not_indexed(self):
+        # The review-requested search index trails GitHub's own record that
+        # the viewer was asked to review, so the notification is what makes a
+        # fresh request visible at all.
+        notification = {
+            "id": "thread-1", "unread": True, "reason": "review_requested",
+            "repository": {"full_name": "owner/repo"},
+            "subject": {"type": "PullRequest",
+                        "url": "https://api.github.com/repos/owner/repo/pulls/1"},
+        }
+
+        def transport(args, **kwargs):
+            if args[:2] == ["search", "prs"]:
+                return []
+            if args[:2] == ["search", "issues"]:
+                return []
+            if args[:2] == ["api", "/notifications"]:
+                return [notification]
+            if args[:2] == ["api", "graphql"]:
+                return {"data": {"r0": {"isArchived": False, "s0_0": {
+                    "state": "OPEN", "isDraft": False, "baseRefName": "main",
+                    "headRefName": "feature", "author": {"login": "author"},
+                }}}}
+            raise AssertionError(args)
+
+        with (patch.object(github, "_gh_json", side_effect=transport),
+              patch.object(github, "_get_gh_login", return_value="athal7"),
+              patch.object(github, "_fetch_my_repo_issues", return_value=[]),
+              patch.object(github, "_repo_dir_index", return_value={})):
+            items = github.fetch({})
+        self.assertEqual(
+            [(item["id"], item["status"], item["weight"], item["indicators"]["review"])
+             for item in items],
+            [("1", "REVIEW REQUESTED", 90, "Requested")],
+        )
+
+    def test_an_answered_review_request_notification_is_dropped(self):
+        # The thread stays unread after a review is submitted, so an old
+        # notification must not claim a review that is no longer owed.
+        notification = {
+            "id": "thread-1", "unread": True, "reason": "review_requested",
+            "repository": {"full_name": "owner/repo"},
+            "subject": {"type": "PullRequest",
+                        "url": "https://api.github.com/repos/owner/repo/pulls/1"},
+        }
+
+        def collect(requested_reviewers, current_login="athal7"):
+            def transport(args, **kwargs):
+                if args[:2] in (["search", "prs"], ["search", "issues"]):
+                    return []
+                if args[:2] == ["api", "/notifications"]:
+                    return [notification]
+                if args[:2] == ["api", "graphql"]:
+                    return {"data": {"r0": {"isArchived": False, "s0_0": {
+                        "state": "OPEN", "isDraft": False,
+                        "reviewRequests": {"nodes": [
+                            {"requestedReviewer": {"__typename": "User", "login": login}}
+                            for login in requested_reviewers
+                        ]},
+                    }}}}
+                raise AssertionError(args)
+
+            with (patch.object(github, "_gh_json", side_effect=transport),
+                  patch.object(github, "_get_gh_login", return_value=current_login),
+                  patch.object(github, "_fetch_my_repo_issues", return_value=[]),
+                  patch.object(github, "_repo_dir_index", return_value={})):
+                return [item["id"] for item in github.fetch({})]
+
+        self.assertEqual(collect(["athal7"]), ["1"])
+        self.assertEqual(collect(["other"]), [])
+        # A team request carries no login, so the viewer's obligation stands.
+        self.assertEqual(collect([None]), ["1"])
+
+    def test_a_merged_pull_request_notification_is_dropped(self):
+        for state in ("MERGED", "CLOSED"):
+            with self.subTest(state=state):
+                notification = {
+                    "id": "thread-1", "unread": True, "reason": "review_requested",
+                    "repository": {"full_name": "owner/repo"},
+                    "subject": {"type": "PullRequest",
+                                "url": "https://api.github.com/repos/owner/repo/pulls/1"},
+                }
+
+                def transport(args, **kwargs):
+                    if args[:2] == ["search", "prs"] or args[:2] == ["search", "issues"]:
+                        return []
+                    if args[:2] == ["api", "/notifications"]:
+                        return [notification]
+                    if args[:2] == ["api", "graphql"]:
+                        return {"data": {"r0": {"isArchived": False, "s0_0": {
+                            "state": state, "isDraft": False,
+                        }}}}
+                    raise AssertionError(args)
+
+                with (patch.object(github, "_gh_json", side_effect=transport),
+                      patch.object(github, "_get_gh_login", return_value="athal7"),
+                      patch.object(github, "_fetch_my_repo_issues", return_value=[]),
+                      patch.object(github, "_repo_dir_index", return_value={})):
+                    self.assertEqual(github.fetch({}), [])
 
 
 class NotificationReuseTests(unittest.TestCase):

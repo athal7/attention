@@ -141,7 +141,7 @@ Config is JSON at `$XDG_CONFIG_HOME/attention/config.json`, falling back to
 | `automation.maxWipByProvider` | Object mapping a plugin name (`"github"`, `"linear"`) to a cap on that provider's sessions; unlisted providers are uncapped. |
 | `automation.maxSessions` | Object mapping an AoE agent (`"freebuff"`, `"omp"`) to a cap on its live sessions, counted from `aoe list --state live` plus this round's starts. Needs `session.agents` to know which agent a dispatch starts. |
 | `dashboard.autoExpand` | `true` opens the dashboard with every group expanded instead of collapsed. Default `false`; groups still toggle with `Enter`, and a filter expands matching groups regardless. |
-| `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, `authors`, and/or `any`) or `fallback: true`. `contextPrefixes` matches an item's `context` or the provider-qualified identity it reports as `repo`, so an organization prefix groups GitHub items even though their rows show only the repository name. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
+| `dashboard.groups` | Optional ordered terminal-dashboard groups. Without it, the dashboard groups pull requests, issues, reminders, events, and other items by type. Each entry has a unique `name` and either a `match` object (`plugins`, `kinds`, `contexts`, `contextPrefixes`, `statuses`, `authors`, and/or `any`) or `fallback: true`. `contextPrefixes` matches an item's `context` or the provider-qualified identity it reports as `repo`, so an organization prefix groups GitHub items even though their rows show only the repository name and number. `any` is a non-empty list of match objects; any one alternative may match, combined with the outer match fields. Optional `columns` is a non-empty list of shared indicator keys. Exactly one fallback is required when groups are configured. |
 
 ### Automation
 
@@ -311,10 +311,10 @@ Invalid grouping configuration emits a warning and uses the existing flat
 dashboard, so it cannot hide attention items.
 
 `contextPrefixes` matches the start of an item's `context` or, when a source
-reports one, its `repo` identity. The bundled `github` plugin shows only the
-repository name as context but reports the full `owner/repo` as `repo`, so
-organization prefixes such as `"myorg/"` group its items without widening
-their rows.
+reports one, its `repo` identity. The bundled `github` plugin shows the
+repository name and item number as context (`odin#1423`) but reports the full
+`owner/repo` as `repo`, so organization prefixes such as `"myorg/"` group its
+items without widening their rows.
 
 `authors` matches the item's author login exactly, including case. GitHub pull
 requests provide their actual author login when available, including for review

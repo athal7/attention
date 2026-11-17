@@ -809,7 +809,7 @@ p._gh_json = lambda args: (_ for _ in ()).throw(RuntimeError('offline'))
 fallback, _ = p._fetch_notification_delta()
 print(fallback)
 " )"
-  check "all approved notification reasons survive and non-PR subject URLs resolve"     "$(sed -n 1p <<<"$out")" "['1', '2', '3', '4', '5', '6'] https://github.com/o/r/discussions/1"
+  check "all approved notification reasons survive and non-PR subject URLs resolve"     "$(sed -n 1p <<<"$out")" "['1', '2', '3', '4', '5', '6', '7'] https://github.com/o/r/discussions/1"
   check "notification deltas replay sixty seconds"     "$(sed -n 2p <<<"$out")" "True"
   check "notification REST fallback treats a repository lookup failure as archived"     "$(sed -n 3p <<<"$out")" "[{'notification_id': '404', '_remove': True}]"
 }

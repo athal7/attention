@@ -32,6 +32,9 @@ _MAX_PR_DETAIL_WORKERS = 32
 _PR_DETAIL_BATCH_SIZE = 10
 _NOTIFICATION_REASONS = {
     "mention", "team_mention", "author", "comment", "manual", "subscribed",
+    # The review-request search index trails GitHub by minutes, so the
+    # notification is what makes a fresh request to review visible at all.
+    "review_requested",
 }
 # Reasons that are the viewer being explicitly named in a thread, as opposed to
 # being notified because they authored, watch, or commented on it.
@@ -476,6 +479,13 @@ def _apply_pr_detail(pr, detail):
             "head": {"ref": detail.get("headRefName") or ""},
             "author": detail.get("author") or {},
         }
+        # Reused by a review_requested notification for the same pull request,
+        # which must not claim a review already answered.
+        if isinstance(detail.get("reviewRequests"), list):
+            pr["_notification_state"]["requestedReviewers"] = [
+                reviewer.get("login") if isinstance(reviewer, dict) else None
+                for reviewer in detail["reviewRequests"]
+            ]
     pr["reviewRequested"] = bool(detail.get("reviewRequests"))
     pr["mergeReady"] = _merge_ready(detail)
     pr["headRefOid"] = detail.get("headRefOid") or ""
@@ -717,7 +727,12 @@ def _fetch_notification_state(notifications, search_items=()):
             field = "pullRequest" if subject_type == "PullRequest" else "issue"
             query.append(
                 f"{alias}: {field}(number: {number}) {{ state "
-                + ("isDraft baseRefName headRefName author { login __typename } " if subject_type == "PullRequest" else "")
+                + (
+                    "isDraft baseRefName headRefName author { login __typename } "
+                    "reviewRequests(first: 50) { nodes { requestedReviewer { "
+                    "__typename ... on User { login } } } } "
+                    if subject_type == "PullRequest" else ""
+                )
                 + "}"
             )
             target_aliases[(repo, subject_type, number)] = alias
@@ -744,12 +759,27 @@ def _fetch_notification_state(notifications, search_items=()):
             base_ref = raw.get("baseRefName") or ""
             head_ref = raw.get("headRefName") or ""
             raw_state = raw.get("state")
+            raw_review_requests = raw.get("reviewRequests")
+            # Absent reviewer data is unknown, not "nobody": only a response
+            # that actually carries the field can say a request was answered.
+            requested_reviewers = (
+                [
+                    (node.get("requestedReviewer") or {}).get("login")
+                    for node in raw_review_requests["nodes"]
+                    if isinstance(node, dict)
+                ]
+                if isinstance(raw_review_requests, dict)
+                and isinstance(raw_review_requests.get("nodes"), list)
+                else None
+            )
             subject_state[(repo, subject_type, number)] = {
                 "state": raw_state.lower() if isinstance(raw_state, str) else raw_state,
                 "draft": raw.get("isDraft"),
                 "base": {"ref": base_ref} if base_ref else {},
                 "head": {"ref": head_ref} if head_ref else {},
                 "author": raw.get("author") or {},
+                **({"requestedReviewers": requested_reviewers}
+                   if requested_reviewers is not None else {}),
             }
     return repository_archived, subject_state
 
@@ -897,6 +927,22 @@ def _only_bot_timeline_comments_since_read(notification, repo, number):
             saw_unread_comment = True
     return saw_unread_comment
 
+def _request_still_owes_review(state, current_login):
+    """Whether a review request this notification raised is still outstanding.
+
+    Unknown reviewer identities (teams carry no login) and a missing reviewer
+    list both count as still owed.
+    """
+    requested = state.get("requestedReviewers")
+    viewer = current_login.casefold() if isinstance(current_login, str) and current_login else ""
+    if not isinstance(requested, list) or not viewer:
+        return True
+    return any(
+        login is None or (isinstance(login, str) and login.casefold() == viewer)
+        for login in requested
+    )
+
+
 def _fetch_notification_delta(since=None, current_login=None, search_items=()):
     """Fetch and validate a durable delta of unread notification threads."""
     poll_started = datetime.now(timezone.utc)
@@ -1000,6 +1046,16 @@ def _fetch_notification_delta(since=None, current_login=None, search_items=()):
                 subject_info = _gh_json(["api", subject.get("url", "")])
                 state = subject_info if isinstance(subject_info, dict) else {}
             if state.get("state") != "open":
+                return {"notification_id": thread_id, "_remove": True}
+            if (
+                subject_type == "PullRequest"
+                and notification.get("reason") == "review_requested"
+                and not _request_still_owes_review(state, current_login)
+            ):
+                # The thread stays unread after the request is answered, so an
+                # old notification must not claim a review that is no longer
+                # owed. Without the reviewer list, keep it: hiding a live
+                # request is worse than showing a stale one.
                 return {"notification_id": thread_id, "_remove": True}
             if (
                 subject_type == "PullRequest"
@@ -1400,6 +1456,14 @@ def _fetch_search_items(config, current_login=None):
             and author.casefold() == current_login.casefold()
         ):
             continue
+        # The search index keeps reporting a pull request for a while after
+        # it merged or closed, and merging does not clear its reviewRequests,
+        # so a stale hit would otherwise read as a review still owed. Only a
+        # detail saying the pull request is still open can be outstanding;
+        # with no detail at all, keep the request rather than hide the work.
+        detail_state = detail.get("state") if isinstance(detail, dict) else None
+        if isinstance(detail_state, str) and detail_state and detail_state != "OPEN":
+            continue
         if _review_handled_by_other(detail, current_login):
             continue
         _apply_pr_detail(pr, detail)
@@ -1472,10 +1536,11 @@ def get_repo_from_url(url):
     return m.group(1) if m else ""
 
 
-def _display_context(repo_name):
-    # UI context: show only the repo name (drop the org prefix), so the
-    # row reads as 'kb' rather than 'myorg/kb'.
-    return repo_name.split("/", 1)[-1]
+def _display_context(repo_name, number):
+    # UI context: show only the repo name (drop the org prefix) plus the
+    # item number, so the row reads as 'kb#40' rather than 'myorg/kb'.
+    name = repo_name.split("/", 1)[-1]
+    return f"{name}#{number}" if number else name
 
 
 def _session_prompt(gtype, reasons):
@@ -1581,6 +1646,8 @@ def fetch(config):
                 weight, status = 80, "CI STATUS"
             elif reason == "mention":
                 weight, status = 82, "MENTIONED"
+            elif reason == "review_requested":
+                weight, status = 90, "REVIEW REQUESTED"
             elif reason == "author":
                 weight, status = 82, "NOTIFIED"
             elif reason == "state_change":
@@ -1607,7 +1674,10 @@ def fetch(config):
             indicators = {
                 "ci": "None",
                 "draft": "Yes" if is_draft else "No",
-                "review": "Requested" if gtype == "review_request" else "None",
+                "review": "Requested" if (
+                    gtype == "review_request"
+                    or g.get("notification_reason") == "review_requested"
+                ) else "None",
                 "merge": "Unknown",
                 "target": g.get("baseRefName") or "—",
             }
@@ -1660,7 +1730,7 @@ def fetch(config):
             "slug": slug,
             "repo_project_path": repo_project_path,
             "repo": repo_name,
-            "context": _display_context(repo_name),
+            "context": _display_context(repo_name, number),
             "title": title,
             "status": status,
             "details": details,
@@ -1738,17 +1808,19 @@ def fetch(config):
                 if reference.get("number") is not None
             ] + _body_association_keys(g.get("body", "")),
             "actions": actions,
-            "context": _display_context(repo_name),
+            "context": _display_context(repo_name, number),
         })
+    # Branch linkage is repository-wide, so it keys off the full identity
+    # rather than the per-item display context.
     branch_owners = {
-        (item["context"].casefold(), item["head_branch"]): item["identity_key"]
+        (item["repo"].casefold(), item["head_branch"]): item["identity_key"]
         for item in items
         if item.get("kind") == "pull_request" and item.get("head_branch")
     }
     for item in items:
         if item.get("kind") != "pull_request" or not item.get("base_branch"):
             continue
-        parent = branch_owners.get((item["context"].casefold(), item["base_branch"]))
+        parent = branch_owners.get((item["repo"].casefold(), item["base_branch"]))
         if parent and parent != item["identity_key"]:
             item["parent_identity_key"] = parent
     return items
