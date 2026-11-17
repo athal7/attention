@@ -33,6 +33,9 @@ _PR_DETAIL_BATCH_SIZE = 10
 _NOTIFICATION_REASONS = {
     "mention", "team_mention", "author", "comment", "manual", "subscribed",
 }
+# Reasons that are the viewer being explicitly named in a thread, as opposed to
+# being notified because they authored, watch, or commented on it.
+_MENTION_NOTIFICATION_REASONS = {"mention", "team_mention"}
 
 _PR_DETAIL_FIELDS = (
     "author,state,headRefOid,mergeable,mergeStateStatus,reviewDecision,"
@@ -354,6 +357,14 @@ def _compose_raw(search_items, notification_items):
                 target_ids.append(thread_id)
         if target_ids and "notification_id" not in winner:
             winner["notification_id"] = target_ids[0]
+        # A search row wins the display, but a mention that brought the same
+        # subject to the viewer's attention still belongs to it -- it is what
+        # keeps, say, someone else's draft pull request in the list.
+        if (
+            notification.get("notification_reason") in _MENTION_NOTIFICATION_REASONS
+            and winner.get("notification_reason") not in _MENTION_NOTIFICATION_REASONS
+        ):
+            winner["notification_reason"] = notification["notification_reason"]
     return combined
 
 
@@ -1187,6 +1198,20 @@ def _submitted_review_by_viewer(detail, current_login):
     return False
 
 
+def _viewer_still_requested(detail, current_login):
+    """Whether GitHub still lists the viewer as an outstanding reviewer.
+
+    GitHub keeps a reviewer in `reviewRequests` until that reviewer submits a
+    review, so a request that is still there is work the viewer still owes --
+    however many other people have since reviewed the pull request.
+    """
+    for reviewer in detail.get("reviewRequests") or []:
+        login = reviewer.get("login") if isinstance(reviewer, dict) else None
+        if isinstance(login, str) and login.casefold() == current_login.casefold():
+            return True
+    return False
+
+
 def _review_handled_by_other(detail, current_login):
     if not isinstance(detail, dict) or not isinstance(current_login, str) or not current_login:
         return False
@@ -1197,6 +1222,9 @@ def _review_handled_by_other(detail, current_login):
             return True
 
     if _submitted_review_by_viewer(detail, current_login):
+        return False
+
+    if _viewer_still_requested(detail, current_login):
         return False
 
     handled_by_other = False
@@ -1396,16 +1424,46 @@ def _fetch_search_items(config, current_login=None):
     return combined
 
 
+def _draft_from_other(item, current_login):
+    """Whether this is someone else's draft pull request.
+
+    A draft is its author's own unfinished work, so another person's draft is
+    not the viewer's to act on and stays out of the list -- unless they were
+    mentioned in it, which is an explicit request for their attention.
+    """
+    if item.get("isDraft") is not True or item.get("_is_own_pr") is True:
+        return False
+    author = item.get("author")
+    login = author.get("login") if isinstance(author, dict) else author
+    if not isinstance(login, str) or not login:
+        # Whose draft this is cannot be established; keeping it beats hiding
+        # work that may be the viewer's own.
+        return False
+    if isinstance(current_login, str) and current_login and login.casefold() == current_login.casefold():
+        return False
+    return item.get("notification_reason") not in _MENTION_NOTIFICATION_REASONS
+
+
 def _fetch_raw(config):
     """Live retrieval seam retained for focused tests and manual refreshes."""
     current_login = _get_gh_login()
     search_items = _fetch_search_items(config, current_login)
-    notification_items, _ = _fetch_notification_delta(
-        current_login=current_login, search_items=search_items,
-    )
+    try:
+        notification_items, _ = _fetch_notification_delta(
+            current_login=current_login, search_items=search_items,
+        )
+    except GitHubFetchError:
+        # Notifications are enrichment on top of the searches. A slow or
+        # failing notifications endpoint (it is the one call that routinely
+        # times out) must not hide the pull requests and issues the searches
+        # did return.
+        notification_items = []
     for item in search_items:
         item.pop("_notification_state", None)
-    return _compose_raw(search_items, notification_items)
+    return [
+        item for item in _compose_raw(search_items, notification_items)
+        if not _draft_from_other(item, current_login)
+    ]
 
 
 def get_repo_from_url(url):

@@ -367,14 +367,21 @@ outcome rather than the word a source chose for it.
   mentions and comments on your work are included. Passive subscription state
   changes and CI activity from watched repositories are excluded. Configured
   `github.trackAuthors` entries remain an explicit opt-in for teammate PRs.
-  Review requests are omitted when another confirmed person has submitted a
-  review, unless you have also submitted a review; a PR assigned to another
-  user is still omitted. Bots, pending and dismissed reviews, and your own
-  assignment do not count. Your own review still counts after later commits
-  make it stale and drop it from the PR's latest reviews, so a re-requested
-  PR stays visible. A review whose author type is unknown does not hide
-  a request, including when the detail fallback lacks bot metadata. PR details
-  are fetched in bounded batches with per-PR fallback.
+  A review request GitHub still addresses to you stays visible however many
+  other people have reviewed since, because it is work you still owe; a PR
+  assigned to another user is omitted. Without such a request, another
+  confirmed person's submitted review hides it unless you have also submitted
+  a review. Bots, pending and dismissed reviews, and your own assignment do
+  not count. Your own review still counts after later commits make it stale
+  and drop it from the PR's latest reviews, so a re-requested PR stays
+  visible. A review whose author type is unknown does not hide a request,
+  including when the detail fallback lacks bot metadata. PR details are
+  fetched in bounded batches with per-PR fallback.
+  Another person's draft PR is omitted -- a draft is its author's unfinished
+  work -- unless the notification about it is a mention (or team mention) of
+  you. A draft's author is only counted when it is known, so an unattributable
+  draft stays visible. A failing or slow notifications call costs only the
+  notification rows: the searches still list their PRs and issues.
   Search and notification validation reuse complete PR and repository state
   within a refresh; missing state is fetched separately.
   Merge ready requires an open, non-draft PR with approved review, a clean

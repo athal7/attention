@@ -22,9 +22,9 @@ def candidate(number, repo="owner/repo"):
             "title": f"Review {number}", "url": f"https://github.com/{repo}/pull/{number}"}
 
 
-def detail(author=None, state="COMMENTED", assignees=None):
+def detail(author=None, state="COMMENTED", assignees=None, requested=True):
     return {"state": "OPEN", "assignees": assignees or [],
-            "reviewRequests": [{"login": "viewer"}],
+            "reviewRequests": [{"login": "viewer"}] if requested else [],
             "latestReviews": [{"author": author, "state": state}] if author else []}
 
 
@@ -99,60 +99,98 @@ class RequestedReviewTests(unittest.TestCase):
             ({"login": "human", "type": "User"}, False),
             ({"login": "human", "is_bot": False}, False),
         ]
-        for author, visible in cases:
-            for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"):
-                with self.subTest(author=author, state=state):
-                    raw = detail(author, state)
-                    transport = self.search_transport([candidate(1)], lambda args: (
-                        [] if args[:2] == ["api", "graphql"] else raw
-                    ))
-                    items = self.collect([candidate(1)], transport)
-                    expected = ["1"] if visible or state in {"PENDING", "DISMISSED"} else []
-                    self.assertEqual([item["id"] for item in items], expected)
-
-    def test_prior_submitted_review_preserves_rerequest_despite_other_review(self):
-        other = {"author": {"login": "human", "__typename": "User"}, "state": "APPROVED"}
-        for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"):
-            for reverse in (False, True):
-                for assigned in (False, True):
-                    with self.subTest(state=state, reverse=reverse, assigned=assigned):
-                        own = {"author": {"login": "VIEWER"}, "state": state}
-                        raw = detail(assignees=[{"login": "other"}] if assigned else [])
-                        raw["latestReviews"] = [own, other] if reverse else [other, own]
+        for requested in (True, False):
+            for author, visible in cases:
+                for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"):
+                    with self.subTest(requested=requested, author=author, state=state):
+                        raw = detail(author, state, requested=requested)
                         transport = self.search_transport([candidate(1)], lambda args: (
                             [] if args[:2] == ["api", "graphql"] else raw
                         ))
-                        visible = state not in {"PENDING", "DISMISSED"} and not assigned
-                        self.assertEqual(
-                            [item["id"] for item in self.collect([candidate(1)], transport)],
-                            ["1"] if visible else [],
-                        )
+                        items = self.collect([candidate(1)], transport)
+                        # A request GitHub still addresses to the viewer is
+                        # theirs to do, no matter who else has already reviewed.
+                        expected = ["1"] if (
+                            requested or visible or state in {"PENDING", "DISMISSED"}
+                        ) else []
+                        self.assertEqual([item["id"] for item in items], expected)
+
+    def test_pending_request_survives_another_reviewers_approval(self):
+        # 0din-ai/odin#1420: a teammate's approval does not clear the viewer's
+        # own outstanding review request.
+        raw = detail({"login": "human", "__typename": "User"}, "APPROVED")
+        raw["reviewDecision"] = "APPROVED"
+        transport = self.search_transport([candidate(1420, "0din-ai/odin")], lambda args: (
+            [] if args[:2] == ["api", "graphql"] else raw
+        ))
+        items = self.collect([candidate(1420, "0din-ai/odin")], transport)
+        self.assertEqual(
+            [(item["id"], item["status"], item["indicators"]["state"]) for item in items],
+            [("1420", "REVIEW REQUESTED", "Review requested")],
+        )
+
+    def test_prior_submitted_review_preserves_rerequest_despite_other_review(self):
+        other = {"author": {"login": "human", "__typename": "User"}, "state": "APPROVED"}
+        for requested in (True, False):
+            for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "PENDING", "DISMISSED"):
+                for reverse in (False, True):
+                    for assigned in (False, True):
+                        with self.subTest(requested=requested, state=state,
+                                          reverse=reverse, assigned=assigned):
+                            own = {"author": {"login": "VIEWER"}, "state": state}
+                            raw = detail(assignees=[{"login": "other"}] if assigned else [],
+                                         requested=requested)
+                            raw["latestReviews"] = [own, other] if reverse else [other, own]
+                            transport = self.search_transport([candidate(1)], lambda args: (
+                                [] if args[:2] == ["api", "graphql"] else raw
+                            ))
+                            # Someone else being assigned keeps the request out of the
+                            # list; an outstanding request on the viewer keeps it in,
+                            # and without one only a submitted review of the viewer's
+                            # own counts as the request having been answered.
+                            visible = (
+                                not assigned
+                                and (requested or state not in {"PENDING", "DISMISSED"})
+                            )
+                            self.assertEqual(
+                                [item["id"] for item in self.collect([candidate(1)], transport)],
+                                ["1"] if visible else [],
+                            )
 
     def test_stale_own_review_preserves_rerequest_after_later_commits(self):
         # New commits drop a reviewer's stale review from latestReviews, but the
         # re-requested reviewer must still see the PR.
         other = {"author": {"login": "human", "__typename": "User"}, "state": "COMMENTED"}
-        for viewer_state, visible in (("CHANGES_REQUESTED", True), ("APPROVED", True),
-                                      ("COMMENTED", True), ("DISMISSED", False),
-                                      ("PENDING", False)):
-            for stale_source in ("viewerLatestReview", "reviews"):
-                with self.subTest(state=viewer_state, source=stale_source):
-                    raw = detail()
-                    raw["latestReviews"] = [other]
-                    if stale_source == "viewerLatestReview":
-                        raw["viewerLatestReview"] = {"state": viewer_state}
-                    else:
-                        raw["reviews"] = [
-                            {"author": {"login": "other"}, "state": "COMMENTED"},
-                            {"author": {"login": "VIEWER"}, "state": viewer_state},
-                        ]
-                    transport = self.search_transport([candidate(1)], lambda args: (
-                        [] if args[:2] == ["api", "graphql"] else raw
-                    ))
-                    self.assertEqual(
-                        [item["id"] for item in self.collect([candidate(1)], transport)],
-                        ["1"] if visible else [],
-                    )
+        for requested in (True, False):
+            for viewer_state, reviewed in (("CHANGES_REQUESTED", True), ("APPROVED", True),
+                                           ("COMMENTED", True), ("DISMISSED", False),
+                                           ("PENDING", False)):
+                for stale_source in ("viewerLatestReview", "reviews"):
+                    with self.subTest(requested=requested, state=viewer_state,
+                                      source=stale_source):
+                        visible = requested or reviewed
+                        self._assert_stale_review_visibility(
+                            other, viewer_state, stale_source, requested, visible,
+                        )
+
+    def _assert_stale_review_visibility(self, other, viewer_state, stale_source,
+                                        requested, visible):
+        raw = detail(requested=requested)
+        raw["latestReviews"] = [other]
+        if stale_source == "viewerLatestReview":
+            raw["viewerLatestReview"] = {"state": viewer_state}
+        else:
+            raw["reviews"] = [
+                {"author": {"login": "other"}, "state": "COMMENTED"},
+                {"author": {"login": "VIEWER"}, "state": viewer_state},
+            ]
+        transport = self.search_transport([candidate(1)], lambda args: (
+            [] if args[:2] == ["api", "graphql"] else raw
+        ))
+        self.assertEqual(
+            [item["id"] for item in self.collect([candidate(1)], transport)],
+            ["1"] if visible else [],
+        )
 
     def test_assignee_policy_is_independent_of_unknown_reviewer_identity(self):
         for assignees, visible in (([], True), ([{"login": "VIEWER"}], True),
@@ -217,8 +255,95 @@ class RequestedReviewTests(unittest.TestCase):
             raise AssertionError(args)
 
         items = self.collect(prs, self.search_transport(prs, fetch_detail))
-        self.assertEqual([item["id"] for item in items], [str(n) for n in range(2 * limit)])
+        # Every candidate keeps its request: the viewer is still a requested
+        # reviewer on all of them, whatever another reviewer has since said.
+        self.assertEqual([item["id"] for item in items], [str(n) for n in range(2 * limit + 1)])
         self.assertEqual(sorted(fallbacks), [0, *range(limit, 2 * limit)])
+
+
+class NotificationFailureTests(unittest.TestCase):
+    def test_failing_notification_fetch_keeps_search_results(self):
+        # The notifications endpoint times out on its own; that must cost the
+        # notification rows only, never the searched pull requests and issues.
+        pr = candidate(1423, "0din-ai/odin")
+
+        def transport(args, **kwargs):
+            if args[:2] == ["search", "prs"]:
+                return [copy.deepcopy(pr)] if "--review-requested=@me" in args else []
+            if args[:2] == ["search", "issues"]:
+                return []
+            if args[:2] == ["api", "graphql"]:
+                return {"data": {"r0": {"isArchived": False, "p0_0": {
+                    "state": "OPEN", "isDraft": False, "reviewDecision": "REVIEW_REQUIRED",
+                    "reviewRequests": {"pageInfo": {"hasNextPage": False},
+                                       "nodes": [{"requestedReviewer": {"__typename": "User", "login": "viewer"}}]},
+                    "author": {"login": "author", "__typename": "User"},
+                }}}}
+            raise AssertionError(args)
+
+        def run(command, **kwargs):
+            args = command[1:]
+            if args[:2] == ["api", "/notifications"]:
+                raise subprocess.TimeoutExpired(command, 30)
+            return subprocess.CompletedProcess(command, 0, json.dumps(transport(args)), "")
+
+        with (patch.object(github.subprocess, "run", side_effect=run),
+              patch.object(github, "_get_gh_login", return_value="viewer"),
+              patch.object(github, "_fetch_my_repo_issues", return_value=[]),
+              patch.object(github, "_repo_dir_index", return_value={})):
+            items = github.fetch({})
+        self.assertEqual([(item["id"], item["status"]) for item in items],
+                         [("1423", "REVIEW REQUESTED")])
+
+
+def draft(number, author=None, **extra):
+    item = {"number": number, "title": f"Draft {number}",
+            "repository": {"nameWithOwner": "owner/repo"},
+            "url": f"https://github.com/owner/repo/pull/{number}", "isDraft": True}
+    if author is not None:
+        item["author"] = {"login": author}
+    item.update(extra)
+    return item
+
+
+class DraftVisibilityTests(unittest.TestCase):
+    def raw(self, items, current_login="viewer"):
+        with (patch.object(github, "_get_gh_login", return_value=current_login),
+              patch.object(github, "_fetch_search_items", return_value=items),
+              patch.object(github, "_fetch_notification_delta", return_value=([], None))):
+            return github._fetch_raw({})
+
+    def test_other_peoples_drafts_stay_out_of_the_list(self):
+        items = [draft(1, "teammate"), draft(2, "viewer"), draft(3, None)]
+        kept = [(item["number"], item["isDraft"]) for item in self.raw(items)]
+        self.assertEqual(kept, [(2, True), (3, True)])
+
+    def test_a_mention_keeps_another_persons_draft(self):
+        items = [
+            draft(1, "teammate", notification_reason="subscribed"),
+            draft(2, "teammate", notification_reason="mention"),
+            draft(3, "teammate", notification_reason="team_mention"),
+        ]
+        self.assertEqual([item["number"] for item in self.raw(items)], [2, 3])
+
+    def test_a_mention_on_a_searched_draft_keeps_it(self):
+        # The search row wins the display, but the mention that also drew
+        # attention to the same draft must not be dropped with it.
+        searched = draft(7, "teammate")
+        notification = {
+            "number": "7", "title": "Draft 7", "isDraft": True,
+            "repository": {"nameWithOwner": "owner/repo"},
+            "url": "https://github.com/owner/repo/pull/7",
+            "notification_id": "thread-7", "notification_reason": "mention",
+            "author": {"login": "teammate", "__typename": "User"},
+        }
+        with (patch.object(github, "_get_gh_login", return_value="viewer"),
+              patch.object(github, "_fetch_search_items", return_value=[searched]),
+              patch.object(github, "_fetch_notification_delta",
+                           return_value=([notification], None))):
+            kept = github._fetch_raw({})
+        self.assertEqual([(item["number"], item["notification_ids"]) for item in kept],
+                         [(7, ["thread-7"])])
 
 
 class NotificationReuseTests(unittest.TestCase):
