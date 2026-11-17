@@ -154,8 +154,12 @@ regardless of which plugin produced it:
 2. **ID-shaped title match**: if item A's title contains a token shaped
    like `[A-Z]+-\d+` (e.g. `ABC-123`) and some other item B's `id`
    (case-insensitive) equals that token, B is absorbed into A.
-3. **Title-substring match**: if item A's title (≥4 chars, not
-   "untitled") is a substring of item B's title, B is absorbed into A.
+3. **Title-phrase match**: if item A's title (≥4 chars, not
+   "untitled") appears in item B's title on word boundaries, B is absorbed
+   into A. The match must be bounded by non-word characters (or the string
+   edge) on both sides, so "Team Dinner" still matches inside "Book
+   babysitter for Team Dinner" but "Pack" never matches inside
+   "/packages/".
 
 "Absorbed" means: whichever of A/B has the higher `status_priority`
 (ties keep A's) keeps its `status` on the merged row; the other's

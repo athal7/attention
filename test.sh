@@ -3090,6 +3090,31 @@ print(json.dumps(merged))
 }
 test_title_substring_cross_link_merge
 
+test_partial_word_title_never_matches() {
+  local out
+  out="$(python3 -c "
+$LOAD_CORE
+rem_item = {
+    'status': 'PENDING', 'context': 'Personal', 'title': 'Pack', 'details': '',
+    'weight': 15, 'id': 'r1', 'actions': [],
+}
+pr_item = {
+    'status': 'REVIEW REQUESTED', 'context': 'owner/repo', 'title': 'Fix /packages/ path handling',
+    'details': '', 'weight': 90, 'id': '7', 'actions': [],
+}
+packed_item = {
+    'status': 'OPEN', 'context': 'owner/repo', 'title': 'Repack the archive',
+    'details': '', 'weight': 70, 'id': '8', 'actions': [],
+}
+merged = m.merge_cross_links([rem_item, pr_item, packed_item])
+import json
+print(json.dumps(sorted(item['title'] for item in merged)))
+")"
+  check "a title that only occurs inside a longer word absorbs nothing" \
+    "$out" '["Fix /packages/ path handling", "Pack", "Repack the archive"]'
+}
+test_partial_word_title_never_matches
+
 test_short_or_untitled_titles_never_match() {
   local out
   out="$(python3 -c "

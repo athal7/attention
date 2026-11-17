@@ -504,6 +504,19 @@ def _absorb(host, guest):
         host_keys.add(new_key)
 
 
+def _title_contains_phrase(phrase, title):
+    """Whether `phrase` occurs in `title` as a whole phrase.
+
+    A bare substring test merges unrelated items whenever the shorter
+    title happens to sit inside a longer word -- a reminder titled
+    "Pack" would absorb a PR whose title mentions "/packages/" and
+    disappear from the queue. Requiring a non-word character (or the
+    string edge) on both sides keeps real phrase matches such as
+    "Team Dinner" in "Book babysitter for Team Dinner".
+    """
+    return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", title) is not None
+
+
 def merge_cross_links(items):
     """Two generic, source-agnostic passes over every fetched item --
     see PLUGINS.md's "Cross-link merging" section for the exact rules.
@@ -557,7 +570,7 @@ def merge_cross_links(items):
                 continue
             if len(host_title) < 4 or host_title == "untitled":
                 continue
-            if host_title in guest_title:
+            if _title_contains_phrase(host_title, guest_title):
                 _absorb(host, guest)
                 absorbed_titles.add(id(guest))
                 break
