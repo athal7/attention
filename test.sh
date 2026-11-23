@@ -4165,6 +4165,287 @@ th.join(timeout=5)
 }
 test_failed_actions_show_a_failure_notice
 
+test_actions_run_in_the_background_and_report_in_place() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [{'key': 's', 'label': 'session', '_item_id': 'a'}]},
+        {'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'},
+    ],
+}
+gate = threading.Event()
+def act(key, row):
+    gate.wait()
+    return True
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=act,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+row_for_a = presenter.push_calls()[-1][1][0]
+controller.dispatch_action('s', row_for_a)
+presenter.wait_for_push_count(3, timeout=5)
+print(repr(presenter.push_calls()[-1][3]))
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+gate.set()
+presenter.wait_for_push_count(4, timeout=5)
+print(repr(presenter.push_calls()[-1][3]))
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a dispatched action reports that it is running without waiting for it to finish" \
+    "$(sed -n 1p <<<"$out")" "'Running: session…'"
+  check "a dispatched action leaves every row in place" \
+    "$(sed -n 2p <<<"$out")" "['A', 'B']"
+  check "the action's own completion replaces the running notice in place" \
+    "$(sed -n 3p <<<"$out")" "'Done: session'"
+}
+test_actions_run_in_the_background_and_report_in_place
+
+test_dismissal_removes_the_row_immediately() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [{'key': 'd', 'label': 'dismiss', 'removes': True,
+                      '_plugin': 'solo', '_item_id': 'a'}]},
+        {'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'},
+    ],
+}
+gate = threading.Event()
+def act(key, row):
+    gate.wait()
+    return True
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=act,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+controller.dispatch_action('d', presenter.push_calls()[-1][1][0])
+presenter.wait_for_push_count(3, timeout=5)
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+gate.set()
+presenter.wait_for_push_count(4, timeout=5)
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+print(repr(presenter.push_calls()[-1][3]))
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a dismissal takes its row off the page as soon as it is dispatched" \
+    "$(sed -n 1p <<<"$out")" "['B']"
+  check "the dismissed row stays gone once the dismissal succeeds" \
+    "$(sed -n 2p <<<"$out")" "['B']"
+  check "a successful dismissal still reports that it is done" \
+    "$(sed -n 3p <<<"$out")" "'Done: dismiss'"
+}
+test_dismissal_removes_the_row_immediately
+
+test_failed_dismissal_puts_the_row_back() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+$DASHBOARD_FIXTURES
+items = {
+    'solo': [
+        {'status': 'S', 'context': 'c', 'title': 'A', 'details': '', 'weight': 5, 'id': 'a',
+         'actions': [{'key': 'd', 'label': 'dismiss', 'removes': True,
+                      '_plugin': 'solo', '_item_id': 'a'}]},
+        {'status': 'S', 'context': 'c', 'title': 'B', 'details': '', 'weight': 1, 'id': 'b'},
+    ],
+}
+presenter = FakePresenter()
+controller = d.DashboardController(
+    ['solo'], presenter,
+    fetch_plugin=gated_fetch_plugin(items, {}, CallLog()),
+    build_snapshot=flatten_build_snapshot,
+    render_rows=blob_render_rows,
+    act=lambda key, row: False,
+)
+th = threading.Thread(target=controller.run)
+th.start()
+presenter.wait_for_push_count(2, timeout=5)
+controller.dispatch_action('d', presenter.push_calls()[-1][1][0])
+presenter.wait_for_push_count(4, timeout=5)
+print([r.split(chr(9))[0] for r in presenter.push_calls()[-1][1]])
+print(repr(presenter.push_calls()[-1][3]))
+presenter.send_result('', '')
+th.join(timeout=5)
+")"
+  check "a dismissal that fails puts its row back where it was" \
+    "$(sed -n 1p <<<"$out")" "['A', 'B']"
+  check "a failed dismissal reports the failure" \
+    "$(sed -n 2p <<<"$out")" "'Action failed: dismiss'"
+}
+test_failed_dismissal_puts_the_row_back
+
+# ---------------------------------------------------------------------------
+echo
+echo "== dashboard.py: prompts and removal for dispatched actions =="
+
+test_action_prompts_are_asked_in_place() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import threading
+presenter = d.CursesPresenter()
+presenter.launch()
+answers = []
+th = threading.Thread(target=lambda: answers.append(presenter.ask(
+    {'prompt': 'Comment body', 'default': 'fallback'},
+)))
+th.start()
+import time
+deadline = time.time() + 5
+while presenter._prompt is None and time.time() < deadline:
+    time.sleep(0.01)
+print(presenter._prompt is not None)
+for key in (ord('h'), ord('i')):
+    presenter._prompt_key(key)
+status, hints = presenter._prompt_render(presenter._prompt, presenter._prompt_text, 60)
+print(status)
+print(hints)
+presenter._prompt_key(10)
+th.join(timeout=5)
+print(answers)
+")"
+  check "an action's prompt opens in the dashboard instead of the shell" \
+    "$(sed -n 1p <<<"$out")" "True"
+  check "typed characters appear on the prompt line" \
+    "$(sed -n 2p <<<"$out")" "Comment body hi▌"
+  check "a prompt with a default says what Enter will accept" \
+    "$(sed -n 3p <<<"$out")" "['Enter accepts \"fallback\" · Esc cancels']"
+  check "Enter answers the waiting action with what was typed" \
+    "$(sed -n 4p <<<"$out")" "['hi']"
+}
+test_action_prompts_are_asked_in_place
+
+test_action_prompt_choices_are_numbered_and_selectable() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import threading
+import time
+presenter = d.CursesPresenter()
+presenter.launch()
+answers = []
+th = threading.Thread(target=lambda: answers.append(presenter.ask(
+    {'prompt': 'Transition to', 'choices': ['Backlog', 'In Progress']},
+)))
+th.start()
+deadline = time.time() + 5
+while presenter._prompt is None and time.time() < deadline:
+    time.sleep(0.01)
+status, hints = presenter._prompt_render(presenter._prompt, presenter._prompt_text, 80)
+print(status)
+print('1) Backlog' in hints[0] and '2) In Progress' in hints[0])
+presenter._prompt_key(ord('2'))
+th.join(timeout=5)
+print(answers)
+")"
+  check "a choice prompt shows just the question on its status line" \
+    "$(sed -n 1p <<<"$out")" "Transition to"
+  check "a choice prompt lists its numbered choices" "$(sed -n 2p <<<"$out")" "True"
+  check "a digit selects that choice for the waiting action" \
+    "$(sed -n 3p <<<"$out")" "['In Progress']"
+}
+test_action_prompt_choices_are_numbered_and_selectable
+
+test_plugin_prompts_route_into_the_dashboard() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import sys
+sys.path.insert(0, '$REPO_ROOT/sources')
+import _util
+asked = []
+def ask(spec):
+    asked.append(spec)
+    return 'typed answer'
+restore = d.install_input(ask)
+try:
+    first = input('Comment body: ')
+    second = _util.prompt_for_input({'prompt': 'Pick', 'choices': ['a', 'b']})
+    hooked = callable(getattr(input, 'prompt_spec', None))
+finally:
+    restore()
+print(first)
+print(second)
+print(hooked)
+print([spec.get('prompt') for spec in asked])
+print(asked[1].get('choices'))
+def cancel(spec):
+    return None
+restore = d.install_input(cancel)
+try:
+    input('Body: ')
+    canceled = 'no error'
+except EOFError:
+    canceled = 'EOFError'
+finally:
+    restore()
+print(canceled)
+print(callable(getattr(input, 'prompt_spec', None)))
+")"
+  check "a plugin's own input() is answered by the dashboard" \
+    "$(sed -n 1p <<<"$out")" "typed answer"
+  check "a configured input spec shows the same prompt in the dashboard" \
+    "$(sed -n 2p <<<"$out")" "typed answer"
+  check "the dashboard's prompt hook is visible to _util while an action runs" \
+    "$(sed -n 3p <<<"$out")" "True"
+  check "bare input() prompts carry their own text, and choice prompts keep their choices" \
+    "$(sed -n 4p <<<"$out")" "['Comment body:', 'Pick']"
+  check "a configured prompt's choices reach the dashboard intact" \
+    "$(sed -n 5p <<<"$out")" "['a', 'b']"
+  check "canceling a dashboard prompt raises EOFError, which plugin code already treats as canceled" \
+    "$(sed -n 6p <<<"$out")" "EOFError"
+  check "restoring hands input() back with no dashboard hook attached" \
+    "$(sed -n 7p <<<"$out")" "False"
+}
+test_plugin_prompts_route_into_the_dashboard
+
+test_cancelled_prompts_unblock_their_action() {
+  local out
+  out="$(python3 -c "
+$LOAD_DASHBOARD
+import threading
+import time
+presenter = d.CursesPresenter()
+presenter.launch()
+answers = []
+th = threading.Thread(target=lambda: answers.append(presenter.ask({'prompt': 'Comment body'})))
+th.start()
+deadline = time.time() + 5
+while presenter._prompt is None and time.time() < deadline:
+    time.sleep(0.01)
+presenter._prompt_key(27)
+th.join(timeout=5)
+print(answers)
+print(presenter._prompt)
+")"
+  check "Esc cancels the prompt by answering None" "$(sed -n 1p <<<"$out")" "[None]"
+  check "a cancelled prompt leaves no prompt on the page" "$(sed -n 2p <<<"$out")" "None"
+}
+test_cancelled_prompts_unblock_their_action
+
 test_read_actions_leave_the_item_in_place
 
 test_terminal_action_relaunches_existing_list_before_refresh() {

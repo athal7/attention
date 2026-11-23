@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 
 from _util import (
-    resolve_configured_actions, resolve_open_action, run_cmd,
+    prompt_for_input, resolve_configured_actions, resolve_open_action, run_cmd,
     run_configured_action, slugify,
 )
 
@@ -218,7 +218,9 @@ def _linear_comment(db_id, token):
     if not db_id:
         print("No issue database ID available to comment.")
         return
-    body = input("\nEnter comment body: ").strip()
+    # `prompt_for_input` asks in the dashboard when one is running and falls
+    # back to the terminal otherwise.
+    body = prompt_for_input({"prompt": "Comment body"})
     if not body:
         print("Empty comment. Canceled.")
         return
@@ -278,30 +280,25 @@ def _linear_transition(db_id, token):
         print("No workflow states found.")
         return
 
-    print("\nAvailable States:")
-    for idx, s in enumerate(states, 1):
-        print(f"{idx}) {s['name']}")
-
-    try:
-        choice = input("\nSelect state to transition to [1-%d]: " % len(states)).strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(states):
-            target_state_id = states[int(choice) - 1]["id"]
-            target_state_name = states[int(choice) - 1]["name"]
-            res_update = _query(token, """
-            mutation($id: String!, $stateId: String!) {
-              issueUpdate(id: $id, input: { stateId: $stateId }) {
-                success
-              }
-            }
-            """, {"id": db_id, "stateId": target_state_id})
-            if res_update and not res_update.get("errors"):
-                print(f"Issue transitioned successfully to '{target_state_name}'!")
-            else:
-                print("Failed to transition issue.")
-        else:
-            print("Invalid choice.")
-    except (KeyboardInterrupt, EOFError):
+    names = [s["name"] for s in states]
+    target_state_name = prompt_for_input({
+        "prompt": "Transition to", "choices": names,
+    })
+    if target_state_name is None:
         print("\nCanceled.")
+        return
+    target_state_id = states[names.index(target_state_name)]["id"]
+    res_update = _query(token, """
+    mutation($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) {
+        success
+      }
+    }
+    """, {"id": db_id, "stateId": target_state_id})
+    if res_update and not res_update.get("errors"):
+        print(f"Issue transitioned successfully to '{target_state_name}'!")
+    else:
+        print("Failed to transition issue.")
 
 
 def act(key, payload):

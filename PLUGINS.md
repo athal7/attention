@@ -74,6 +74,7 @@ defaults shown below if omitted.
             "primary": True,         # bool, optional (default False) -- at most one per item, what plain Enter runs
             "wip": True,             # true marks, "clear" unmarks after completion; optional (default False)
             "read": True,            # bool, optional (default False) -- read-only action: running it leaves the item in place instead of deprioritizing it
+            "removes": True,         # bool, optional (default False) -- running it takes the item off the list (dismiss, complete), so the dashboard drops the row immediately and restores it if the action fails
             "payload": {...},        # dict, optional (default {}) -- anything JSON-serializable; yours, passed back to act()
         },
         ...
@@ -136,7 +137,12 @@ actual login, with bot logins normalized to their `[bot]` form.
 
 Actions run first when the highlighted item supports that key.
 `j` and `k` move through the list, `q` quits, `Enter` runs the primary action,
-and any other printable character is added to the filter query. After a
+and any other printable character is added to the filter query. An action
+runs in the background -- the page stays up, a `Running: ...` notice appears,
+and its own prints and prompts are captured by the dashboard rather than
+written over it -- then a `Done: ...` or `Action failed: ...` notice replaces
+that one. A `"removes": true` action takes its row off the page as soon as it
+is dispatched, because the next refresh would not show it anyway. After a
 write action the acted-on item drops down the list; after a `"read": true`
 action it stays put, so it can be acted on again immediately.
 

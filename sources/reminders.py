@@ -71,7 +71,10 @@ def fetch(config):
             "details": details,
         }
         actions = [
-            {"key": "x", "label": "complete", "payload": {"id": reminder_id}},
+            {
+                "key": "x", "label": "complete", "removes": True,
+                "payload": {"id": reminder_id},
+            },
         ]
         configured_actions = config.get("reminders", {}).get("actions", [])
         actions.extend(resolve_configured_actions(configured_actions, record))

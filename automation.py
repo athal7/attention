@@ -292,14 +292,18 @@ def _nudge_item(entry):
         "title": entry.get("title", ""),
         "details": entry.get("message", ""),
         "weight": entry.get("weight", 0),
-        "id": "",
+        "id": entry.get("id", ""),
         "kind": "nudge",
         "actions": [
             {
                 "key": "d",
                 "label": "dismiss",
+                # Dismissing drops the nudge, so the dashboard takes the row
+                # away as soon as it is dispatched.
+                "removes": True,
                 # Core dispatches a nudge action itself, without a plugin.
                 "_plugin": NUDGE_PLUGIN,
+                "_item_id": entry.get("id", ""),
                 "payload": {"kind": "dismiss_nudge", "nudge_id": entry.get("id", "")},
             },
         ],

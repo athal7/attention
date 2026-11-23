@@ -1779,6 +1779,11 @@ def fetch(config):
             actions.append({
                 "key": dismiss_key,
                 "label": "dismiss",
+                # Acknowledged threads stop being unread, so a notification
+                # row goes away on the next fetch; drop it as soon as it is
+                # dismissed. A pull request or issue row survives its own
+                # notifications, so it stays put.
+                "removes": kind == "notification",
                 "payload": {"kind": "dismiss_notification", **acknowledgement},
             })
 

@@ -24,6 +24,10 @@ class TerminalInputTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         config_dir = Path(tmp.name) / "attention"
         config_dir.mkdir()
+        # An action's own output never reaches the terminal -- the dashboard
+        # owns it -- so the fixture records its pick in a file the test reads,
+        # and the page itself only gains a notice.
+        self.hits = Path(tmp.name) / "hits"
         records = [
             {"id": "alpha-1", "title": "Alpha one", "group": "Alpha", "weight": 4},
             {"id": "alpha-2", "title": "Alpha two", "group": "Alpha", "weight": 3},
@@ -37,7 +41,9 @@ class TerminalInputTests(unittest.TestCase):
                 "title": "{title}", "id": "{id}", "context": "{group}",
                 "kind": "{group}", "weight": "{weight}",
                 "actions": [{"key": "o", "label": "select", "command": [
-                    sys.executable, "-c", "print('PICKED {id}', flush=True)",
+                    sys.executable, "-c",
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+                    str(self.hits), "{id}",
                 ]}],
             }},
         }
@@ -90,6 +96,16 @@ class TerminalInputTests(unittest.TestCase):
                 break
         self.assertIn(marker, self.transcript, self.transcript.decode(errors="replace"))
 
+    def wait_for_action(self, item_id):
+        """Wait for the dashboard's own notice, then read what the action did."""
+        self.wait_for(b"Done: select")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self.hits.exists() and self.hits.read_text() == item_id:
+                return
+            self.read_output(0.05)
+        self.fail(f"action on {item_id!r} recorded {self.hits.read_text() if self.hits.exists() else 'nothing'!r}")
+
     def send(self, data, fragmented=False):
         if fragmented:
             for byte in data:
@@ -109,7 +125,7 @@ class TerminalInputTests(unittest.TestCase):
             self.send(sequence, fragmented)
         self.send(sequence, fragmented)
         os.write(self.master, b"o")
-        self.wait_for(b"PICKED beta-2" if grouped else b"PICKED alpha-2")
+        self.wait_for_action("beta-2" if grouped else "alpha-2")
 
     def test_normal_down_in_flat_list(self):
         self.check_navigation(b"\x1b[B", grouped=False)
@@ -128,7 +144,7 @@ class TerminalInputTests(unittest.TestCase):
         self.send(b"\x1b[B")
         self.send(b"\x1b[A")
         os.write(self.master, b"o")
-        self.wait_for(b"PICKED alpha-1")
+        self.wait_for_action("alpha-1")
 
     def test_groups_expand_and_collapse_without_leaving_the_tree(self):
         self.launch(True)
@@ -140,7 +156,7 @@ class TerminalInputTests(unittest.TestCase):
         self.wait_for(b"Beta one")
         self.send(b"\x1b[B")
         os.write(self.master, b"o")
-        self.wait_for(b"PICKED beta-1")
+        self.wait_for_action("beta-1")
 
     def test_auto_expand_opens_group_items_without_toggling(self):
         self.launch(True, auto_expand=True)
@@ -148,7 +164,7 @@ class TerminalInputTests(unittest.TestCase):
         self.wait_for(b"Beta two")
         self.send(b"\x1b[B")
         os.write(self.master, b"o")
-        self.wait_for(b"PICKED alpha-1")
+        self.wait_for_action("alpha-1")
 
     def test_linked_action_disclosure_and_hidden_hotkey(self):
         script = (
@@ -178,6 +194,108 @@ class TerminalInputTests(unittest.TestCase):
         self.wait_for(b"? show")
         os.write(self.master, b"1")
         self.wait_for(b"RESULT 1")
+
+    def spawn(self, build_config):
+        """Start the dashboard on a config the caller builds for its temp dir."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        config_dir = self.root / "attention"
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(json.dumps(build_config(self.root)))
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color", XDG_CONFIG_HOME=tmp.name,
+                   XDG_STATE_HOME=tmp.name, XDG_CACHE_HOME=tmp.name,
+                   PYTHONDONTWRITEBYTECODE="1")
+        env.pop("ESCDELAY", None)
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(ROOT / "attention")],
+                stdin=slave, stdout=slave, stderr=slave, env=env,
+            )
+        finally:
+            os.close(slave)
+        self.master = master
+        self.transcript = b""
+        self.addCleanup(self.stop_process)
+
+    @staticmethod
+    def generic_config(records, actions):
+        return {
+            "plugins": ["generic"],
+            "dashboard": {"autoExpand": True},
+            "generic": {"fixture": {
+                "command": [sys.executable, "-c",
+                            "print(" + repr(json.dumps(records)) + ")"],
+                "title": "{title}", "id": "{id}", "context": "Work",
+                "status": "TODO", "weight": "{weight}", "actions": actions,
+            }},
+        }
+
+    def test_action_prompts_are_answered_without_leaving_the_dashboard(self):
+        def build(root):
+            out = root / "comment"
+            return self.generic_config(
+                [{"id": "one", "title": "Alpha one", "weight": 1}],
+                [{
+                    "key": "c", "label": "comment",
+                    "command": [
+                        sys.executable, "-c",
+                        "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+                        str(out), "{input}",
+                    ],
+                    "input": {"prompt": "Comment body", "default": "fallback"},
+                }],
+            )
+
+        self.spawn(build)
+        self.wait_for(b"Alpha one")
+        self.send(b"\x1b[B")
+        self.send(b"c")
+        # The prompt is drawn by the dashboard itself: no shell, no new
+        # terminal window, and the rows stay on screen behind it.
+        self.wait_for(b"Comment body")
+        self.wait_for(b"Esc cancel")
+        self.send(b"typed answer")
+        self.send(b"\r")
+        self.wait_for(b"Done: comment")
+        self.assertEqual((self.root / "comment").read_text(), "typed answer")
+
+    def test_dismissal_removes_the_row_before_the_action_finishes(self):
+        def build(root):
+            out = root / "completed"
+            return self.generic_config(
+                [{"id": "one", "title": "Finish me", "weight": 5},
+                 {"id": "two", "title": "Stays put", "weight": 1}],
+                [{
+                    "key": "d", "label": "dismiss", "removes": True,
+                    "command": [
+                        sys.executable, "-c",
+                        "import pathlib, sys, time; time.sleep(1); "
+                        "pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+                        str(out), "{id}",
+                    ],
+                }],
+            )
+
+        self.spawn(build)
+        self.wait_for(b"Finish me")
+        self.wait_for(b"Stays put")
+        self.send(b"\x1b[B")
+        self.send(b"d")
+        self.wait_for(b"Running: dismiss")
+        # The row goes as soon as the dismissal is dispatched, a full second
+        # before the command it is waiting on finishes. Curses only writes the
+        # cells that change, so move the selection to make it repaint the
+        # remaining rows and read what is actually on screen now.
+        self.transcript = b""
+        self.send(b"\x1b[B")
+        self.assertIn(b"Stays put", self.transcript)
+        self.assertNotIn(b"Finish me", self.transcript)
+        self.wait_for(b"Done: dismiss")
+        self.assertEqual((self.root / "completed").read_text(), "one")
 
     def test_dashboard_renders_stacked_rows_with_individual_glyphs(self):
         tmp = tempfile.TemporaryDirectory()

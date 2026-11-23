@@ -258,6 +258,7 @@ def resolve_configured_actions(configured_actions, record):
             "primary": a.get("primary", False),
             "wip": a.get("wip", False),
             "read": a.get("read", False),
+            "removes": a.get("removes", False),
             "payload": payload,
         })
     return actions
@@ -305,6 +306,7 @@ def prompt_for_input(spec):
     interactive = getattr(input, "prompt_spec", None)
     if callable(interactive):
         return interactive(spec)
+
     prompt = spec.get("prompt") or "Input"
     choices = spec.get("choices")
     default = spec.get("default")
