@@ -1543,7 +1543,7 @@ def _display_context(repo_name, number):
     return f"{name}#{number}" if number else name
 
 
-def _session_prompt(gtype, reasons):
+def _session_prompt(gtype, reasons, is_own_pr=False):
     """State-aware default message for a work session dispatched from an
     item. The action depends on both whose work it is and why it needs
     attention -- fixing my own PR is a different job from reviewing
@@ -1557,6 +1557,7 @@ def _session_prompt(gtype, reasons):
     - Merge conflict: resolve it.
     - Review comments only: respond to them.
     - Review update only: inspect the feedback before deciding what to do.
+    - Nothing outstanding: it is merge ready, so land it.
 
     Not my work:
     - A PR someone asked me to review: review it.
@@ -1564,8 +1565,10 @@ def _session_prompt(gtype, reasons):
       fix, their changes to make -- not mine).
     - An issue assigned to me or open in my repo: work on it.
 
-    `reasons` is the attention_reasons list (empty for review requests
-    and issues).
+    `reasons` is the attention_reasons list (empty for review requests,
+    notifications, and issues). `is_own_pr` marks a notification row
+    whose pull request I authored: there is nothing for me to review, so
+    it asks for a check-in instead.
     """
     if gtype == "authored_attention":
         if "Changes Requested" in reasons:
@@ -1578,11 +1581,15 @@ def _session_prompt(gtype, reasons):
             return "Respond to the review comments."
         if "Review Update" in reasons:
             return "Check the latest review update."
-        return "Review it."
+        return "Merge it once the checks pass."
     if gtype == "tracked_attention":
+        if is_own_pr:
+            return "Address it yourself."
         return "Follow up with the author."
     if gtype in ("assigned_issue", "repo_issue"):
         return "Work on it."
+    if is_own_pr:
+        return "Check on your PR."
     return "Review it."
 
 
@@ -1712,7 +1719,11 @@ def fetch(config):
             "" if repo_path else f"No unique local GitHub checkout for {repo_name}."
         )
         slug = slugify(title)
-        session_prompt = _session_prompt(gtype, g.get("attention_reasons", []))
+        session_prompt = _session_prompt(
+            gtype,
+            g.get("attention_reasons", []),
+            g.get("_is_own_pr") is True,
+        )
 
         head_branch = g.get("headRefName", "")
         if kind == "pull_request" and head_branch:

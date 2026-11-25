@@ -2659,6 +2659,14 @@ probe = {'title': 'My PR', 'repository': {'nameWithOwner': 'o/r'}, 'number': 1,
 p._fetch_raw = lambda config: [probe]
 p._repo_dir_index = lambda code_dir: {}
 print(p.fetch({'codeDir': '/tmp'})[0]['session_prompt'])
+print(f('authored_attention', []))
+notif = {'number': '7', 'title': 'My PR', 'repository': {'nameWithOwner': 'o/r'},
+         'url': 'https://github.com/o/r/pull/7', 'type': 'notification',
+         'subject_type': 'PullRequest', '_is_own_pr': True, 'headRefName': 'feat'}
+p._fetch_raw = lambda config: [notif]
+print(p.fetch({'codeDir': '/tmp'})[0]['session_prompt'])
+p._fetch_raw = lambda config: [dict(notif, _is_own_pr=False)]
+print(p.fetch({'codeDir': '/tmp'})[0]['session_prompt'])
 ")"
   check "my PR with failing CI tells me to fix CI" \
     "$(sed -n 1p <<<"$out")" "Fix the failing CI checks."
@@ -2682,6 +2690,12 @@ print(p.fetch({'codeDir': '/tmp'})[0]['session_prompt'])
     "$(sed -n 10p <<<"$out")" "Work on it."
   check "GitHub PR items carry their state-aware prompt into structured handoff" \
     "$(sed -n 11p <<<"$out")" "Fix the failing CI checks."
+  check "a merge-ready PR of mine is a landing job, not a review" \
+    "$(sed -n 12p <<<"$out")" "Merge it once the checks pass."
+  check "a notification on my own PR asks for a check-in, not a review" \
+    "$(sed -n 13p <<<"$out")" "Check out the \`feat\` branch in this worktree. Check on your PR."
+  check "a notification on someone else's PR still asks for a review" \
+    "$(sed -n 14p <<<"$out")" "Check out the \`feat\` branch in this worktree. Review it."
 }
 test_github_session_prompt_state_aware
 
